@@ -1,0 +1,17 @@
+# Private configuration
+.env
+.env.*
+!.env.example
+*.env
+/compose.override.yaml
+
+# Generated Go and frontend output
+/bin/
+node_modules/
+dist/
+/docs/.vitepress/cache/
+*.tsbuildinfo
+.DS_Store
+
+# Windows resources windows.sh makes for its builds only
+/cmd/*/rsrc_windows_*.syso

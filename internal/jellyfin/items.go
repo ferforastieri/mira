@@ -1,0 +1,802 @@
+package jellyfin
+
+import (
+	"context"
+	"crypto/sha256"
+	"encoding/hex"
+	"net/http"
+	"slices"
+	"strings"
+	"time"
+
+	"github.com/ferforastieri/mira/internal/accounts"
+	"github.com/ferforastieri/mira/internal/library"
+	"github.com/ferforastieri/mira/internal/playback"
+	"github.com/ferforastieri/mira/internal/stremio"
+)
+
+// UserItemData is what a user did with an item: Jellyfin's
+// UserItemDataDto, in its key order.
+type UserItemData struct {
+	Rating                *float64 `json:",omitempty"`
+	PlayedPercentage      *float64 `json:",omitempty"`
+	UnplayedItemCount     *int     `json:",omitempty"`
+	PlaybackPositionTicks int64
+	PlayCount             int
+	IsFavorite            bool
+	Likes                 *bool `json:",omitempty"`
+	LastPlayedDate        *Time `json:",omitempty"`
+	Played                bool
+	Key                   string
+	ItemId                string
+}
+
+type NameGuidPair struct {
+	Name string
+	Id   string
+}
+
+type NameValuePair struct {
+	Name  string
+	Value string
+}
+
+type MediaUrl struct {
+	Url  string
+	Name string
+}
+
+type BaseItemPerson struct {
+	Name            string
+	Id              string
+	Role            string
+	Type            string
+	PrimaryImageTag string `json:",omitempty"`
+}
+
+// BaseItemDto is Jellyfin's description of any item. Fields Jellyfin only
+// sends on request (the Fields parameter) or in an item's own description
+// are pointers or omitted when empty.
+type BaseItemDto struct {
+	Name           string
+	OriginalTitle  string `json:",omitempty"`
+	ServerId       string
+	Id             string
+	Etag           string `json:",omitempty"`
+	PlaylistItemId string `json:",omitempty"` // the entry a playlist lists the item as
+	DateCreated    *Time  `json:",omitempty"`
+	CanDelete      *bool  `json:",omitempty"`
+	CanDownload    *bool  `json:",omitempty"`
+	SortName       string `json:",omitempty"`
+	// ForcedSortName is the sort name an administrator set.
+	ForcedSortName string      `json:",omitempty"`
+	PremiereDate   *Time       `json:",omitempty"`
+	ExternalUrls   *[]MediaUrl `json:",omitempty"`
+	// Path is the name a movie's or an episode's version downloads as:
+	// Mira has no file of its own, and apps take the file name of a
+	// download from it.
+	Path                     string             `json:",omitempty"`
+	EnableMediaSourceDisplay *bool              `json:",omitempty"`
+	OfficialRating           string             `json:",omitempty"`
+	ChannelId                *string            // always sent: null but for a programme's channel
+	ChannelName              string             `json:",omitempty"`
+	Overview                 *string            `json:",omitempty"`
+	Taglines                 *[]string          `json:",omitempty"`
+	Genres                   *[]string          `json:",omitempty"`
+	CommunityRating          *float64           `json:",omitempty"`
+	CriticRating             *float64           `json:",omitempty"`
+	CustomRating             string             `json:",omitempty"`
+	RunTimeTicks             *int64             `json:",omitempty"`
+	PlayAccess               string             `json:",omitempty"`
+	ProductionYear           *int               `json:",omitempty"`
+	IndexNumber              *int               `json:",omitempty"`
+	ParentIndexNumber        *int               `json:",omitempty"`
+	RemoteTrailers           *[]MediaUrl        `json:",omitempty"`
+	ProviderIds              *map[string]string `json:",omitempty"`
+	IsFolder                 bool
+	ParentId                 string `json:",omitempty"`
+	// ExtraType is a local folder's extra's (see extras.go).
+	ExtraType                string `json:",omitempty"`
+	Type                     string
+	People                   *[]BaseItemPerson `json:",omitempty"`
+	Studios                  *[]NameGuidPair   `json:",omitempty"`
+	GenreItems               *[]NameGuidPair   `json:",omitempty"`
+	ParentBackdropItemId     string            `json:",omitempty"`
+	ParentBackdropImageTags  []string          `json:",omitempty"`
+	LocalTrailerCount        *int              `json:",omitempty"`
+	UserData                 UserItemData      `json:",omitzero"`
+	RecursiveItemCount       *int              `json:",omitempty"`
+	ChildCount               *int              `json:",omitempty"`
+	SeriesName               string            `json:",omitempty"`
+	SeriesId                 string            `json:",omitempty"`
+	SeasonId                 string            `json:",omitempty"`
+	SpecialFeatureCount      *int              `json:",omitempty"`
+	DisplayPreferencesId     string            `json:",omitempty"`
+	Status                   string            `json:",omitempty"`
+	AirDays                  *[]string         `json:",omitempty"`
+	Tags                     *[]string         `json:",omitempty"`
+	PrimaryImageAspectRatio  *float64          `json:",omitempty"`
+	SeriesPrimaryImageTag    string            `json:",omitempty"`
+	SeasonName               string            `json:",omitempty"`
+	CollectionType           string            `json:",omitempty"`
+	DisplayOrder             string            `json:",omitempty"`
+	ImageTags                map[string]string
+	BackdropImageTags        []string
+	ImageBlurHashes          map[string]map[string]string
+	ParentPrimaryImageItemId string `json:",omitempty"`
+	ParentPrimaryImageTag    string `json:",omitempty"`
+	// Chapters are those of the version the item plays first, once Mira
+	// analyzed it.
+	Chapters               *[]ChapterInfo `json:",omitempty"`
+	LocationType           string
+	MediaType              string
+	VideoType              string    `json:",omitempty"`
+	EndDate                *Time     `json:",omitempty"`
+	LockedFields           *[]string `json:",omitempty"`
+	LockData               *bool     `json:",omitempty"`
+	CumulativeRunTimeTicks *int64    `json:",omitempty"`
+	DateLastMediaAdded     *Time     `json:",omitempty"`
+	// Number, ChannelNumber and ChannelType describe a channel, and
+	// CurrentProgram its programme airing now; the others a programme.
+	Number                 string       `json:",omitempty"`
+	ChannelNumber          string       `json:",omitempty"`
+	ChannelPrimaryImageTag string       `json:",omitempty"`
+	StartDate              *Time        `json:",omitempty"`
+	CurrentProgram         *BaseItemDto `json:",omitempty"`
+	IsMovie                *bool        `json:",omitempty"`
+	IsSeries               *bool        `json:",omitempty"`
+	IsNews                 *bool        `json:",omitempty"`
+	IsKids                 *bool        `json:",omitempty"`
+	IsSports               *bool        `json:",omitempty"`
+	// IsRepeat marks a programme its guide marks previously shown.
+	IsRepeat    *bool  `json:",omitempty"`
+	ChannelType string `json:",omitempty"`
+	// EpisodeTitle is the title of the episode a programme airs.
+	EpisodeTitle string `json:",omitempty"`
+	// The fields of music (see describeMusic): a track's album and its
+	// artwork, the artists of a track or an album and the artist of its
+	// album, whether a track has lyrics, a track's or album's gain, and
+	// what an artist's page counts.
+	Album                string          `json:",omitempty"`
+	AlbumId              string          `json:",omitempty"`
+	AlbumPrimaryImageTag string          `json:",omitempty"`
+	AlbumArtist          string          `json:",omitempty"`
+	AlbumArtists         *[]NameGuidPair `json:",omitempty"`
+	ArtistItems          *[]NameGuidPair `json:",omitempty"`
+	Artists              *[]string       `json:",omitempty"`
+	HasLyrics            *bool           `json:",omitempty"`
+	NormalizationGain    *float64        `json:",omitempty"`
+	SongCount            *int            `json:",omitempty"`
+	AlbumCount           *int            `json:",omitempty"`
+	ArtistCount          *int            `json:",omitempty"`
+	MovieCount           *int            `json:",omitempty"`
+	SeriesCount          *int            `json:",omitempty"`
+	EpisodeCount         *int            `json:",omitempty"`
+	TrailerCount         *int            `json:",omitempty"`
+	MusicVideoCount      *int            `json:",omitempty"`
+	ProgramCount         *int            `json:",omitempty"`
+	// Container, MediaSources, MediaStreams, HasSubtitles, Width, Height
+	// and Trickplay describe a movie's or episode's versions.
+	Container    string                  `json:",omitempty"`
+	MediaSources *[]MediaSourceInfo      `json:",omitempty"`
+	MediaStreams *[]playback.MediaStream `json:",omitempty"`
+	HasSubtitles *bool                   `json:",omitempty"`
+	Width        *int                    `json:",omitempty"`
+	Height       *int                    `json:",omitempty"`
+	// Trickplay holds the scrubbing thumbnails of its versions, by media
+	// source and width.
+	Trickplay *map[string]map[int]TrickplayInfo `json:",omitempty"`
+	// TimerId and SeriesTimerId are the timers recording a programme, or
+	// a recording; CompletionPercentage is how far a recording under way
+	// is.
+	TimerId              string   `json:",omitempty"`
+	SeriesTimerId        string   `json:",omitempty"`
+	CompletionPercentage *float64 `json:",omitempty"`
+}
+
+// addMediaSources describes a movie's or episode's versions in its DTO, as
+// Jellyfin does in item details and, when asked, in listings. opened is the
+// identifier the item was asked by: its own, or one of its versions'. Item
+// details describe the versions known now and ask the addons for the others
+// in the background (see knownPlayable); listings only show what is known.
+// Both describe a placeholder while no version is known, so that apps see
+// the title as playable.
+// A channel's details describe its streams as a placeholder, as Jellyfin's
+// do: PlaybackInfo describes them once the channel plays.
+func (h *Handler) addMediaSources(r *http.Request, user accounts.User, dto *BaseItemDto, item library.Item, opened accounts.ID, detail bool) {
+	if item.Kind == library.KindChannel && detail {
+		dto.MediaSources = &[]MediaSourceInfo{channelPlaceholder(item)}
+		dto.MediaStreams = &[]playback.MediaStream{}
+		if sources := h.lineupSources(r, user, item, opened); len(sources) > 0 {
+			dto.MediaSources = &sources
+		}
+		return
+	}
+	if audioItem(item.Kind) {
+		h.addAudioSources(r, user, dto, item, detail)
+		return
+	}
+	if !versioned(item.Kind) && item.Kind != library.KindRecording && item.Kind != library.KindReplay {
+		return
+	}
+	var sources []MediaSourceInfo
+	var p playable
+	if detail && item.Kind == library.KindRecording {
+		var err error
+		p, err = h.playable(r.Context(), user, item)
+		if err != nil && r.Context().Err() == nil {
+			h.Logger.Warn("The versions of a title could not be listed", "error", err)
+		}
+		sources = h.mediaSources(r, p, opened)
+		h.prepareOpened(r.Context(), user, item, p.versions, opened)
+	} else if detail {
+		var complete bool
+		var err error
+		p, complete, err = h.knownPlayable(r.Context(), user, item, opened)
+		if err != nil && r.Context().Err() == nil {
+			h.Logger.Warn("The versions of a title could not be listed", "error", err)
+		}
+		sources = h.mediaSources(r, p, opened)
+		if len(sources) == 0 {
+			sources = []MediaSourceInfo{h.placeholderSource(r, item)}
+		}
+		h.setDownload(r, user, dto, item, p.versions, opened, true)
+		if complete {
+			h.prepareOpened(r.Context(), user, item, p.versions, opened)
+		} else {
+			h.prepareListed(r.Context(), user, item, opened)
+		}
+	} else if p = h.cachedPlayable(r.Context(), user, item); len(p.versions) > 0 {
+		sources = h.mediaSources(r, p, opened)
+	} else {
+		sources = []MediaSourceInfo{h.placeholderSource(r, item)}
+	}
+	h.setChapters(r.Context(), dto, p.versions, opened)
+	dto.Id = opened.String()
+	dto.MediaSources = &sources
+	// Recordings get no thumbnails (see queueImages): no Trickplay field.
+	if detail && item.Kind != library.KindRecording {
+		dto.Trickplay = h.trickplayManifest(r.Context(), user, item, p.versions, opened)
+	}
+	if len(sources) == 0 {
+		dto.MediaStreams = &[]playback.MediaStream{}
+		return
+	}
+	// The item's streams are those of the version it was opened as.
+	opens := sources[openedIndex(opened, p.versions)]
+	dto.MediaStreams = &opens.MediaStreams
+	dto.Container = opens.Container
+	for _, stream := range opens.MediaStreams {
+		switch stream.Type {
+		case "Subtitle":
+			// Jellyfin leaves the flag out for titles without subtitles.
+			if detail {
+				dto.HasSubtitles = new(true)
+			}
+		case "Video":
+			if dto.Width == nil {
+				dto.Width, dto.Height = stream.Width, stream.Height
+			}
+		}
+	}
+}
+
+// fieldSet holds the optional fields a request asked for.
+type fieldSet map[string]bool
+
+func requestedFields(r *http.Request) fieldSet {
+	fields := fieldSet{}
+	for key, values := range r.URL.Query() {
+		if !strings.EqualFold(key, "fields") {
+			continue
+		}
+		for _, value := range values {
+			for field := range strings.SplitSeq(value, ",") {
+				if field = strings.TrimSpace(field); field != "" {
+					fields[strings.ToLower(field)] = true
+				}
+			}
+		}
+	}
+	return fields
+}
+
+func (f fieldSet) has(name string) bool { return f[strings.ToLower(name)] }
+
+// nameID derives the identifier of a named thing (a genre, a person) the
+// way Mira identifies items: stable for the same name.
+func nameID(kind, name string) string {
+	sum := sha256.Sum256([]byte("mira:" + kind + ":" + strings.ToLower(name)))
+	return hex.EncodeToString(sum[:16])
+}
+
+var itemTypes = map[library.Kind]string{
+	library.KindLibrary:    "CollectionFolder",
+	library.KindCollection: "BoxSet",
+	library.KindMovie:      "Movie",
+	// Jellyfin's home videos are videos too, and the titles of other
+	// types, without videos or with them, videos and folders of videos.
+	library.KindVideo:   "Video",
+	library.KindFolder:  "Folder",
+	library.KindSeries:  "Series",
+	library.KindSeason:  "Season",
+	library.KindEpisode: "Episode",
+	library.KindPerson:  "Person",
+	library.KindChannel: "TvChannel",
+	library.KindProgram: "Program",
+	// Jellyfin's recordings are videos of its recordings folders; Replay's
+	// programmes are as well, in a folder per channel.
+	library.KindRecording:     "Video",
+	library.KindReplayFolder:  "Folder",
+	library.KindReplay:        "Video",
+	library.KindArtist:        "MusicArtist",
+	library.KindAlbum:         "MusicAlbum",
+	library.KindTrack:         "Audio",
+	library.KindAudiobook:     "AudioBook",
+	library.KindMusicPlaylist: "Playlist",
+	// Jellyfin's extras are videos, and its theme songs audio, told
+	// apart by their ExtraType.
+	library.KindExtra:     "Video",
+	library.KindThemeSong: "Audio",
+}
+
+// typeAliases are the other names apps ask item types by: Jellyfin's
+// BaseItemKind names channels LiveTvChannel as well as TvChannel, and
+// programmes LiveTvProgram and TvProgram as well as Program. jellyfin-web
+// searches programmes as LiveTvProgram, and Jellyfin's Android TV app
+// channels as LiveTvChannel.
+var typeAliases = map[library.Kind][]string{
+	library.KindChannel: {"LiveTvChannel"},
+	library.KindProgram: {"LiveTvProgram", "TvProgram"},
+}
+
+// namesType reports whether name, whatever its case, is the type of the
+// items of kind, or another name of it.
+func namesType(name string, kind library.Kind) bool {
+	return strings.EqualFold(name, itemTypes[kind]) ||
+		slices.ContainsFunc(typeAliases[kind], func(alias string) bool { return strings.EqualFold(name, alias) })
+}
+
+// isFolder reports whether items of a kind hold other items.
+func isFolder(kind library.Kind) bool {
+	switch kind {
+	case library.KindLibrary, library.KindCollection, library.KindSeries, library.KindSeason,
+		library.KindArtist, library.KindAlbum, library.KindMusicPlaylist, library.KindReplayFolder, library.KindFolder:
+		return true
+	}
+	return false
+}
+
+// appCollectionType is the content type apps are told a library holds. A
+// library of an addon's collections is told apart from Jellyfin's
+// Collections view: it holds folders of titles, as a Jellyfin library of
+// mixed content does, and has no type. Jellyfin apps leave libraries of
+// collections out of their home rows of latest items (jellyfin-web's
+// Latest Media, Streamyfin's Recently Added), which then left such
+// libraries, often a server's only ones, without rows. Some apps list a
+// library by its type, though: told nothing, they list the titles of all
+// its collections together. The apps an administrator chose for
+// collectionLibraries are told its own type, boxsets, and list its
+// collections, then a collection's titles (see
+// accounts.Settings.CollectionLibraryApps).
+func appCollectionType(item library.Item, collectionLibraries bool) string {
+	if item.Kind == library.KindLibrary && item.CollectionType == "boxsets" && item.ID != collectionsViewID && !collectionLibraries {
+		return ""
+	}
+	return item.CollectionType
+}
+
+// collectionLibrariesByType reports whether the app of ctx's caller is told
+// an addon's collection library holds collections: an administrator chose
+// it, by the name it sends in the Client field of its authorization. A
+// request made with an API key, under the key's app name, or without a
+// caller, is not.
+func (h *Handler) collectionLibrariesByType(ctx context.Context) bool {
+	c := callerFrom(ctx)
+	return c.APIKey == nil && c.Device.Client != "" && h.Accounts.CollectionLibraryApp(c.Device.Client)
+}
+
+// newItemDto describes an item, with what the user did with it in state.
+// detail is true for an item's own description, which carries every field;
+// listings carry the base fields plus those in fields.
+func (h *Handler) newItemDto(item library.Item, fields fieldSet, detail bool, state userState) BaseItemDto {
+	// Items Mira makes itself, its collections, views and recordings,
+	// show administrators' edits too; the library's already do.
+	item = h.Library.Overridden(item)[0]
+	playable := versioned(item.Kind) || item.Kind == library.KindRecording || item.Kind == library.KindReplay
+	folder := isFolder(item.Kind)
+	dto := BaseItemDto{
+		Name:              item.Name,
+		ServerId:          h.ServerID,
+		Id:                item.ID.String(),
+		OfficialRating:    item.OfficialRating,
+		IsFolder:          folder,
+		Type:              itemTypes[item.Kind],
+		Status:            item.Status,
+		CollectionType:    appCollectionType(item, state.collectionLibraries),
+		SeriesName:        item.SeriesName,
+		ImageTags:         map[string]string{},
+		BackdropImageTags: []string{},
+		ImageBlurHashes:   map[string]map[string]string{},
+		LocationType:      "FileSystem",
+		MediaType:         mediaType(item.Kind),
+		UserData:          state.of(item),
+	}
+	if item.Kind == library.KindEpisode && !item.Available {
+		dto.LocationType = "Virtual"
+	}
+	if item.PremiereDate != nil {
+		dto.PremiereDate = new(Time(*item.PremiereDate))
+	}
+	if item.Kind == library.KindSeries {
+		if item.EndDate != nil {
+			dto.EndDate = new(Time(*item.EndDate))
+		} else if item.Status == "Ended" && item.Contents != nil && item.Contents.LastReleased != nil {
+			dto.EndDate = new(Time(*item.Contents.LastReleased))
+		}
+	} else if end := h.Library.Overrides(item.ID).EndDate; end != nil {
+		// Other items show an end date once an administrator sets one.
+		dto.EndDate = new(Time(*end))
+	}
+	if item.CommunityRating > 0 {
+		dto.CommunityRating = new(item.CommunityRating)
+	}
+	if item.Runtime > 0 {
+		dto.RunTimeTicks = new(int64(item.Runtime / 100))
+	}
+	if item.ProductionYear > 0 {
+		dto.ProductionYear = new(item.ProductionYear)
+	}
+	switch item.Kind {
+	case library.KindSeason:
+		dto.IndexNumber = new(item.IndexNumber)
+		dto.SeriesPrimaryImageTag = library.ImageTag(item.SeriesPoster)
+	case library.KindEpisode:
+		// An episode shows where its series' order puts it.
+		place := item.ShownPlace()
+		dto.IndexNumber = new(place.Episode)
+		dto.ParentIndexNumber = new(place.Season)
+		dto.SeasonId = place.SeasonID.String()
+		dto.SeasonName = place.SeasonName
+		dto.SeriesPrimaryImageTag = library.ImageTag(item.SeriesPoster)
+		// Jellyfin shows the nearest parent artwork: the season's, else the
+		// series'. A season of an episode order shows its series'.
+		if item.SeasonPoster != "" && item.Shown == nil {
+			dto.ParentPrimaryImageItemId, dto.ParentPrimaryImageTag = item.SeasonID.String(), library.ImageTag(item.SeasonPoster)
+		} else if item.SeriesPoster != "" {
+			dto.ParentPrimaryImageItemId, dto.ParentPrimaryImageTag = item.SeriesID.String(), library.ImageTag(item.SeriesPoster)
+		}
+	case library.KindSeries:
+		dto.AirDays = &[]string{}
+		dto.DisplayOrder = item.DisplayOrder
+	case library.KindCollection:
+		dto.DisplayOrder = "PremiereDate"
+	case library.KindFolder:
+		// Listings count a folder's videos when asked; its own description
+		// always does (see below).
+		if c := item.Contents; c != nil && !detail {
+			if fields.has("ChildCount") {
+				dto.ChildCount = new(c.Children)
+			}
+			if fields.has("RecursiveItemCount") {
+				dto.RecursiveItemCount = new(c.Released)
+			}
+		}
+	}
+	if playable {
+		dto.VideoType = "VideoFile"
+	}
+	if item.SeriesID != (accounts.ID{}) {
+		dto.SeriesId = item.SeriesID.String()
+		dto.ParentBackdropItemId = item.SeriesID.String()
+		dto.ParentBackdropImageTags = []string{}
+	}
+	h.setImages(&dto, item, state.badges)
+
+	if item.Overview != "" && (detail || fields.has("Overview")) {
+		dto.Overview = new(item.Overview)
+	}
+	if detail || fields.has("Genres") {
+		dto.Genres = new(nonNil(item.Genres))
+	}
+	if detail || fields.has("ProviderIds") {
+		providers := item.ProviderIDs
+		if providers == nil {
+			providers = map[string]string{}
+		}
+		dto.ProviderIds = &providers
+	}
+	if detail || fields.has("DateCreated") {
+		created := time.Unix(0, 0).UTC()
+		// A replay was made when it aired.
+		if item.Kind == library.KindReplay {
+			created = *item.StartDate
+		}
+		dto.DateCreated = new(Time(created))
+	}
+	if detail || fields.has("CanDelete") {
+		dto.CanDelete = new(false)
+	}
+	if detail || fields.has("CanDownload") {
+		// Until its versions are known; see setDownload.
+		dto.CanDownload = new(false)
+	}
+	describeEdited(&dto, item, fields, detail)
+	if detail || fields.has("People") {
+		dto.People = new(h.people(item.People))
+	}
+	if detail || fields.has("Chapters") {
+		dto.Chapters = &[]ChapterInfo{}
+	}
+	if (detail || fields.has("ParentId") || item.ExtraType != "") && item.ParentID != (accounts.ID{}) {
+		dto.ParentId = item.ParentID.String()
+		if item.Shown != nil {
+			dto.ParentId = item.Shown.SeasonID.String()
+		}
+	}
+	dto.ExtraType = item.ExtraType
+	if detail {
+		dto.Etag = nameID("etag", item.ID.String())
+		dto.ExternalUrls = new(externalURLs(item.ProviderIDs, item.Kind))
+		dto.EnableMediaSourceDisplay = new(true)
+		dto.PlayAccess = "Full"
+		dto.RemoteTrailers = new(trailers(item.Trailers))
+		dto.GenreItems = new(genreItems(item.Genres))
+		dto.LocalTrailerCount = new(0)
+		dto.SpecialFeatureCount = new(0)
+		dto.DisplayPreferencesId = item.ID.String()
+		dto.LockedFields = &[]string{}
+		dto.LockData = new(false)
+		if item.Kind == library.KindLibrary {
+			// Jellyfin reports this date unset on libraries.
+			dto.DateLastMediaAdded = new(Time(time.Time{}))
+		}
+		if c := item.Contents; c != nil {
+			dto.ChildCount = new(c.Children)
+			dto.RecursiveItemCount = new(c.Released)
+			if c.LastReleased != nil {
+				dto.DateLastMediaAdded = new(Time(*c.LastReleased))
+			} else {
+				dto.DateLastMediaAdded = new(Time(time.Time{}))
+			}
+			if item.Kind == library.KindSeries {
+				dto.CumulativeRunTimeTicks = new(int64(c.Runtime / 100))
+			}
+		}
+	}
+	describeLive(&dto, item, fields, detail)
+	var gain *float64
+	if g, known := state.gains[item.ID]; known {
+		gain = &g
+	}
+	describeMusic(&dto, item, fields, detail, state.lyrics[item.ID], gain)
+	return dto
+}
+
+func nonNil(values []string) []string {
+	if values == nil {
+		return []string{}
+	}
+	return values
+}
+
+// describeEdited adds to a DTO what only administrators' edits give an
+// item (see library.Overrides), or MDBList for its critic rating: its sort
+// name, original title, taglines, tags, studios and critic and custom
+// ratings, as Jellyfin describes them.
+func describeEdited(dto *BaseItemDto, item library.Item, fields fieldSet, detail bool) {
+	if detail || fields.has("SortName") {
+		dto.SortName = sortName(item)
+		if detail {
+			dto.ForcedSortName = item.SortName
+		}
+	}
+	if detail && item.OriginalTitle != "" {
+		dto.OriginalTitle = item.OriginalTitle
+	}
+	if item.CriticRating != nil {
+		dto.CriticRating = new(*item.CriticRating)
+	}
+	if detail || fields.has("CustomRating") {
+		dto.CustomRating = item.CustomRating
+	}
+	if detail || fields.has("Taglines") {
+		dto.Taglines = new(nonNil(item.Taglines))
+	}
+	if detail || fields.has("Tags") {
+		dto.Tags = new(nonNil(item.Tags))
+	}
+	if detail || fields.has("Studios") {
+		studios := make([]NameGuidPair, 0, len(item.Studios))
+		for _, studio := range item.Studios {
+			studios = append(studios, NameGuidPair{Name: studio, Id: nameID("studio", studio)})
+		}
+		dto.Studios = &studios
+	}
+}
+
+// setImages sets the tags of an item's images on its DTO: its Primary
+// image's is the badged one (see badgedTag) when badges holds what its
+// badges show. Artwork found dead is left out (see withoutDead). A movie
+// or series lacking a poster TMDB was not asked about yet advertises the
+// tag of its lookup (see library.Item.TMDBPoster), the poster looked up
+// when asked for (see taggedArtwork).
+func (h *Handler) setImages(dto *BaseItemDto, item library.Item, badges map[accounts.ID]string) {
+	item.Images = h.withoutDead(item.Images)
+	if item.Images.Primary == "" && item.TMDBPoster != "" {
+		dto.ImageTags["Primary"] = library.ImageTag(item.TMDBPoster)
+		dto.PrimaryImageAspectRatio = new(2.0 / 3.0)
+	}
+	if item.Images.Primary != "" {
+		dto.ImageTags["Primary"] = library.ImageTag(item.Images.Primary)
+		if shown, ok := badges[item.ID]; ok {
+			dto.ImageTags["Primary"] = h.badgedTag(posterBadgesPurpose, item.ID, dto.ImageTags["Primary"], shown)
+		}
+		ratio := 2.0 / 3.0
+		switch item.Kind {
+		case library.KindEpisode, library.KindVideo, library.KindProgram, library.KindRecording, library.KindReplay, library.KindExtra:
+			ratio = 16.0 / 9.0
+		case library.KindChannel, library.KindReplayFolder:
+			// Channel logos are square, as Jellyfin's tuners give them.
+			ratio = 1
+		case library.KindArtist, library.KindAlbum, library.KindTrack, library.KindAudiobook, library.KindMusicPlaylist:
+			// Covers are square.
+			ratio = 1
+		default:
+			// A title's or collection's poster has the shape its addon
+			// declares.
+			switch item.PosterShape {
+			case stremio.ShapeLandscape:
+				ratio = 16.0 / 9.0
+			case stremio.ShapeSquare:
+				ratio = 1
+			}
+		}
+		if item.WidePrimary {
+			// A library's generated image, or the backdrop it found.
+			ratio = 16.0 / 9.0
+		}
+		dto.PrimaryImageAspectRatio = new(ratio)
+	}
+	if item.Images.Logo != "" {
+		dto.ImageTags["Logo"] = library.ImageTag(item.Images.Logo)
+	}
+	if item.Images.Banner != "" {
+		dto.ImageTags["Banner"] = library.ImageTag(item.Images.Banner)
+	}
+	if item.Images.Thumb != "" && item.Kind != library.KindEpisode {
+		dto.ImageTags["Thumb"] = library.ImageTag(item.Images.Thumb)
+	}
+	if item.Images.Art != "" {
+		dto.ImageTags["Art"] = library.ImageTag(item.Images.Art)
+	}
+	if item.Images.Disc != "" {
+		dto.ImageTags["Disc"] = library.ImageTag(item.Images.Disc)
+	}
+	if item.Images.Backdrop != "" {
+		tag := library.ImageTag(item.Images.Backdrop)
+		if item.Kind == library.KindSeason || item.Kind == library.KindEpisode {
+			dto.ParentBackdropImageTags = []string{tag}
+		} else {
+			dto.BackdropImageTags = []string{tag}
+		}
+	}
+}
+
+// people describes a title's credits, without the tags of photos found
+// dead (see withoutDead).
+func (h *Handler) people(credits []library.Person) []BaseItemPerson {
+	result := make([]BaseItemPerson, 0, len(credits))
+	for _, person := range credits {
+		entry := BaseItemPerson{Name: person.Name, Id: person.ID.String(), Role: person.Role, Type: person.Type}
+		if photo := h.withoutDead(library.Images{Primary: person.Image}).Primary; photo != "" {
+			entry.PrimaryImageTag = library.ImageTag(photo)
+		}
+		result = append(result, entry)
+	}
+	return result
+}
+
+func trailers(list []library.Trailer) []MediaUrl {
+	result := make([]MediaUrl, 0, len(list))
+	for _, trailer := range list {
+		result = append(result, MediaUrl{Url: trailer.URL, Name: trailer.Name})
+	}
+	return result
+}
+
+func genreItems(genres []string) []NameGuidPair {
+	result := make([]NameGuidPair, 0, len(genres))
+	for _, genre := range genres {
+		result = append(result, NameGuidPair{Name: genre, Id: nameID("genre", genre)})
+	}
+	return result
+}
+
+// externalURLs links a title to the sites of its provider identifiers.
+func externalURLs(ids map[string]string, kind library.Kind) []MediaUrl {
+	result := []MediaUrl{}
+	if id := ids["Imdb"]; id != "" {
+		result = append(result, MediaUrl{Name: "IMDb", Url: "https://www.imdb.com/title/" + id})
+	}
+	if id := ids["Tmdb"]; id != "" {
+		path := "movie"
+		if kind != library.KindMovie {
+			path = "tv"
+		}
+		result = append(result, MediaUrl{Name: "TMDB", Url: "https://www.themoviedb.org/" + path + "/" + id})
+	}
+	if id := ids["Tvdb"]; id != "" && kind != library.KindMovie {
+		result = append(result, MediaUrl{Name: "TheTVDB", Url: "https://thetvdb.com/?tab=series&id=" + id})
+	}
+	return result
+}
+
+// QueryResult is Jellyfin's paged list.
+type QueryResult struct {
+	Items            []BaseItemDto
+	TotalRecordCount int
+	StartIndex       int
+}
+
+// itemTypeFilter keeps the item types a request includes and drops those it
+// excludes; mediaTypes further keeps only items of those media types, and
+// the IsFolder and IsNotFolder filters only folders or the others. An
+// addon's collection, a folder of titles, is kept by a request for
+// folders too: jellyfin-web lists a library without content type, as an
+// addon's collection library is to most apps (see appCollectionType), by
+// its folders, movies and series. A request that leaves folders out still
+// keeps it, as Jellyfin keeps collections.
+func itemTypeFilter(r *http.Request) func(library.Item) bool {
+	include := listQuery(r, "includeItemTypes")
+	exclude := listQuery(r, "excludeItemTypes")
+	media := listQuery(r, "mediaTypes")
+	filters := listQuery(r, "filters")
+	matches := func(list []string, value string) bool {
+		return slices.ContainsFunc(list, func(t string) bool { return strings.EqualFold(t, value) })
+	}
+	folders, others := matches(filters, "IsFolder"), matches(filters, "IsNotFolder")
+	return func(item library.Item) bool {
+		named := func(list []string) bool {
+			return slices.ContainsFunc(list, func(t string) bool { return namesType(t, item.Kind) })
+		}
+		folder := isFolder(item.Kind)
+		included := len(include) == 0 || named(include) || item.Kind == library.KindCollection && matches(include, "Folder")
+		return included && !named(exclude) &&
+			(len(media) == 0 || matches(media, mediaType(item.Kind))) && (!folders || folder) && (!others || !folder)
+	}
+}
+
+// mediaType is the kind of media an item plays: titles, episodes and
+// channels are videos, and programmes, which play their channel; folders
+// have none.
+func mediaType(kind library.Kind) string {
+	switch kind {
+	case library.KindMovie, library.KindVideo, library.KindEpisode, library.KindChannel, library.KindProgram, library.KindRecording, library.KindReplay,
+		library.KindExtra:
+		return "Video"
+	case library.KindTrack, library.KindAudiobook, library.KindMusicPlaylist, library.KindThemeSong:
+		return "Audio"
+	}
+	return "Unknown"
+}
+
+// versioned reports whether items of kind play the versions addons or
+// local folders list for them: movies, home videos, episodes and the
+// videos of local folders' extras.
+func versioned(kind library.Kind) bool {
+	return kind == library.KindMovie || kind == library.KindVideo || kind == library.KindEpisode || kind == library.KindExtra
+}
+
+// audioItem reports whether items of kind play as audio: tracks,
+// audiobooks, and the theme songs of local folders, whose one version is
+// their file (see library.Service.Versions).
+func audioItem(kind library.Kind) bool {
+	return library.AudioKind(kind) || kind == library.KindThemeSong
+}
+
+// song reports whether items of kind keep no resume point, and count as
+// played as songs do: tracks and theme songs.
+func song(kind library.Kind) bool {
+	return kind == library.KindTrack || kind == library.KindThemeSong
+}

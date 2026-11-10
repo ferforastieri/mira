@@ -1,0 +1,578 @@
+package hls
+
+import (
+	"bytes"
+	"context"
+	"encoding/json"
+	"io"
+	"log/slog"
+	"math"
+	"os"
+	"os/exec"
+	"path/filepath"
+	"slices"
+	"strconv"
+	"strings"
+	"testing"
+	"time"
+)
+
+func seconds(values ...float64) []time.Duration {
+	durations := make([]time.Duration, len(values))
+	for i, v := range values {
+		durations[i] = time.Duration(math.Round(v * float64(time.Second)))
+	}
+	return durations
+}
+
+func TestSegmentsStartOnKeyframesFFmpegCanSeekTo(t *testing.T) {
+	t.Parallel()
+	for name, c := range map[string]struct {
+		keyframes []time.Duration
+		duration  time.Duration
+		starts    []time.Duration
+	}{
+		"the first segment ends on the first keyframe 2 s in, the others 4 s after their start": {
+			seconds(0, 2.5, 7, 8, 15.333, 16, 22.917, 27), 30 * time.Second, seconds(0, 2.5, 7, 15.333, 22.917, 27),
+		},
+		"2 s keyframes make a 2 s segment, then 4 s ones": {
+			seconds(0, 2, 4, 6, 8, 10), 12 * time.Second, seconds(0, 2, 6, 10),
+		},
+		"10 s keyframes make 10 s segments": {
+			seconds(0, 10, 20, 30), 40 * time.Second, seconds(0, 10, 20, 30),
+		},
+		"a keyframe followed closely by another does not start a segment": {
+			seconds(0, 6, 6.1, 12, 18), 20 * time.Second, seconds(0, 6.1, 12, 18),
+		},
+		"a keyframe at the very end does not start a segment": {
+			seconds(0, 6, 12, 19.5), 20 * time.Second, seconds(0, 6, 12),
+		},
+		"the first segment starts at zero, whatever the first keyframe": {
+			seconds(0.083, 6.083, 12.083), 15 * time.Second, seconds(0, 6.083, 12.083),
+		},
+		"a version without keyframes past the first is one segment": {
+			seconds(0), 9 * time.Second, seconds(0),
+		},
+	} {
+		t.Run(name, func(t *testing.T) {
+			t.Parallel()
+			plan := NewPlan(c.keyframes, c.duration)
+			if !slices.Equal(plan.starts, c.starts) {
+				t.Fatalf("starts %v, want %v", plan.starts, c.starts)
+			}
+			if last := plan.Len() - 1; plan.End(last) != c.duration {
+				t.Errorf("the last segment ends at %v", plan.End(last))
+			}
+			if got := plan.Segment(c.starts[len(c.starts)-1] + time.Millisecond); got != len(c.starts)-1 {
+				t.Errorf("segment of the last start: %d", got)
+			}
+		})
+	}
+}
+
+// A version without keyframes known is cut as one with a keyframe
+// everywhere: 2 s, then every 4 s, the last segment at least 1 s long; the
+// playlists' target duration is the longest segment, rounded up.
+func TestGridAndTargetDurationFollowTheSegments(t *testing.T) {
+	t.Parallel()
+	grid := NewGridPlan(13 * time.Second)
+	if !grid.Grid() || !slices.Equal(grid.starts, seconds(0, 2, 6, 10)) || grid.TargetDuration() != 4 {
+		t.Errorf("grid %v, target %d", grid.starts, grid.TargetDuration())
+	}
+	if short := NewGridPlan(10500 * time.Millisecond); !slices.Equal(short.starts, seconds(0, 2, 6)) || short.End(2) != 10500*time.Millisecond {
+		t.Errorf("short grid %v", short.starts)
+	}
+	if got := NewPlan(seconds(0, 2.5, 7, 12, 17.5), 20*time.Second).TargetDuration(); got != 6 {
+		t.Errorf("target duration %d, want 6 (12 to 17.5 s)", got)
+	}
+	if got := NewPlan(seconds(0, 2, 4, 6, 8, 10), 12*time.Second).TargetDuration(); got != 4 {
+		t.Errorf("target duration %d, want 4", got)
+	}
+}
+
+func TestPlaylistsListEverySegment(t *testing.T) {
+	t.Parallel()
+	plan := NewPlan(seconds(0, 6.5, 13), 20*time.Second)
+	var media bytes.Buffer
+	if err := WriteMedia(&media, plan, FMP4, func(n int) string { return "hls1/main/" + strconv.Itoa(n) + ".mp4?a=b" }); err != nil {
+		t.Fatal(err)
+	}
+	want := `#EXTM3U
+#EXT-X-PLAYLIST-TYPE:VOD
+#EXT-X-VERSION:7
+#EXT-X-TARGETDURATION:7
+#EXT-X-MEDIA-SEQUENCE:0
+#EXT-X-MAP:URI="hls1/main/-1.mp4?a=b"
+#EXTINF:6.500000, nodesc
+hls1/main/0.mp4?a=b
+#EXTINF:6.500000, nodesc
+hls1/main/1.mp4?a=b
+#EXTINF:7.000000, nodesc
+hls1/main/2.mp4?a=b
+#EXT-X-ENDLIST
+`
+	if media.String() != want {
+		t.Errorf("media playlist:\n%s", media.String())
+	}
+	var master bytes.Buffer
+	if err := WriteMaster(&master, []Variant{{Bandwidth: 5_000_000, Codecs: "avc1.640028,mp4a.40.2", Width: 1920, Height: 1080, FrameRate: 23.976, Range: "SDR",
+		URI: "main.m3u8?a=b"}}, nil); err != nil {
+		t.Fatal(err)
+	}
+	if want := "#EXTM3U\n#EXT-X-STREAM-INF:BANDWIDTH=5000000,AVERAGE-BANDWIDTH=5000000,VIDEO-RANGE=SDR,CODECS=\"avc1.640028,mp4a.40.2\",RESOLUTION=1920x1080,FRAME-RATE=23.976\nmain.m3u8?a=b\n"; master.String() != want {
+		t.Errorf("master playlist:\n%s", master.String())
+	}
+}
+
+func TestSubtitleRenditionsFollowHLSRules(t *testing.T) {
+	t.Parallel()
+	var master bytes.Buffer
+	err := WriteMaster(&master, []Variant{{Bandwidth: 1_000_000, URI: "main.m3u8"}}, []Rendition{
+		{Name: "French", Language: "fr", URI: "s0.m3u8"},
+		{Name: "French", Language: "fr", URI: "s1.m3u8"},
+		{Name: `Forced "signs"`, Language: "fr", Forced: true, URI: "s2.m3u8"},
+		{Name: "English", Language: "en", Default: true, URI: "s3.m3u8"},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	// Names differ within the group; a default track is autoselected, and
+	// so is a forced one.
+	want := `#EXTM3U
+#EXT-X-MEDIA:TYPE=SUBTITLES,GROUP-ID="subs",NAME="French",LANGUAGE="fr",DEFAULT=NO,AUTOSELECT=NO,FORCED=NO,URI="s0.m3u8"
+#EXT-X-MEDIA:TYPE=SUBTITLES,GROUP-ID="subs",NAME="French 2",LANGUAGE="fr",DEFAULT=NO,AUTOSELECT=NO,FORCED=NO,URI="s1.m3u8"
+#EXT-X-MEDIA:TYPE=SUBTITLES,GROUP-ID="subs",NAME="Forced 'signs'",LANGUAGE="fr",DEFAULT=NO,AUTOSELECT=YES,FORCED=YES,URI="s2.m3u8"
+#EXT-X-MEDIA:TYPE=SUBTITLES,GROUP-ID="subs",NAME="English",LANGUAGE="en",DEFAULT=YES,AUTOSELECT=YES,FORCED=NO,URI="s3.m3u8"
+#EXT-X-STREAM-INF:BANDWIDTH=1000000,AVERAGE-BANDWIDTH=1000000,SUBTITLES="subs"
+main.m3u8
+`
+	if master.String() != want {
+		t.Errorf("master playlist:\n%s", master.String())
+	}
+}
+
+// Several variants are listed in order, the one chosen first, each with
+// its own bandwidth, size, codecs and media playlist, sharing the
+// subtitles; the playlist tells that every segment starts on a keyframe.
+func TestVariantsAreListedInOrder(t *testing.T) {
+	t.Parallel()
+	var master bytes.Buffer
+	err := WriteMaster(&master, []Variant{
+		{Bandwidth: 15_640_000, Codecs: "avc1.640028,mp4a.40.2", Width: 1920, Height: 1080, FrameRate: 24, Range: "SDR", URI: "main.m3u8?a=b"},
+		{Bandwidth: 8_140_000, Codecs: "avc1.64001f,mp4a.40.2", Width: 1280, Height: 720, FrameRate: 24, Range: "SDR", URI: "hls1/main1/main.m3u8?a=b"},
+	}, []Rendition{{Name: "English", Language: "en", URI: "s0.m3u8"}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	want := `#EXTM3U
+#EXT-X-INDEPENDENT-SEGMENTS
+#EXT-X-MEDIA:TYPE=SUBTITLES,GROUP-ID="subs",NAME="English",LANGUAGE="en",DEFAULT=NO,AUTOSELECT=NO,FORCED=NO,URI="s0.m3u8"
+#EXT-X-STREAM-INF:BANDWIDTH=15640000,AVERAGE-BANDWIDTH=15640000,VIDEO-RANGE=SDR,CODECS="avc1.640028,mp4a.40.2",RESOLUTION=1920x1080,FRAME-RATE=24,SUBTITLES="subs"
+main.m3u8?a=b
+#EXT-X-STREAM-INF:BANDWIDTH=8140000,AVERAGE-BANDWIDTH=8140000,VIDEO-RANGE=SDR,CODECS="avc1.64001f,mp4a.40.2",RESOLUTION=1280x720,FRAME-RATE=24,SUBTITLES="subs"
+hls1/main1/main.m3u8?a=b
+`
+	if master.String() != want {
+		t.Errorf("master playlist:\n%s", master.String())
+	}
+}
+
+// tools returns FFmpeg and ffprobe, named by MIRA_TEST_FFMPEG, or skips
+// the test.
+func tools(t *testing.T) (string, string) {
+	t.Helper()
+	ffmpeg := os.Getenv("MIRA_TEST_FFMPEG")
+	if ffmpeg == "" {
+		t.Skip("MIRA_TEST_FFMPEG is not set")
+	}
+	return ffmpeg, filepath.Join(filepath.Dir(ffmpeg), "ffprobe")
+}
+
+// source writes a 30-second Matroska file with B-frames, keyframes at
+// irregular times and audio in codec, and returns where ffprobe finds its
+// keyframes.
+func source(t *testing.T, ffmpeg, ffprobe, codec string) (string, []time.Duration) {
+	t.Helper()
+	path := filepath.Join(t.TempDir(), "source.mkv")
+	out, err := exec.Command(ffmpeg, "-hide_banner", "-loglevel", "error",
+		"-f", "lavfi", "-i", "testsrc2=size=160x90:rate=24", "-f", "lavfi", "-i", "sine=frequency=440:sample_rate=48000",
+		"-t", "30", "-c:v", "libx264", "-preset", "veryfast", "-bf", "3", "-g", "1000", "-sc_threshold", "0",
+		"-force_key_frames", "0,2.5,7,8,15.3,16,22.9,27", "-c:a", codec, "-b:a", "96k", path).CombinedOutput()
+	if err != nil {
+		t.Fatalf("make the source: %v: %s", err, out)
+	}
+	var keyframes []time.Duration
+	for _, p := range probePackets(t, ffprobe, path) {
+		if p.Type == "video" && strings.Contains(p.Flags, "K") {
+			at, _ := strconv.ParseFloat(p.PTS, 64)
+			keyframes = append(keyframes, seconds(at)...)
+		}
+	}
+	if len(keyframes) != 8 {
+		t.Fatalf("the source has keyframes at %v", keyframes)
+	}
+	return path, keyframes
+}
+
+type packet struct {
+	Type  string `json:"codec_type"`
+	PTS   string `json:"pts_time"`
+	Flags string `json:"flags"`
+}
+
+func probePackets(t *testing.T, ffprobe, path string) []packet {
+	t.Helper()
+	out, err := exec.Command(ffprobe, "-v", "error", "-show_entries", "packet=codec_type,pts_time,flags",
+		"-show_entries", "stream=codec_type", "-of", "json", path).Output()
+	if err != nil {
+		t.Fatalf("probe %s: %v", filepath.Base(path), err)
+	}
+	var result struct{ Packets []packet }
+	if err := json.Unmarshal(out, &result); err != nil {
+		t.Fatal(err)
+	}
+	return result.Packets
+}
+
+func TestRemuxedSegmentsJoinIntoTheSource(t *testing.T) {
+	t.Parallel()
+	ffmpeg, ffprobe := tools(t)
+	// AAC starts before zero, with its priming; the MP4 header of E-AC-3
+	// needs its first packet; converted audio is decoded from where FFmpeg
+	// starts; converted video gets keyframes where the source has them, on
+	// a GPU too when there is one.
+	for _, c := range []struct {
+		codec, convert string
+		encode         bool
+		gpu            string
+	}{{"aac", "", false, ""}, {"eac3", "", false, ""}, {"eac3", "aac", false, ""}, {"aac", "", true, ""}, {"aac", "", true, "nvenc"}, {"aac", "", true, "vaapi"},
+		{"aac", "", true, "videotoolbox"}} {
+		input, keyframes := source(t, ffmpeg, ffprobe, c.codec)
+		for _, format := range []Format{FMP4, TS} {
+			name := c.codec + " in " + format.Extension()
+			switch {
+			case c.convert != "":
+				name = c.codec + " converted to " + c.convert + " in " + format.Extension()
+			case c.gpu != "":
+				name = "video converted to H.264 with " + c.gpu + " in " + format.Extension()
+			case c.encode:
+				name = "video converted to H.264 in " + format.Extension()
+			}
+			t.Run(name, func(t *testing.T) {
+				t.Parallel()
+				m, err := NewManager(ffmpeg, t.TempDir(), slog.New(slog.DiscardHandler))
+				if err != nil {
+					t.Fatal(err)
+				}
+				defer m.Close()
+				encoding := &VideoEncoding{Encoder: "libx264", Level: "4.1", Width: 128, Height: 72, Bitrate: 300_000, FrameRate: 24}
+				switch {
+				case c.gpu != "":
+					hw, ok := m.DetectHardware(c.gpu, "")
+					i := slices.IndexFunc(hw.Encoders, func(e string) bool { return strings.HasPrefix(e, "h264_") })
+					if !ok || i < 0 {
+						t.Skip("no GPU encodes H.264 with " + c.gpu)
+					}
+					// GPU encoders take larger pictures.
+					encoding = &VideoEncoding{Encoder: hw.Encoders[i], Level: "4.1", Width: 320, Height: 180, Bitrate: 500_000, FrameRate: 24, Hardware: &hw}
+				case c.encode && !slices.Contains(m.Encoders(), "libx264"):
+					t.Skip("FFmpeg has no libx264")
+				}
+				plan := NewPlan(keyframes, 30*time.Second)
+				released := make(chan struct{})
+				open := func(context.Context) (Remux, func(), error) {
+					remux := Remux{Input: input, Video: 0, Audio: 1, Format: format, Plan: plan}
+					if c.convert != "" {
+						remux.AudioCodec, remux.AudioChannels, remux.AudioBitrate = c.convert, 2, 128_000
+					}
+					if c.encode {
+						remux.Encode = encoding
+					}
+					return remux, func() { close(released) }, nil
+				}
+				key := Key{Session: "session", Audio: 1, Format: format}
+				ctx, cancel := context.WithTimeout(t.Context(), time.Minute)
+				defer cancel()
+
+				read := func(f *os.File, err error) []byte {
+					t.Helper()
+					if err != nil {
+						t.Fatal(err)
+					}
+					defer f.Close()
+					data, err := io.ReadAll(f)
+					if err != nil {
+						t.Fatal(err)
+					}
+					return data
+				}
+				// A player resuming mid-file, then starting over: FFmpeg starts
+				// at segment 2, then again at 0.
+				read(m.Segment(ctx, key, open, 2))
+				var init []byte
+				if format == FMP4 {
+					init = read(m.Init(ctx, key, open))
+				}
+				dir := t.TempDir()
+				joined := slices.Clone(init)
+				for n := range plan.Len() {
+					data := read(m.Segment(ctx, key, open, n))
+					joined = append(joined, data...)
+					one := filepath.Join(dir, "segment"+strconv.Itoa(n))
+					if err := os.WriteFile(one, append(slices.Clone(init), data...), 0o600); err != nil {
+						t.Fatal(err)
+					}
+					packets := probePackets(t, ffprobe, one)
+					i := slices.IndexFunc(packets, func(p packet) bool { return p.Type == "video" })
+					if i < 0 {
+						t.Fatalf("segment %d has no video", n)
+					}
+					at, _ := strconv.ParseFloat(packets[i].PTS, 64)
+					at -= timestampOffset.Seconds()
+					if want := plan.Start(n).Seconds(); !strings.Contains(packets[i].Flags, "K") || math.Abs(at-want) > 0.002 {
+						t.Errorf("segment %d starts with %+v (at %.3f), want a keyframe at %.3f", n, packets[i], at, want)
+					}
+					// Its audio starts with the video, wherever FFmpeg started.
+					a := slices.IndexFunc(packets, func(p packet) bool { return p.Type == "audio" })
+					if a < 0 {
+						t.Fatalf("segment %d has no audio", n)
+					}
+					audioAt, _ := strconv.ParseFloat(packets[a].PTS, 64)
+					if audioAt -= timestampOffset.Seconds(); math.Abs(audioAt-plan.Start(n).Seconds()) > 0.25 {
+						t.Errorf("segment %d: audio starts at %.3f, video at %.3f", n, audioAt, plan.Start(n).Seconds())
+					}
+				}
+				// Joined, the segments are the source's 720 frames, in order.
+				all := filepath.Join(dir, "joined")
+				if err := os.WriteFile(all, joined, 0o600); err != nil {
+					t.Fatal(err)
+				}
+				frames, last := 0, -1.0
+				for _, p := range probePackets(t, ffprobe, all) {
+					if p.Type != "video" {
+						continue
+					}
+					frames++
+					if strings.Contains(p.Flags, "K") {
+						at, _ := strconv.ParseFloat(p.PTS, 64)
+						if at <= last {
+							t.Errorf("keyframe at %.3f after %.3f", at, last)
+						}
+						last = at
+					}
+				}
+				if frames != 720 {
+					t.Errorf("%d video frames, want 720", frames)
+				}
+				if c.convert != "" {
+					// MPEG-TS lists its streams twice, in its program too.
+					out, _ := exec.Command(ffprobe, "-v", "error", "-select_streams", "a", "-show_entries", "stream=codec_name,channels", "-of", "csv=p=0", all).Output()
+					if got, _, _ := firstLine(out); got != c.convert+",2" {
+						t.Errorf("converted audio: %q", got)
+					}
+				}
+				if c.encode {
+					// H.264 High, as the master playlist's CODECS announces.
+					out, _ := exec.Command(ffprobe, "-v", "error", "-select_streams", "v", "-show_entries", "stream=codec_name,profile,width,height,pix_fmt", "-of", "csv=p=0", all).Output()
+					want := "h264,High," + strconv.Itoa(encoding.Width) + "," + strconv.Itoa(encoding.Height) + ",yuv420p"
+					if got, _, _ := firstLine(out); got != want {
+						t.Errorf("converted video: %q, want %q", got, want)
+					}
+				}
+				if _, err := m.Segment(ctx, key, open, plan.Len()); err != ErrNotFound {
+					t.Errorf("segment past the end: %v", err)
+				}
+				m.Stop("session")
+				select {
+				case <-released:
+				case <-time.After(10 * time.Second):
+					t.Error("the input was not released")
+				}
+			})
+		}
+	}
+}
+
+func TestHDRIsConvertedToSDR(t *testing.T) {
+	t.Parallel()
+	ffmpeg, ffprobe := tools(t)
+	// Video tagged as HDR10: BT.2020 primaries and the PQ transfer.
+	input := filepath.Join(t.TempDir(), "hdr.mkv")
+	if out, err := exec.Command(ffmpeg, "-hide_banner", "-loglevel", "error", "-f", "lavfi", "-i", "testsrc2=size=320x180:rate=24", "-t", "8",
+		"-vf", "setparams=color_primaries=bt2020:color_trc=smpte2084:colorspace=bt2020nc", "-c:v", "libx264", "-force_key_frames", "0,6",
+		input).CombinedOutput(); err != nil {
+		t.Fatalf("make the source: %v: %s", err, out)
+	}
+	plan := NewPlan(seconds(0, 6), 8*time.Second)
+	// On the processor, then on an NVIDIA GPU or VideoToolbox that tone
+	// maps, if there is one.
+	for _, gpu := range []string{"", "nvenc", "videotoolbox"} {
+		name := gpu
+		if name == "" {
+			name = "processor"
+		}
+		t.Run(name, func(t *testing.T) {
+			t.Parallel()
+			m, err := NewManager(ffmpeg, t.TempDir(), slog.New(slog.DiscardHandler))
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer m.Close()
+			encoding := &VideoEncoding{Encoder: "libx264", Level: "4.1", Width: 320, Height: 180, Bitrate: 500_000, FrameRate: 24, ToneMap: true}
+			switch hw, ok := m.DetectHardware(gpu, ""); {
+			case gpu == "" && (!m.HasFilters("zscale", "tonemap") || !slices.Contains(m.Encoders(), "libx264")):
+				t.Skip("FFmpeg cannot convert HDR to SDR")
+			case gpu != "" && (!ok || !hw.ToneMapping):
+				t.Skip("no GPU tone maps with " + gpu)
+			case gpu != "":
+				encoding.Encoder, encoding.Hardware = hw.Encoders[0], &hw
+			}
+			open := func(context.Context) (Remux, func(), error) {
+				return Remux{Input: input, Video: 0, Audio: -1, Format: TS, Plan: plan, Encode: encoding}, func() {}, nil
+			}
+			ctx, cancel := context.WithTimeout(t.Context(), time.Minute)
+			defer cancel()
+			f, err := m.Segment(ctx, Key{Session: "session", Audio: -1, Format: TS}, open, 0)
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer f.Close()
+			out, _ := exec.Command(ffprobe, "-v", "error", "-select_streams", "v", "-show_entries", "stream=codec_name,pix_fmt,color_transfer,color_primaries",
+				"-of", "csv=p=0", f.Name()).Output()
+			if got, _, _ := firstLine(out); !strings.HasSuffix(got, ",yuv420p,bt709,bt709") {
+				t.Errorf("converted video: %q", got)
+			}
+		})
+	}
+}
+
+// FFmpeg's encoders tag their output with the colors the decoded frames
+// carry. FFmpeg's HEVC decoder gives frames only those of the bitstream:
+// an HEVC source that states its colors in its container alone, as
+// Matroska's Colour element can, decodes to frames without any. Converted
+// video keeps the source's colors all the same, on the processor and on a
+// GPU, and claims none the source does not state.
+func TestConvertedVideoKeepsTheSourcesColors(t *testing.T) {
+	t.Parallel()
+	ffmpeg, ffprobe := tools(t)
+	if encoders, _ := exec.Command(ffmpeg, "-hide_banner", "-encoders").Output(); !bytes.Contains(encoders, []byte(" libx265 ")) {
+		t.Skip("FFmpeg has no libx265 to make the source with")
+	}
+	dir := t.TempDir()
+	untagged, tagged := filepath.Join(dir, "untagged.mkv"), filepath.Join(dir, "tagged.mkv")
+	for _, run := range [][]string{
+		{"-f", "lavfi", "-i", "testsrc2=size=320x180:rate=24", "-t", "8", "-c:v", "libx265", "-x265-params", "log-level=error",
+			"-force_key_frames", "0,6", untagged},
+		{"-i", untagged, "-c", "copy", "-color_range", "tv", "-colorspace", "bt709", "-color_trc", "bt709", "-color_primaries", "bt709", tagged},
+	} {
+		if out, err := exec.Command(ffmpeg, append([]string{"-hide_banner", "-loglevel", "error"}, run...)...).CombinedOutput(); err != nil {
+			t.Fatalf("make the source: %v: %s", err, out)
+		}
+	}
+	plan := NewPlan(seconds(0, 6), 8*time.Second)
+	bt709 := Colors{Range: "tv", Matrix: "bt709", Transfer: "bt709", Primaries: "bt709"}
+	for _, gpu := range []string{"", "nvenc", "vaapi", "videotoolbox"} {
+		name := gpu
+		if name == "" {
+			name = "processor"
+		}
+		t.Run(name, func(t *testing.T) {
+			t.Parallel()
+			m, err := NewManager(ffmpeg, t.TempDir(), slog.New(slog.DiscardHandler))
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer m.Close()
+			encoding := VideoEncoding{Encoder: "libx264", Level: "4.1", Width: 320, Height: 180, Bitrate: 500_000, FrameRate: 24}
+			switch hw, ok := m.DetectHardware(gpu, ""); {
+			case gpu == "" && !slices.Contains(m.Encoders(), "libx264"):
+				t.Skip("FFmpeg has no libx264")
+			case gpu != "":
+				i := slices.IndexFunc(hw.Encoders, func(e string) bool { return strings.HasPrefix(e, "h264_") })
+				if !ok || i < 0 {
+					t.Skip("no GPU encodes H.264 with " + gpu)
+				}
+				encoding.Encoder, encoding.Hardware = hw.Encoders[i], &hw
+			}
+			for _, tc := range []struct {
+				input  string
+				colors Colors
+				want   string
+			}{
+				{tagged, bt709, "tv,bt709,bt709,bt709"},
+				// Unknown colors stay unknown.
+				{untagged, Colors{}, "unknown,unknown,unknown"},
+			} {
+				encoding := encoding
+				encoding.Colors = tc.colors
+				open := func(context.Context) (Remux, func(), error) {
+					return Remux{Input: tc.input, Video: 0, Audio: -1, Format: FMP4, Plan: plan, Encode: &encoding}, func() {}, nil
+				}
+				ctx, cancel := context.WithTimeout(t.Context(), time.Minute)
+				key := Key{Session: filepath.Base(tc.input), Audio: -1, Format: FMP4}
+				header, err := m.Init(ctx, key, open)
+				if err != nil {
+					cancel()
+					t.Fatal(err)
+				}
+				segment, err := m.Segment(ctx, key, open, 0)
+				cancel()
+				if err != nil {
+					header.Close()
+					t.Fatal(err)
+				}
+				data, _ := io.ReadAll(header)
+				more, _ := io.ReadAll(segment)
+				header.Close()
+				segment.Close()
+				joined := filepath.Join(t.TempDir(), "joined.mp4")
+				if err := os.WriteFile(joined, append(data, more...), 0o600); err != nil {
+					t.Fatal(err)
+				}
+				// The stream's colors, then those its first frame decodes
+				// with, which come from the bitstream.
+				stream, _ := exec.Command(ffprobe, "-v", "error", "-select_streams", "v", "-show_entries",
+					"stream=color_range,color_space,color_transfer,color_primaries", "-of", "csv=p=0", joined).Output()
+				frame, _ := exec.Command(ffprobe, "-v", "error", "-select_streams", "v", "-read_intervals", "%+#1", "-show_entries",
+					"frame=color_space,color_transfer,color_primaries", "-of", "csv=p=0", joined).Output()
+				got, _, _ := firstLine(stream)
+				// The frame's line ends with an empty field for its side data.
+				decoded, _, _ := firstLine(frame)
+				decoded = strings.TrimRight(decoded, ",")
+				if !strings.HasSuffix(got, tc.want) || !strings.HasSuffix(","+tc.want, ","+decoded) {
+					t.Errorf("%s: stream %q, frame %q, want %q", filepath.Base(tc.input), got, decoded, tc.want)
+				}
+				m.Stop(key.Session)
+			}
+		})
+	}
+}
+
+func TestARemuxThatFailsReportsItsError(t *testing.T) {
+	t.Parallel()
+	ffmpeg, ffprobe := tools(t)
+	input, keyframes := source(t, ffmpeg, ffprobe, "aac")
+	m, err := NewManager(ffmpeg, t.TempDir(), slog.New(slog.DiscardHandler))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer m.Close()
+	// Only the audio, as if it were the video: segments cannot be cut on
+	// its keyframes.
+	open := func(context.Context) (Remux, func(), error) {
+		return Remux{Input: input, Video: 1, Audio: -1, Format: FMP4, Plan: NewPlan(keyframes, 30*time.Second)}, func() {}, nil
+	}
+	ctx, cancel := context.WithTimeout(t.Context(), 20*time.Second)
+	defer cancel()
+	_, err = m.Segment(ctx, Key{Session: "session", Format: FMP4}, open, 0)
+	if err == nil || ctx.Err() != nil || !strings.Contains(err.Error(), "no video track") {
+		t.Errorf("segment of a failing remux: %v", err)
+	}
+}
+
+// firstLine is the first line ffprobe printed, without the carriage return
+// it ends lines with on Windows.
+func firstLine(out []byte) (first, rest string, found bool) {
+	first, rest, found = strings.Cut(strings.TrimSpace(string(out)), "\n")
+	return strings.TrimSuffix(first, "\r"), rest, found
+}

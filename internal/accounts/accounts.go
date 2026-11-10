@@ -1,0 +1,1020 @@
+// Package accounts stores users, their signed-in devices, admin interface
+// sessions and server settings.
+package accounts
+
+import (
+	"context"
+	"errors"
+	"fmt"
+	"slices"
+	"strings"
+	"sync"
+	"sync/atomic"
+	"time"
+	"unicode"
+	"unicode/utf8"
+
+	"github.com/jackc/pgx/v5"
+	"github.com/jackc/pgx/v5/pgconn"
+	"github.com/jackc/pgx/v5/pgxpool"
+
+	"github.com/ferforastieri/mira/internal/i18n"
+	"github.com/ferforastieri/mira/internal/localization"
+	"github.com/ferforastieri/mira/internal/secrets"
+)
+
+var (
+	ErrInvalidName        = errors.New("invalid user name")
+	ErrInvalidPassword    = errors.New("invalid password")
+	ErrNameTaken          = errors.New("user name already taken")
+	ErrNotFound           = errors.New("not found")
+	ErrLastAdministrator  = errors.New("the last enabled administrator must stay an enabled administrator")
+	ErrInvalidCredentials = errors.New("invalid user name or password")
+	ErrDisabled           = errors.New("account disabled")
+	ErrWrongPassword      = errors.New("wrong current password")
+	ErrSetupComplete      = errors.New("an administrator already exists")
+)
+
+const (
+	maxNameLength     = 64
+	minPasswordLength = 8
+	// Bounds the cost of hashing attacker-supplied input.
+	maxPasswordLength = 256
+	// Serializes changes that could leave the server without an enabled
+	// administrator.
+	administratorsLock int64 = 0x706f6c79_61646d6e // "polyadmn"
+)
+
+// User is an account usable from Jellyfin apps and the admin interface.
+type User struct {
+	ID              ID
+	Name            string
+	IsAdministrator bool
+	// IsHidden keeps the user off the sign-in screen of Jellyfin apps.
+	IsHidden       bool
+	IsDisabled     bool
+	CreatedAt      time.Time
+	LastLoginAt    *time.Time
+	LastActivityAt *time.Time
+	// LastActivityApp is the app of the last activity, written with
+	// LastActivityAt: a device's Client, or AdminApp. Empty when unknown.
+	LastActivityApp string
+	// Parental limits the titles the user reaches by their rating.
+	Parental ParentalControl
+	// VideoTranscoding and AudioTranscoding let the user's apps have the
+	// video (burning subtitles in included) or the audio converted, when the
+	// server converts; ContentDownloading alone lets them download titles.
+	// See Store.Conversions and Store.MayDownload.
+	VideoTranscoding   bool
+	AudioTranscoding   bool
+	ContentDownloading bool
+	// PersonalAddons lets the user add and use their own addons, when the
+	// server allows users' own addons (see Settings.PersonalAddonsAllowed).
+	PersonalAddons bool
+	// UseSharedAddons shows the user the server's addons and libraries
+	// before their own, when they may use their own; otherwise they see
+	// the server's alone whatever its value.
+	UseSharedAddons bool
+	// InvalidLoginAttempts counts the user's wrong passwords in a row,
+	// while the server blocks accounts after Settings.LoginAttempts of them;
+	// BlockedUntil is when the last block ends (see Store.BlockedUntil).
+	InvalidLoginAttempts int
+	BlockedUntil         *time.Time
+	// MaxPlaybacks is how many of the user's other devices may be playing
+	// when one more asks to play, 0 for no limit; MaxBitrate, the highest
+	// bitrate the user plays at, in bits per second, 0 for no limit. LiveTv
+	// lets the user reach Live TV; SyncPlay is what they may do in SyncPlay
+	// groups; RemoteControl lets them control other users' apps.
+	MaxPlaybacks  int
+	MaxBitrate    int
+	LiveTv        bool
+	SyncPlay      SyncPlayAccess
+	RemoteControl bool
+	// HiddenLibraries are the server's libraries the user's apps do not
+	// show; libraries added later show. Their titles stay reachable from
+	// elsewhere: this chooses libraries, it hides no title.
+	HiddenLibraries []ID
+	// BlockedGenres hides the titles of any of these genres, compared
+	// without regard to case, like parental control (see Restricted).
+	BlockedGenres []string
+	// AccessSchedules are the hours the user may use the server in; none
+	// allows every hour (see AllowedAt).
+	AccessSchedules []AccessSchedule
+	// CollectionManagement lets the user create collections, change them
+	// and delete them; every user sees them.
+	CollectionManagement bool
+	// SubtitleManagement lets the user add subtitle files to titles from
+	// their apps, Jellyfin's EnableSubtitleManagement.
+	SubtitleManagement bool
+	// ImageTag identifies the user's profile picture, empty without one
+	// (see Store.SetImage).
+	ImageTag string
+	// LiveTvManagement lets the user schedule and delete Live TV
+	// recordings, Jellyfin's EnableLiveTvManagement.
+	LiveTvManagement bool
+	// QualityGroup is the tallest video the user is offered, a height of
+	// ConversionHeights, 0 for Original, no limit (see FitsGroup).
+	QualityGroup int
+	// EndsOn is the date the account ends, at midnight UTC, nil for never:
+	// from that date in the server's time zone, it is refused as a
+	// disabled one is (see Ended). An administrator's never ends.
+	EndsOn *time.Time
+	// EndsAt is the exact time the account ends, nil for none: an invite
+	// link with an account end gives it to the accounts it creates (see
+	// Invite.AccountDays), and a date set since replaces it. An account
+	// has EndsOn or EndsAt, never both.
+	EndsAt *time.Time
+	// CanShare lets the user give a movie or an episode to someone without
+	// an account, through a share link, while the server allows them
+	// (Settings.ShareLinks). Losing it revokes the user's links.
+	CanShare bool
+	// TorrentStreams offers the user the torrents' files addons list,
+	// while the server plays them (see Settings.TorrentsAllowed). Off for
+	// every user, administrators included, until given.
+	TorrentStreams bool
+	// GroupID is the group the user belongs to, nil for none (see Group);
+	// while FollowGroup is set, the settings the group holds are its
+	// values, otherwise the user's own. FollowGroup is set without a group.
+	GroupID     *ID
+	FollowGroup bool
+	// MetadataLanguage is the language the user's titles are described in,
+	// by the server's addons given that language (see addons.Addon.Language);
+	// empty for the server's descriptions. It also names what Mira
+	// generates when Mira speaks it (see i18n.Match).
+	MetadataLanguage string
+	// TwoStep is set once the user signs in with a code from an
+	// authenticator app after their password (see Store.ConfirmTwoStep).
+	TwoStep bool
+	// ProviderOnly has the user sign in through the identity provider
+	// alone: their password is refused (see Authenticate).
+	ProviderOnly bool
+	// WebTheme is the user's web player theme, one of WebThemes, empty for
+	// the server's (see Settings.WebThemeOf); WebThemeLocked keeps the user
+	// from changing it themselves (see SetOwnWebTheme).
+	WebTheme       string
+	WebThemeLocked bool
+	// AudioRegion is the regional variant of audio the user prefers, one
+	// of localization.AudioVariants ("fr-CA"), empty for none. It refines
+	// the audio language they or the server chose for them, or names it
+	// when neither did.
+	AudioRegion string
+	// RemoteAccess lets the user sign in and use the server from outside
+	// the local network, Jellyfin's EnableRemoteAccess: without it, only
+	// from the local network (see AllowedFrom). On for every user until
+	// taken away.
+	RemoteAccess bool
+	// LiveTvChannels chooses the Live TV channels of the server's sources
+	// the user sees, while LiveTv lets them reach Live TV at all.
+	LiveTvChannels ChannelRule
+	// LocalFirst offers the user the versions of local folders and
+	// network shares before the others, whatever the version order's
+	// criteria: those of Order versions by, and their order of sources
+	// (see Settings.VersionOrder). Off for every user until given.
+	LocalFirst bool
+	// NextUpWithResume has taking an episode off Continue Watching also
+	// take its series off Next Up, as Remove from Next Up does. The
+	// user's own choice, off until they turn it on.
+	NextUpWithResume bool
+	// BoostVolume makes jellyfin-web's player louder for the user, in the
+	// browser itself: Mira's script there sends the sound of videos
+	// through a gain and a compressor. Nothing changes on the server.
+	BoostVolume bool
+	// ConvertSound converts the audio of the user's videos and channels,
+	// evened at -16 LUFS whatever Settings.NormalizeConvertedAudio says,
+	// the video copied where it plays as it is: every app then plays it
+	// louder, at the cost of direct play. Both are off until chosen.
+	ConvertSound bool
+	// InterfaceSize is the size of the admin app for the user, one of
+	// InterfaceSizes: InterfaceCompact, the default, or InterfaceLarge.
+	// The user's own choice; the admin app applies it on every browser.
+	InterfaceSize string
+}
+
+// NewUser describes an account to create.
+type NewUser struct {
+	Name            string
+	Password        string
+	IsAdministrator bool
+	IsHidden        bool
+	// Group is the group the account joins and follows, nil for none; an
+	// administrator cannot join one (ErrAdministratorGroup).
+	Group *ID
+	// ProviderOnly has the account sign in through the identity provider
+	// only; it then needs no password.
+	ProviderOnly bool
+}
+
+// UserChanges lists the fields to update; nil fields are kept.
+type UserChanges struct {
+	Name            *string
+	Password        *string
+	IsAdministrator *bool
+	IsHidden        *bool
+	IsDisabled      *bool
+	Parental        *ParentalControl
+	// The user's permissions, see User.
+	VideoTranscoding   *bool
+	AudioTranscoding   *bool
+	ContentDownloading *bool
+	PersonalAddons     *bool
+	// The user's playback and access limits, see User.
+	MaxPlaybacks  *int
+	MaxBitrate    *int
+	LiveTv        *bool
+	SyncPlay      *SyncPlayAccess
+	RemoteControl *bool
+	// The user's content settings, see User.
+	HiddenLibraries *[]ID
+	BlockedGenres   *[]string
+	AccessSchedules *[]AccessSchedule
+	// The user's permission to manage collections, see User.
+	CollectionManagement *bool
+	// SubtitleManagement, see User.
+	SubtitleManagement *bool
+	// LiveTvManagement, see User.
+	LiveTvManagement *bool
+	// QualityGroup, see User.
+	QualityGroup *int
+	// UseSharedAddons, see User.
+	UseSharedAddons *bool
+	// EndsOn sets the date the account ends, the zero time for never, and
+	// clears its exact end (User.EndsAt); an administrator's cannot be set
+	// (ErrAdministratorEnds), and making a user an administrator clears
+	// both. See User.
+	EndsOn *time.Time
+	// CanShare, see User.
+	CanShare *bool
+	// TorrentStreams, see User.
+	TorrentStreams *bool
+	// Group sets the user's group, the zero ID for none. Joining a group
+	// follows it, unless FollowGroup says otherwise; leaving one keeps its
+	// values as the user's own. An administrator cannot join one
+	// (ErrAdministratorGroup), and making a member one takes them out.
+	Group *ID
+	// FollowGroup has the user follow their group, taking its values back,
+	// or keep its values as their own and stop following it.
+	FollowGroup *bool
+	// DetachFromGroup decides what a change to a setting the user's group
+	// holds does while they follow it, when it sets another value than the
+	// group's: with it, the user stops following the group and keeps the
+	// change; without it, the change is refused (ErrFollowsGroup).
+	DetachFromGroup bool
+	// MetadataLanguage, see User: a language code (MetadataLanguageCode)
+	// or empty. Which languages the server's addons have is the caller's to
+	// check.
+	MetadataLanguage *string
+	// ProviderOnly, see User.
+	ProviderOnly *bool
+	// WebTheme and WebThemeLocked, see User: WebTheme is one of WebThemes
+	// or empty. Whether the Custom theme is offered is the caller's to
+	// check.
+	WebTheme       *string
+	WebThemeLocked *bool
+	// AudioRegion, see User: one of localization.AudioVariants or empty.
+	AudioRegion *string
+	// RemoteAccess, see User.
+	RemoteAccess *bool
+	// LiveTvChannels, see User.
+	LiveTvChannels *ChannelRule
+	// LocalFirst, see User.
+	LocalFirst *bool
+	// NextUpWithResume, see User.
+	NextUpWithResume *bool
+	// BoostVolume and ConvertSound, see User.
+	BoostVolume, ConvertSound *bool
+	// InterfaceSize, see User: one of InterfaceSizes.
+	InterfaceSize *string
+}
+
+// Store is the accounts repository.
+type Store struct {
+	db       *pgxpool.Pool
+	settings atomic.Pointer[Settings]
+	// signedOut is told of the devices signed out.
+	signedOut atomic.Pointer[func(devices []ID)]
+	// now is the clock blocks and unused devices are measured by.
+	now func() time.Time
+	// logLevel follows the settings' DetailedLog (see FollowLogLevel).
+	logLevel atomic.Pointer[followedLevel]
+	// changed is closed at the next change of the settings, then made
+	// anew by SettingsChanged; changedMu guards it.
+	changedMu sync.Mutex
+	changed   chan struct{}
+	// box seals the secrets of the settings; nil stores them as they are.
+	box *secrets.Box
+	// secretsMu guards unreadable, the secrets of the settings the box
+	// cannot open, as they are stored, by name.
+	secretsMu  sync.Mutex
+	unreadable map[string]string
+	// signIns remembers the access tokens and API keys resolved lately.
+	signIns signIns
+	// leavers are told of each user deleted (see OnDelete); leaversMu
+	// guards them.
+	leaversMu sync.Mutex
+	leavers   []Leaver
+}
+
+// Option completes a store.
+type Option func(*Store)
+
+// Sealing has the store seal the secrets of the settings with box, and
+// open those sealed; without it, they are stored as they are.
+func Sealing(box *secrets.Box) Option {
+	return func(s *Store) { s.box = box }
+}
+
+// OnSignOut has f told of the devices signed out, once their tokens no
+// longer work: signed out by their app, revoked by an administrator, or
+// signed out with the rest of their account by a password change, or by
+// the account being disabled or deleted.
+func (s *Store) OnSignOut(f func(devices []ID)) {
+	s.signedOut.Store(&f)
+}
+
+func (s *Store) notifySignOut(devices []ID) {
+	if f := s.signedOut.Load(); f != nil && len(devices) > 0 {
+		(*f)(devices)
+	}
+}
+
+// Leaver is told of each user deleted, in the deletion's transaction,
+// before the user's rows go with it: it reads what it opened for user
+// outside Mira, and returns what signs that out, which runs once the
+// deletion is committed and must not wait; nil when there is nothing to
+// sign out. Its error fails the deletion.
+type Leaver func(ctx context.Context, tx pgx.Tx, user ID) (func(), error)
+
+// OnDelete adds leaver to those told of each user deleted.
+func (s *Store) OnDelete(leaver Leaver) {
+	s.leaversMu.Lock()
+	defer s.leaversMu.Unlock()
+	s.leavers = append(s.leavers, leaver)
+}
+
+// qualifiedUserColumns prefixes userColumns with a table alias for joins.
+func qualifiedUserColumns(alias string) string {
+	return alias + "." + strings.ReplaceAll(userColumns, ", ", ", "+alias+".")
+}
+
+// Open returns a store backed by db and loads the server settings.
+func Open(ctx context.Context, db *pgxpool.Pool, options ...Option) (*Store, error) {
+	store := &Store{db: db, now: time.Now}
+	for _, option := range options {
+		option(store)
+	}
+	settings, err := store.loadSettings(ctx)
+	if err != nil {
+		return nil, err
+	}
+	store.settings.Store(&settings)
+	return store, nil
+}
+
+const userColumns = "id, name, is_administrator, is_hidden, is_disabled, created_at, last_login_at, last_activity_at, last_activity_app, " +
+	"max_parental_rating, max_parental_sub_rating, block_unrated_items, video_transcoding, audio_transcoding, content_downloading, " +
+	"personal_addons, use_shared_addons, invalid_login_attempts, blocked_until, " +
+	"max_playbacks, max_bitrate, live_tv, sync_play, remote_control, " +
+	"hidden_libraries, blocked_genres, access_schedules, collection_management, " +
+	"subtitle_management, image_tag, live_tv_management, quality_group, ends_on, ends_at, can_share, group_id, follow_group, metadata_language, two_step, torrent_streams, " +
+	"provider_only, web_theme, web_theme_locked, audio_region, remote_access, live_tv_channels, local_first, next_up_with_resume, " +
+	"boost_volume, convert_sound, interface_size"
+
+// fields lists where the userColumns of a row go.
+func (user *User) fields() []any {
+	return []any{&user.ID, &user.Name, &user.IsAdministrator, &user.IsHidden, &user.IsDisabled,
+		&user.CreatedAt, &user.LastLoginAt, &user.LastActivityAt, &user.LastActivityApp,
+		&user.Parental.MaxRating, &user.Parental.MaxSubRating, &user.Parental.BlockUnrated,
+		&user.VideoTranscoding, &user.AudioTranscoding, &user.ContentDownloading,
+		&user.PersonalAddons, &user.UseSharedAddons, &user.InvalidLoginAttempts, &user.BlockedUntil,
+		&user.MaxPlaybacks, &user.MaxBitrate, &user.LiveTv, &user.SyncPlay, &user.RemoteControl,
+		&user.HiddenLibraries, &user.BlockedGenres, &user.AccessSchedules, &user.CollectionManagement,
+		&user.SubtitleManagement, &user.ImageTag, &user.LiveTvManagement, &user.QualityGroup, &user.EndsOn, &user.EndsAt, &user.CanShare,
+		&user.GroupID, &user.FollowGroup, &user.MetadataLanguage, &user.TwoStep, &user.TorrentStreams,
+		&user.ProviderOnly, &user.WebTheme, &user.WebThemeLocked, &user.AudioRegion, &user.RemoteAccess, &user.LiveTvChannels, &user.LocalFirst,
+		&user.NextUpWithResume, &user.BoostVolume, &user.ConvertSound, &user.InterfaceSize}
+}
+
+func scanUser(row pgx.Row) (User, error) {
+	var user User
+	err := row.Scan(user.fields()...)
+	if errors.Is(err, pgx.ErrNoRows) {
+		return user, ErrNotFound
+	}
+	return user, err
+}
+
+// normalizeName trims a user name and checks the characters Jellyfin apps
+// display and type reliably.
+func normalizeName(name string) (string, error) {
+	name = strings.TrimSpace(name)
+	if name == "" || utf8.RuneCountInString(name) > maxNameLength {
+		return "", ErrInvalidName
+	}
+	for _, r := range name {
+		if !unicode.IsLetter(r) && !unicode.IsDigit(r) && !strings.ContainsRune(" -_'.@+", r) {
+			return "", ErrInvalidName
+		}
+	}
+	return name, nil
+}
+
+func checkPassword(password string) error {
+	length := utf8.RuneCountInString(password)
+	if length < minPasswordLength || len(password) > maxPasswordLength {
+		return ErrInvalidPassword
+	}
+	return nil
+}
+
+func uniqueViolation(err error) bool {
+	var pgErr *pgconn.PgError
+	return errors.As(err, &pgErr) && pgErr.Code == "23505"
+}
+
+// SetupRequired reports whether no administrator exists yet.
+func (s *Store) SetupRequired(ctx context.Context) (bool, error) {
+	var exists bool
+	err := s.db.QueryRow(ctx, "SELECT EXISTS (SELECT 1 FROM users WHERE is_administrator)").Scan(&exists)
+	return !exists, err
+}
+
+// CreateFirstAdministrator creates the first administrator, once. language,
+// the language the administrator set the server up in, becomes the server
+// language when it is one of i18n.Languages; anything else is ignored.
+func (s *Store) CreateFirstAdministrator(ctx context.Context, name, password, language string) (User, error) {
+	var user User
+	var settings *Settings
+	err := pgx.BeginFunc(ctx, s.db, func(tx pgx.Tx) error {
+		if _, err := tx.Exec(ctx, "SELECT pg_advisory_xact_lock($1)", administratorsLock); err != nil {
+			return err
+		}
+		var exists bool
+		if err := tx.QueryRow(ctx, "SELECT EXISTS (SELECT 1 FROM users WHERE is_administrator)").Scan(&exists); err != nil {
+			return err
+		}
+		if exists {
+			return ErrSetupComplete
+		}
+		var err error
+		user, err = createUser(ctx, tx, NewUser{Name: name, Password: password, IsAdministrator: true, IsHidden: true})
+		if err != nil || !i18n.Valid(language) {
+			return err
+		}
+		settings = &Settings{}
+		return tx.QueryRow(ctx, "UPDATE settings SET language = $1 RETURNING "+settingsColumns, language).Scan(settings.fields()...)
+	})
+	if err == nil && settings != nil {
+		s.openSecrets(settings)
+		s.storeSettings(settings)
+	}
+	return user, err
+}
+
+// CreateUser adds an account, in its group if it names one.
+func (s *Store) CreateUser(ctx context.Context, user NewUser) (User, error) {
+	if user.Group == nil {
+		return createUser(ctx, s.db, user)
+	}
+	var created User
+	err := pgx.BeginFunc(ctx, s.db, func(tx pgx.Tx) error {
+		var err error
+		created, err = createUserIn(ctx, tx, user)
+		return err
+	})
+	if err != nil {
+		return User{}, err
+	}
+	return created, nil
+}
+
+// UserError is why one of the accounts CreateUsers was given could not be
+// created; Index is its place in the list.
+type UserError struct {
+	Index int
+	Err   error
+}
+
+func (e *UserError) Error() string {
+	return fmt.Sprintf("user %d: %v", e.Index, e.Err)
+}
+
+func (e *UserError) Unwrap() error {
+	return e.Err
+}
+
+// CreateUsers adds accounts, under the rules of CreateUser, all of them or
+// none: when one cannot be created, nothing is, and the error is a
+// *UserError naming it. Two of them with the same name make the second's
+// ErrNameTaken.
+func (s *Store) CreateUsers(ctx context.Context, users []NewUser) ([]User, error) {
+	created := make([]User, 0, len(users))
+	err := pgx.BeginFunc(ctx, s.db, func(tx pgx.Tx) error {
+		for i, user := range users {
+			added, err := createUserIn(ctx, tx, user)
+			if err != nil {
+				return &UserError{Index: i, Err: err}
+			}
+			created = append(created, added)
+		}
+		return nil
+	})
+	if err != nil {
+		return nil, err
+	}
+	return created, nil
+}
+
+// createUserIn adds an account in tx, and has it join and follow its group
+// if it names one.
+func createUserIn(ctx context.Context, tx pgx.Tx, user NewUser) (User, error) {
+	if user.Group != nil && user.IsAdministrator {
+		return User{}, ErrAdministratorGroup
+	}
+	created, err := createUser(ctx, tx, user)
+	if err != nil || user.Group == nil {
+		return created, err
+	}
+	created, _, err = applyUserChanges(ctx, tx, created.ID, UserChanges{Group: user.Group}, userUpdate{}, signIn{})
+	return created, err
+}
+
+func createUser(ctx context.Context, db interface {
+	QueryRow(context.Context, string, ...any) pgx.Row
+}, user NewUser) (User, error) {
+	name, err := normalizeName(user.Name)
+	if err != nil {
+		return User{}, err
+	}
+	password := user.Password
+	if user.ProviderOnly && password == "" {
+		password = unknowablePassword()
+	}
+	if err := checkPassword(password); err != nil {
+		return User{}, err
+	}
+	// The administratorPermissions take is_administrator, the other
+	// settings a group holds their columns' defaults (see newUserValues).
+	created, err := scanUser(db.QueryRow(ctx,
+		"INSERT INTO users (name, password_hash, is_administrator, is_hidden, provider_only, "+strings.Join(administratorPermissions, ", ")+
+			") VALUES ($1, $2, $3, $4, $5, $3, $3, $3, $3) RETURNING "+userColumns,
+		name, hashPassword(password), user.IsAdministrator, user.IsHidden, user.ProviderOnly))
+	if uniqueViolation(err) {
+		return User{}, ErrNameTaken
+	}
+	return created, err
+}
+
+// User returns one account. One read less than signInLife ago is not read
+// again: every change to it this process makes forgets it (see
+// forgetSignIns), so that it applies from the user's next request.
+func (s *Store) User(ctx context.Context, id ID) (User, error) {
+	now := s.now()
+	if user, ok := s.signIns.user(id, now); ok {
+		return user, nil
+	}
+	generation := s.signIns.current()
+	user, err := scanUser(s.db.QueryRow(ctx, "SELECT "+userColumns+" FROM users WHERE id = $1", id))
+	if err != nil {
+		return User{}, err
+	}
+	s.signIns.keepUser(user, now, generation)
+	return user, nil
+}
+
+// Users returns every account, sorted by name.
+func (s *Store) Users(ctx context.Context) ([]User, error) {
+	rows, err := s.db.Query(ctx, "SELECT "+userColumns+" FROM users ORDER BY lower(name), id")
+	if err != nil {
+		return nil, err
+	}
+	return pgx.CollectRows(rows, func(row pgx.CollectableRow) (User, error) { return scanUser(row) })
+}
+
+// Authenticate checks a name and password. The name is matched without
+// regard to case. A disabled or ended account is reported only after its
+// password is verified, so the response does not reveal which names exist.
+//
+// While Settings.LoginAttempts is set, that many wrong passwords in a row
+// block the account for LoginBlock: every sign-in is then refused as a
+// wrong password is, the right password included, and a sign-in, a new
+// password or Unblock starts the count again. The wrong password that
+// blocks the account is a *BlockError. Jellyfin disables the account
+// instead, until an administrator enables it again; Mira only blocks it
+// for a while, so that the last administrator can never be locked out for
+// good.
+func (s *Store) Authenticate(ctx context.Context, name, password string) (User, error) {
+	var hash string
+	var user User
+	err := s.db.QueryRow(ctx,
+		"SELECT password_hash, "+userColumns+" FROM users WHERE lower(name) = lower($1)",
+		strings.TrimSpace(name)).Scan(append([]any{&hash}, user.fields()...)...)
+	if errors.Is(err, pgx.ErrNoRows) {
+		_, _ = verifyPassword(password, unknownUserHash)
+		return User{}, ErrInvalidCredentials
+	}
+	if err != nil {
+		return User{}, err
+	}
+	ok := false
+	if len(password) <= maxPasswordLength {
+		if ok, err = verifyPassword(password, hash); err != nil {
+			return User{}, fmt.Errorf("user %s: %w", user.ID, err)
+		}
+	}
+	// An account that signs in through the provider alone refuses every
+	// password, as a wrong one, which counts toward the client's attempts
+	// but not toward the account's: nobody may block it with passwords
+	// that could never be right.
+	if user.ProviderOnly {
+		return User{}, ErrInvalidCredentials
+	}
+	limit, now := s.Settings().LoginAttempts, s.now()
+	if limit > 0 && user.Blocked(now) {
+		return User{}, ErrInvalidCredentials
+	}
+	if !ok {
+		if limit > 0 {
+			counted, blocked, err := s.countWrongPassword(ctx, user.ID, limit, now)
+			if err != nil {
+				return User{}, err
+			}
+			if blocked {
+				return User{}, &BlockError{User: counted}
+			}
+		}
+		return User{}, ErrInvalidCredentials
+	}
+	if user.InvalidLoginAttempts > 0 || user.BlockedUntil != nil {
+		if user, err = s.Unblock(ctx, user.ID); err != nil {
+			return User{}, err
+		}
+	}
+	if user.Refused(now) {
+		return User{}, ErrDisabled
+	}
+	return user, nil
+}
+
+// UpdateUser applies changes to an account. A new password or disabling the
+// account signs out all of its devices and admin sessions, except the admin
+// session whose token hash is keepSession (the caller changing their own
+// password stays signed in).
+func (s *Store) UpdateUser(ctx context.Context, id ID, changes UserChanges, keepSession []byte) (User, error) {
+	return s.updateUser(ctx, id, changes, signIn{adminSession: keepSession})
+}
+
+// UpdateUserFromDevice applies changes an administrator made from a
+// Jellyfin app: when they sign the account out, the app's device, which
+// may be the account's own, stays signed in.
+func (s *Store) UpdateUserFromDevice(ctx context.Context, id ID, changes UserChanges, device ID) (User, error) {
+	return s.updateUser(ctx, id, changes, signIn{device: &device})
+}
+
+// signIn names the admin session or Jellyfin device that made a change to
+// an account, which stays signed in when the change signs the account out
+// everywhere else. The zero value keeps nothing.
+type signIn struct {
+	adminSession []byte
+	device       *ID
+}
+
+// userUpdate is a UserChanges checked and normalized, as it is written.
+type userUpdate struct {
+	name, hash *string
+	parental   ParentalControl
+	hidden     *[]ID
+	genres     *[]string
+	schedules  *[]AccessSchedule
+	channels   *ChannelRule
+}
+
+// prepare checks changes and normalizes what they set.
+func (changes UserChanges) prepare() (userUpdate, error) {
+	var u userUpdate
+	if changes.Parental != nil {
+		normalized, err := changes.Parental.normalized()
+		if err != nil {
+			return u, err
+		}
+		u.parental = normalized
+	}
+	if err := changes.checkAccess(); err != nil {
+		return u, err
+	}
+	if changes.HiddenLibraries != nil {
+		u.hidden = new(normalizedLibraries(*changes.HiddenLibraries))
+	}
+	if changes.BlockedGenres != nil {
+		normalized, err := normalizedGenres(*changes.BlockedGenres)
+		if err != nil {
+			return u, err
+		}
+		u.genres = &normalized
+	}
+	if changes.AccessSchedules != nil {
+		normalized, err := normalizedSchedules(*changes.AccessSchedules)
+		if err != nil {
+			return u, err
+		}
+		u.schedules = &normalized
+	}
+	if changes.LiveTvChannels != nil {
+		normalized, err := changes.LiveTvChannels.normalized()
+		if err != nil {
+			return u, err
+		}
+		u.channels = &normalized
+	}
+	if changes.MetadataLanguage != nil && *changes.MetadataLanguage != "" && !MetadataLanguageCode(*changes.MetadataLanguage) {
+		return u, ErrInvalidMetadataLanguage
+	}
+	if changes.WebTheme != nil && *changes.WebTheme != "" && !slices.Contains(WebThemes, *changes.WebTheme) {
+		return u, ErrInvalidWebTheme
+	}
+	if changes.AudioRegion != nil && *changes.AudioRegion != "" && !localization.AudioVariantOffered(*changes.AudioRegion) {
+		return u, ErrInvalidAudioRegion
+	}
+	if changes.InterfaceSize != nil && !slices.Contains(InterfaceSizes, *changes.InterfaceSize) {
+		return u, ErrInvalidInterfaceSize
+	}
+	if changes.Name != nil {
+		normalized, err := normalizeName(*changes.Name)
+		if err != nil {
+			return u, err
+		}
+		u.name = &normalized
+	}
+	if changes.Password != nil {
+		if err := checkPassword(*changes.Password); err != nil {
+			return u, err
+		}
+		hashed := hashPassword(*changes.Password)
+		u.hash = &hashed
+	}
+	return u, nil
+}
+
+func (s *Store) updateUser(ctx context.Context, id ID, changes UserChanges, keep signIn) (User, error) {
+	u, err := changes.prepare()
+	if err != nil {
+		return User{}, err
+	}
+	var updated User
+	var signedOut []ID
+	err = pgx.BeginFunc(ctx, s.db, func(tx pgx.Tx) error {
+		var err error
+		updated, signedOut, err = applyUserChanges(ctx, tx, id, changes, u, keep)
+		return err
+	})
+	// Whatever changed, permissions, limits or a sign-out, applies from
+	// the user's next request.
+	s.forgetSignIns()
+	if err == nil {
+		s.notifySignOut(signedOut)
+	}
+	return updated, err
+}
+
+// applyUserChanges applies changes, prepared as u, to the account id in tx,
+// and returns it with the devices it signed out. It takes the
+// administrators' lock first, which also serializes the changes to groups.
+func applyUserChanges(ctx context.Context, tx pgx.Tx, id ID, changes UserChanges, u userUpdate, keep signIn) (User, []ID, error) {
+	if _, err := tx.Exec(ctx, "SELECT pg_advisory_xact_lock($1)", administratorsLock); err != nil {
+		return User{}, nil, err
+	}
+	current, err := scanUser(tx.QueryRow(ctx, "SELECT "+userColumns+" FROM users WHERE id = $1 FOR UPDATE", id))
+	if err != nil {
+		return User{}, nil, err
+	}
+	staysAdministrator := current.IsAdministrator && (changes.IsAdministrator == nil || *changes.IsAdministrator)
+	staysEnabled := !current.IsDisabled && (changes.IsDisabled == nil || !*changes.IsDisabled)
+	if current.IsAdministrator && !current.IsDisabled && !(staysAdministrator && staysEnabled) {
+		if err := requireAnotherAdministrator(ctx, tx, id); err != nil {
+			return User{}, nil, err
+		}
+	}
+	// An administrator's account never ends, so that the last one is
+	// never locked out: making a user one clears their end. A date set,
+	// or never, replaces an exact end, which no other change touches.
+	endsOn, endsAt := current.EndsOn, current.EndsAt
+	if changes.EndsOn != nil {
+		endsOn, endsAt = endDate(*changes.EndsOn), nil
+	}
+	administrator := current.IsAdministrator
+	if changes.IsAdministrator != nil {
+		administrator = *changes.IsAdministrator
+	}
+	if administrator {
+		if changes.EndsOn != nil && endsOn != nil {
+			return User{}, nil, ErrAdministratorEnds
+		}
+		endsOn, endsAt = nil, nil
+	}
+	membership, err := groupMembership(ctx, tx, current, administrator, changes, u)
+	if err != nil {
+		return User{}, nil, err
+	}
+	if u.hash != nil {
+		// A new password starts the count of wrong ones again.
+		if _, err := tx.Exec(ctx, "UPDATE users SET invalid_login_attempts = 0, blocked_until = NULL WHERE id = $1", id); err != nil {
+			return User{}, nil, err
+		}
+	}
+	updated, err := scanUser(tx.QueryRow(ctx, `UPDATE users SET
+			name = coalesce($2, name),
+			password_hash = coalesce($3, password_hash),
+			is_administrator = coalesce($4, is_administrator),
+			is_hidden = coalesce($5, is_hidden),
+			is_disabled = coalesce($6, is_disabled),
+			max_parental_rating = CASE WHEN $7 THEN $8 ELSE max_parental_rating END,
+			max_parental_sub_rating = CASE WHEN $7 THEN $9 ELSE max_parental_sub_rating END,
+			block_unrated_items = CASE WHEN $7 THEN $10 ELSE block_unrated_items END,
+			video_transcoding = coalesce($11, video_transcoding),
+			audio_transcoding = coalesce($12, audio_transcoding),
+			content_downloading = coalesce($13, content_downloading),
+			personal_addons = coalesce($14, personal_addons),
+			max_playbacks = coalesce($15, max_playbacks),
+			max_bitrate = coalesce($16, max_bitrate),
+			live_tv = coalesce($17, live_tv),
+			sync_play = coalesce($18, sync_play),
+			remote_control = coalesce($19, remote_control),
+			hidden_libraries = coalesce($20, hidden_libraries),
+			blocked_genres = coalesce($21, blocked_genres),
+			access_schedules = coalesce($22::jsonb, access_schedules),
+			collection_management = coalesce($23, collection_management),
+			subtitle_management = coalesce($24, subtitle_management),
+			live_tv_management = coalesce($25, live_tv_management),
+			quality_group = coalesce($26, quality_group),
+			use_shared_addons = coalesce($27, use_shared_addons),
+			ends_on = $28,
+			ends_at = $45,
+			end_recorded = end_recorded AND ends_on IS NOT DISTINCT FROM $28 AND ends_at IS NOT DISTINCT FROM $45,
+			can_share = coalesce($29, can_share),
+			group_id = $30,
+			follow_group = $31,
+			metadata_language = coalesce($32, metadata_language),
+			torrent_streams = coalesce($33, torrent_streams),
+			provider_only = coalesce($34, provider_only),
+			web_theme = coalesce($35, web_theme),
+			web_theme_locked = coalesce($36, web_theme_locked),
+			audio_region = coalesce($37, audio_region),
+			remote_access = coalesce($38, remote_access),
+			live_tv_channels = coalesce($39::jsonb, live_tv_channels),
+			local_first = coalesce($40, local_first),
+			next_up_with_resume = coalesce($41, next_up_with_resume),
+			boost_volume = coalesce($42, boost_volume),
+			convert_sound = coalesce($43, convert_sound),
+			interface_size = coalesce($44, interface_size)
+		WHERE id = $1 RETURNING `+userColumns,
+		id, u.name, u.hash, changes.IsAdministrator, changes.IsHidden, changes.IsDisabled,
+		changes.Parental != nil, u.parental.MaxRating, u.parental.MaxSubRating, u.parental.BlockUnrated,
+		changes.VideoTranscoding, changes.AudioTranscoding, changes.ContentDownloading,
+		changes.PersonalAddons,
+		changes.MaxPlaybacks, changes.MaxBitrate, changes.LiveTv, changes.SyncPlay, changes.RemoteControl,
+		u.hidden, u.genres, u.schedules, changes.CollectionManagement,
+		changes.SubtitleManagement, changes.LiveTvManagement, changes.QualityGroup, changes.UseSharedAddons, endsOn, changes.CanShare,
+		membership.group, membership.follow, changes.MetadataLanguage, changes.TorrentStreams, changes.ProviderOnly,
+		changes.WebTheme, changes.WebThemeLocked, changes.AudioRegion, changes.RemoteAccess, u.channels, changes.LocalFirst,
+		changes.NextUpWithResume, changes.BoostVolume, changes.ConvertSound, changes.InterfaceSize, endsAt))
+	if uniqueViolation(err) {
+		return User{}, nil, ErrNameTaken
+	}
+	if err != nil {
+		return User{}, nil, err
+	}
+	if membership.takeValues {
+		if updated, err = scanUser(tx.QueryRow(ctx, "UPDATE users SET ("+groupColumns+") = (SELECT "+groupColumns+
+			" FROM user_groups WHERE id = $2) WHERE id = $1 RETURNING "+userColumns, id, membership.group)); err != nil {
+			return User{}, nil, err
+		}
+	}
+	var signedOut []ID
+	if u.hash != nil || (updated.IsDisabled && !current.IsDisabled) {
+		if signedOut, err = signOutEverywhere(ctx, tx, id, keep); err != nil {
+			return User{}, nil, err
+		}
+	}
+	// A user who may no longer share, or is disabled, loses their links.
+	if !updated.CanShare || updated.IsDisabled {
+		if err := revokeShareLinks(ctx, tx, id); err != nil {
+			return User{}, nil, err
+		}
+	}
+	return updated, signedOut, nil
+}
+
+// ChangePassword replaces the caller's own password after checking the
+// current one.
+func (s *Store) ChangePassword(ctx context.Context, id ID, current, next string, keepSession []byte) error {
+	return s.changePassword(ctx, id, current, next, signIn{adminSession: keepSession})
+}
+
+// ChangePasswordFromDevice replaces the password of the user signed in on a
+// Jellyfin app after checking the current one. The app's device stays
+// signed in; the account's other devices and admin sessions are signed out.
+func (s *Store) ChangePasswordFromDevice(ctx context.Context, id ID, current, next string, device ID) error {
+	return s.changePassword(ctx, id, current, next, signIn{device: &device})
+}
+
+func (s *Store) changePassword(ctx context.Context, id ID, current, next string, keep signIn) error {
+	var hash string
+	if err := s.db.QueryRow(ctx, "SELECT password_hash FROM users WHERE id = $1", id).Scan(&hash); err != nil {
+		if errors.Is(err, pgx.ErrNoRows) {
+			return ErrNotFound
+		}
+		return err
+	}
+	ok, err := verifyPassword(current, hash)
+	if err != nil {
+		return err
+	}
+	if !ok {
+		return ErrWrongPassword
+	}
+	_, err = s.updateUser(ctx, id, UserChanges{Password: &next}, keep)
+	return err
+}
+
+// DeleteUser removes an account with its devices and sessions, and revokes
+// the invites whose new accounts copy it. What the leavers opened for the
+// user outside Mira is signed out once it is done (see OnDelete).
+func (s *Store) DeleteUser(ctx context.Context, id ID) error {
+	s.leaversMu.Lock()
+	leavers := slices.Clone(s.leavers)
+	s.leaversMu.Unlock()
+	var signedOut []ID
+	var leave []func()
+	err := pgx.BeginFunc(ctx, s.db, func(tx pgx.Tx) error {
+		if _, err := tx.Exec(ctx, "SELECT pg_advisory_xact_lock($1)", administratorsLock); err != nil {
+			return err
+		}
+		current, err := scanUser(tx.QueryRow(ctx, "SELECT "+userColumns+" FROM users WHERE id = $1 FOR UPDATE", id))
+		if err != nil {
+			return err
+		}
+		if current.IsAdministrator && !current.IsDisabled {
+			if err := requireAnotherAdministrator(ctx, tx, id); err != nil {
+				return err
+			}
+		}
+		// What goes with the account is read while it is locked.
+		for _, leaver := range leavers {
+			after, err := leaver(ctx, tx, id)
+			if err != nil {
+				return err
+			}
+			if after != nil {
+				leave = append(leave, after)
+			}
+		}
+		// The devices would go with the account; they are listed first, to
+		// be told signed out.
+		if signedOut, err = deletedDevices(tx.Query(ctx, "DELETE FROM devices WHERE user_id = $1 RETURNING id", id)); err != nil {
+			return err
+		}
+		// Before the account goes, so that an invite being accepted either
+		// copies it or is found revoked.
+		if _, err := tx.Exec(ctx, "UPDATE invites SET revoked_at = now() WHERE model_user_id = $1 AND revoked_at IS NULL", id); err != nil {
+			return err
+		}
+		_, err = tx.Exec(ctx, "DELETE FROM users WHERE id = $1", id)
+		return err
+	})
+	s.forgetSignIns()
+	if err == nil {
+		s.notifySignOut(signedOut)
+		for _, after := range leave {
+			after()
+		}
+	}
+	return err
+}
+
+func requireAnotherAdministrator(ctx context.Context, tx pgx.Tx, except ID) error {
+	var others bool
+	err := tx.QueryRow(ctx,
+		"SELECT EXISTS (SELECT 1 FROM users WHERE is_administrator AND NOT is_disabled AND id <> $1)",
+		except).Scan(&others)
+	if err != nil {
+		return err
+	}
+	if !others {
+		return ErrLastAdministrator
+	}
+	return nil
+}
+
+func signOutEverywhere(ctx context.Context, tx pgx.Tx, user ID, keep signIn) ([]ID, error) {
+	// The admin session kept keeps the web client's sign-in it was taken
+	// from, whose end would end it (see CreateDeviceAdminSession), as Jellyfin
+	// keeps the token that changed the password.
+	devices, err := deletedDevices(tx.Query(ctx, `DELETE FROM devices WHERE user_id = $1 AND id IS DISTINCT FROM $2
+		AND id IS DISTINCT FROM (SELECT device FROM admin_sessions WHERE token_hash = $3)
+		RETURNING id`, user, keep.device, keep.adminSession))
+	if err != nil {
+		return nil, err
+	}
+	_, err = tx.Exec(ctx,
+		"DELETE FROM admin_sessions WHERE user_id = $1 AND token_hash IS DISTINCT FROM $2", user, keep.adminSession)
+	return devices, err
+}

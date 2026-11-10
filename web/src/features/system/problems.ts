@@ -1,0 +1,281 @@
+import { useQuery } from '@tanstack/react-query'
+import {
+  fetchHealth,
+  fetchHealthProblems,
+  queryKeys,
+  type HealthProblem,
+  type Owner,
+  type UnreadableSecret,
+} from '@/api'
+import { dateTime, formatBytes } from '@/format'
+import { useI18n } from '@/i18n'
+import type { Messages } from '@/i18n'
+
+/** How often the health is read again where it is followed, in milliseconds. */
+const healthPoll = 30_000
+
+/**
+ * The server's health. With `poll`, read again every 30 seconds: a page follows it with one
+ * observer only, while what shows it is on screen, as reading it scans the library.
+ */
+export function useHealth(poll = false) {
+  return useQuery({
+    queryKey: queryKeys.health,
+    queryFn: ({ signal }) => fetchHealth(signal),
+    refetchInterval: poll ? healthPoll : false,
+  })
+}
+
+/** The problems the server finds, errors first, refreshed every 10 seconds. */
+export function useHealthProblems() {
+  const { language } = useI18n()
+  return useQuery({
+    queryKey: queryKeys.healthProblems(language),
+    queryFn: async ({ signal }) => (await fetchHealthProblems(language, signal)).problems,
+    refetchInterval: 10_000,
+  })
+}
+
+/** A row's name, followed by whose it is when it is a user's own. */
+function ownedName(t: Messages, name: string, owner: Owner): string {
+  return owner === null ? name : `${name} (${t.system.health.owner.user(owner.name)})`
+}
+
+/**
+ * The name of a stored secret the key cannot decrypt: a server setting, the keys of the
+ * certificate of Let's Encrypt, a user's two-step sign-in, a network share's password, a user's
+ * tracking or app connection, or a notification target of a user or of the server.
+ */
+export function unreadableName(t: Messages, secret: UnreadableSecret): string {
+  const text = t.system.health
+  if (secret.setting !== null) return text.secretNames[secret.setting]
+  if (secret.certificate) return text.certificateKeys
+  if (secret.twoStep) return text.twoStepOf(secret.user ?? '')
+  if (secret.folder !== null) return text.sharePasswordOf(secret.folder)
+  if (secret.destination !== null) return text.destinationSecretOf(secret.destination)
+  if (secret.target !== null) {
+    return secret.user === null
+      ? text.serverTargetOf(secret.target)
+      : text.targetOf(secret.target, secret.user)
+  }
+  if (secret.app !== null) {
+    return text.connectionOf(t.account.appImport.apps[secret.app], secret.user ?? '')
+  }
+  return text.connectionOf(serviceNames[secret.service ?? 'trakt'], secret.user ?? '')
+}
+
+/** The tracking services by their names. */
+const serviceNames = {
+  trakt: 'Trakt',
+  simkl: 'Simkl',
+  mdblist: 'MDBList',
+  publicmetadb: 'PublicMetaDB',
+  anilist: 'AniList',
+  myanimelist: 'MyAnimeList',
+  lastfm: 'Last.fm',
+  listenbrainz: 'ListenBrainz',
+}
+
+/** The reasons a torrent's peers did not connect, in the order Health tells them. */
+const peerReasons = [
+  'connected',
+  'timedOut',
+  'refused',
+  'unreachable',
+  'proxy',
+  'closed',
+  'left',
+  'other',
+  'untried',
+] as const
+
+/** Why a torrent that did not start, with peers found, sent nothing: its peers counted by why. */
+function torrentStartWhy(
+  t: Messages,
+  problem: Extract<HealthProblem, { code: 'torrent_start' }>,
+): string {
+  const text = t.system.health.problems
+  const why = text.torrentStartWhy[problem.failure]
+  const peers = problem.peers
+  if (!peers) return why
+  const counts = peerReasons.flatMap((reason) => {
+    const n = peers[reason] ?? 0
+    return n > 0 ? [text.torrentPeerWhy[reason](n)] : []
+  })
+  return counts.length === 0
+    ? why
+    : `${why} (${text.torrentStartPeers(peers.found, counts.join(', '))})`
+}
+
+/**
+ * That a host answers an error file instead of the videos, since a time: Health's problem, and the
+ * notice on the versions from that host, each followed by what to check
+ * (`problems.hostErrorFileHint`).
+ */
+export function hostErrorFileText(
+  t: Messages,
+  language: string,
+  host: string,
+  since: string,
+): string {
+  return t.system.health.problems.hostErrorFile(
+    host,
+    new Intl.DateTimeFormat(language, { timeStyle: 'short' }).format(new Date(since)),
+  )
+}
+
+/** What a problem the server found says. */
+export function problemText(t: Messages, language: string, problem: HealthProblem): string {
+  const health = t.system.health
+  const text = health.problems
+  switch (problem.code) {
+    case 'database':
+      return text.database
+    case 'disk':
+      return text.disk(health.folders[problem.folder], formatBytes(problem.free, language))
+    case 'addon':
+      if (problem.until !== undefined) {
+        return text.addonTimingOut(
+          ownedName(t, problem.name, problem.owner ?? null),
+          new Intl.DateTimeFormat(language, { timeStyle: 'short' }).format(new Date(problem.until)),
+        )
+      }
+      return text.addon(
+        ownedName(t, problem.name, problem.owner ?? null),
+        health.failures[problem.failure] ?? problem.failure,
+      )
+    case 'conversions_full':
+      return text.conversionsFull
+    case 'thumbnails_paused':
+      return text.paused(problem.host)
+    case 'unknown_proxy':
+      return text.unknownProxy(problem.address)
+    case 'discovery_port':
+      return text.discoveryPort(problem.port)
+    case 'dlna_port':
+      return text.dlnaPort(problem.port)
+    case 'torrent_route': {
+      const why = text.torrentWhy[problem.failure](problem.name ?? '')
+      return problem.grace === undefined
+        ? text.torrentRoute(why)
+        : text.torrentRouteRiding(why.charAt(0).toUpperCase() + why.slice(1), problem.grace)
+    }
+    case 'torrent_udp':
+      return text.torrentUdp(problem.name)
+    case 'torrent_start':
+      return text.torrentStart(torrentStartWhy(t, problem))
+    case 'torrent_stopped':
+      return text.torrentStopped(
+        new Intl.DateTimeFormat(language, { timeStyle: 'short' }).format(new Date(problem.at)),
+        text.torrentStoppedWhy[problem.failure](problem.name ?? ''),
+      )
+    case 'host_error_file':
+      return `${hostErrorFileText(t, language, problem.host, problem.at)} ${text.hostErrorFileHint}`
+    case 'discovery_address':
+      return text.discoveryAddress(problem.address)
+    case 'proxy_name_unresolved':
+      return text.proxyNameUnresolved(problem.name)
+    case 'secrets_unreadable':
+      return text.unreadableSecrets(
+        problem.secrets.map((secret) => unreadableName(t, secret)).join(', '),
+      )
+    case 'secrets_plaintext':
+      return text.plaintextSecrets
+    case 'backup_failed':
+      return text.backupFailed
+    case 'backup_stale':
+      return text.backupStale
+    case 'backup_destination_failed':
+      return text.backupDestinationFailed(problem.name)
+    case 'backup_destination_stale':
+      return text.backupDestinationStale(problem.name)
+    case 'iptv':
+      return text.iptv(ownedName(t, problem.name, problem.owner ?? null))
+    case 'tuner':
+      return problem.failure === 'unreachable'
+        ? text.tunerUnreachable(problem.name)
+        : text.tuner(problem.name)
+    case 'guide':
+      return text.guide(ownedName(t, problem.name, problem.owner ?? null))
+    case 'folder':
+      if (problem.failure === 'unreachable') return text.shareUnreachable(problem.name)
+      if (problem.failure === 'refused') return text.shareRefused(problem.name)
+      if (problem.failure === 'host_key_changed') return text.shareHostKey(problem.name)
+      return problem.share !== undefined ? text.share(problem.name) : text.folder(problem.name)
+    case 'folder_unwatched':
+      if (problem.share !== undefined) {
+        if (problem.failure === 'unreachable') return text.shareUnwatchedUnreachable(problem.name)
+        if (problem.failure === 'refused') return text.shareUnwatchedRefused(problem.name)
+        if (problem.failure === 'host_key_changed') return text.shareHostKey(problem.name)
+        return text.shareUnwatched(problem.name)
+      }
+      if (problem.failure === 'watch_limit') return text.folderWatchLimit(problem.name)
+      if (problem.failure === 'instance_limit') return text.folderInstanceLimit(problem.name)
+      if (problem.failure === 'open_files_limit') return text.folderOpenFilesLimit(problem.name)
+      return text.folderUnwatched(problem.name)
+    case 'folder_search':
+      return text.folderSearch(
+        problem.name,
+        problem.addon ?? '',
+        t.localFolders.searchFailures[problem.failure] ?? '',
+      )
+    case 'search_late':
+      return text.searchLate(ownedName(t, problem.name, problem.owner ?? null))
+    case 'smart_list_empty':
+      return text.smartListEmpty(problem.name, problem.owner?.name ?? null)
+    case 'virtual_channel_source':
+      return text.virtualChannelSource(problem.name)
+    case 'folder_no_search':
+      return text.folderNoSearch(problem.name)
+    case 'task':
+      return text.task(problem.task)
+    case 'https_port':
+      return text.httpsPort(problem.port)
+    case 'https_files':
+      if (problem.failure === 'missing') return text.httpsFileMissing(problem.file)
+      if (problem.failure === 'mismatch') return text.httpsFilesMismatch
+      return text.httpsFileUnreadable(problem.file)
+    case 'https_renewal':
+      return text.httpsRenewal(problem.error)
+    case 'https_expiry':
+      return problem.tone === 'error'
+        ? text.httpsExpired(dateTime(problem.expires, language))
+        : text.httpsExpires(dateTime(problem.expires, language))
+    case 'subtitle_ocr_language': {
+      const missing = text.subtitleOcrLanguage(ocrLanguageName(language, problem), problem.file)
+      return problem.error ? `${missing} ${text.subtitleOcrDownloadFailed(problem.error)}` : missing
+    }
+    case 'metadata_languages':
+      return text.metadataLanguages(problem.name)
+    case 'nvidia_driver':
+      return text.nvidiaDriver(problem.name)
+    case 'nvidia_older_ffmpeg':
+      return text.nvidiaOlderFFmpeg(problem.failure, problem.error)
+    case 'theme_copy_missing':
+      return text.themeCopyMissing(problem.missing, problem.files)
+    case 'desktop_rolled_back':
+      return text.desktopRolledBack(problem.name, problem.previous, problem.error)
+    case 'folder_unwritable':
+      return text.folderUnwritable(health.folderTitle[problem.folder], problem.path)
+    case 'connection_stopped':
+      return problem.kind === 'app'
+        ? text.appStopped(t.account.appImport.apps[problem.name], problem.owner.name)
+        : text.trackingStopped(serviceNames[problem.name], problem.owner.name)
+  }
+}
+
+/**
+ * A language Tesseract has no data for, named in `language` from its file, as jpn.traineddata
+ * or chi_sim.traineddata, else as the server names it in English.
+ */
+export function ocrLanguageName(language: string, problem: { name: string; file: string }): string {
+  const code = problem.file.replace(/\.traineddata$/, '').split('_')[0]
+  try {
+    return (
+      new Intl.DisplayNames([language], { type: 'language', fallback: 'none' }).of(code) ??
+      problem.name
+    )
+  } catch {
+    return problem.name
+  }
+}

@@ -1,0 +1,647 @@
+package jellyfin
+
+import (
+	"bytes"
+	"context"
+	"encoding/json"
+	"fmt"
+	"io"
+	"log/slog"
+	"net/http"
+	"net/http/httptest"
+	"os"
+	"path/filepath"
+	"slices"
+	"strings"
+	"sync"
+	"sync/atomic"
+	"testing"
+	"time"
+
+	"github.com/jackc/pgx/v5/pgxpool"
+
+	"github.com/ferforastieri/mira/internal/accounts"
+	"github.com/ferforastieri/mira/internal/activity"
+	"github.com/ferforastieri/mira/internal/addons"
+	"github.com/ferforastieri/mira/internal/backup"
+	"github.com/ferforastieri/mira/internal/collections"
+	"github.com/ferforastieri/mira/internal/database"
+	"github.com/ferforastieri/mira/internal/hls"
+	"github.com/ferforastieri/mira/internal/homerows"
+	"github.com/ferforastieri/mira/internal/iptv"
+	"github.com/ferforastieri/mira/internal/library"
+	"github.com/ferforastieri/mira/internal/logs"
+	"github.com/ferforastieri/mira/internal/playback"
+	"github.com/ferforastieri/mira/internal/playlists"
+	"github.com/ferforastieri/mira/internal/preferences"
+	"github.com/ferforastieri/mira/internal/quickconnect"
+	"github.com/ferforastieri/mira/internal/source"
+	"github.com/ferforastieri/mira/internal/stremio"
+	"github.com/ferforastieri/mira/internal/tasks"
+	"github.com/ferforastieri/mira/internal/testdb/migrated"
+	"github.com/ferforastieri/mira/internal/throttle"
+	"github.com/ferforastieri/mira/internal/thumbnails"
+	"github.com/ferforastieri/mira/internal/updates"
+	"github.com/ferforastieri/mira/internal/userdata"
+)
+
+const testServerID = "0123456789abcdef0123456789abcdef"
+
+// The tests hash passwords and derive backup keys at a small cost (see
+// accounts.LowerPasswordCostForTests and backup.LowerKeyCostForTests).
+func TestMain(m *testing.M) {
+	accounts.LowerPasswordCostForTests()
+	backup.LowerKeyCostForTests()
+	m.Run()
+}
+
+type testServer struct {
+	t       *testing.T
+	store   *accounts.Store
+	addons  *addons.Store
+	library *library.Service
+	pool    *pgxpool.Pool
+	url     string
+	// handler serves url, for tests that call it as a request would.
+	handler *Handler
+	// The activity log, tasks and recent log lines the handler serves.
+	activity *activity.Store
+	tasks    *tasks.Registry
+	logs     *logs.Ring
+	// iptv stores the IPTV sources the library lists.
+	iptv *iptv.Service
+	// warnings are the warnings and errors the server logged.
+	warnings *warnings
+}
+
+// warnings keeps the messages of the records at WARN or above that a
+// logger handles, with their attributes, discarding the others; all of
+// them once all is set.
+type warnings struct {
+	mu       sync.Mutex
+	messages []string
+	attrs    []map[string]string
+	all      atomic.Bool
+}
+
+func (w *warnings) Enabled(_ context.Context, level slog.Level) bool {
+	return level >= slog.LevelWarn || w.all.Load()
+}
+
+func (w *warnings) Handle(_ context.Context, record slog.Record) error {
+	attrs := map[string]string{}
+	record.Attrs(func(a slog.Attr) bool {
+		attrs[a.Key] = a.Value.String()
+		return true
+	})
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	w.messages = append(w.messages, record.Message)
+	w.attrs = append(w.attrs, attrs)
+	return nil
+}
+
+func (w *warnings) WithAttrs([]slog.Attr) slog.Handler { return w }
+
+func (w *warnings) WithGroup(string) slog.Handler { return w }
+
+// logged returns the messages logged so far.
+func (w *warnings) logged() []string {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	return slices.Clone(w.messages)
+}
+
+// attrsOf returns the attributes of each record logged so far with message.
+func (w *warnings) attrsOf(message string) []map[string]string {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	var found []map[string]string
+	for i, m := range w.messages {
+		if m == message {
+			found = append(found, w.attrs[i])
+		}
+	}
+	return found
+}
+
+func newTestServer(t *testing.T, failures int) testServer {
+	t.Helper()
+	// Tests seed analyses instead of running ffprobe, which CI lacks.
+	return newProbingServer(t, failures, "ffprobe-not-installed")
+}
+
+// newProbingServer is a test server whose analyses run the ffprobe at
+// ffprobe. configure, if any, completes the handler's options.
+func newProbingServer(t *testing.T, failures int, ffprobe string, configure ...func(*Options, *pgxpool.Pool)) testServer {
+	t.Helper()
+	return newServerReaching(t, failures, ffprobe, nil, configure...)
+}
+
+// newServerReaching is newProbingServer whose requests to sources go
+// through reach, when set: a test serves a source on a public address
+// from a local server with it, never reaching that address.
+func newServerReaching(t *testing.T, failures int, ffprobe string, reach func(source.Opener) source.Opener,
+	configure ...func(*Options, *pgxpool.Pool)) testServer {
+	t.Helper()
+	pool := migrated.New(t)
+	store, err := accounts.Open(t.Context(), pool)
+	if err != nil {
+		t.Fatal(err)
+	}
+	// Playback is prepared ahead, the default, only in the tests that turn
+	// it on: the others count every request to the sources.
+	settings := store.Settings()
+	settings.PrepareAhead = false
+	if _, err := store.UpdateSettings(t.Context(), settings); err != nil {
+		t.Fatal(err)
+	}
+	warned := &warnings{}
+	logger := slog.New(warned)
+	client := stremio.NewClient("test")
+	addonStore := addons.New(pool, client)
+	secret, err := database.Secret(t.Context(), pool)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var opener source.Opener = client
+	if reach != nil {
+		opener = reach(client)
+	}
+	sources, err := source.New(t.TempDir(), func() source.Policy { return source.Policy{Limit: 1 << 30} }, opener, logger)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = sources.Close() })
+	lib := library.New(pool, addonStore, client, logger, store.Settings)
+	// Follow-ups ask addons again, while tests count their requests: only
+	// the tests of follow-ups turn them on (see followedOn).
+	lib.SetFollowUps()
+	channels := iptv.New(pool, addonStore, client, logger, store.Settings)
+	lib.UseIPTV(channels)
+	channels.OnChange(lib.LineupChanged)
+	// Remuxes run FFmpeg when tests are given one.
+	ffmpeg := os.Getenv("MIRA_TEST_FFMPEG")
+	if ffmpeg == "" {
+		ffmpeg = "ffmpeg-not-installed"
+	}
+	segments, err := hls.NewManager(ffmpeg, t.TempDir(), logger)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(segments.Close)
+	player, err := playback.New(pool, opener, ffprobe, playback.NewSigner(secret), sources, segments, lib.Renew, logger, store.Settings)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = player.Close() })
+	channels.UseRetry(player.RetryItem)
+	activityLog := activity.New(pool, store.Settings, logger)
+	registry := tasks.New(logger)
+	ring := logs.NewRing(logs.Capacity)
+	images := thumbnails.New(thumbnails.Options{
+		DB:       pool,
+		FFmpeg:   ffmpeg,
+		Settings: store.Settings,
+		Open:     func(v library.Version) thumbnails.Source { return player.OpenSource(v).Once() },
+		Analyzed: player.Analyzed,
+		// Paced for tests: a request every 10 ms.
+		Pace:   10 * time.Millisecond,
+		Poll:   10 * time.Millisecond,
+		Logger: logger,
+	})
+	t.Cleanup(images.Close)
+	options := Options{
+		ServerID:      testServerID,
+		Accounts:      store,
+		QuickConnect:  quickconnect.New(),
+		SignIns:       throttle.New(failures, time.Minute),
+		WebSocketPort: 8096,
+		Library:       lib,
+		IPTV:          channels,
+		Stremio:       client,
+		Playback:      player,
+		Preferences:   preferences.New(pool),
+		UserData:      userdata.New(pool),
+		Playlists:     playlists.New(pool),
+		Collections:   collections.New(pool),
+		HomeRows:      homerows.New(pool),
+		Thumbnails:    images,
+		Logger:        logger,
+		Activity:      activityLog,
+		Tasks:         registry,
+		Logs:          ring,
+		CacheDir:      t.TempDir(),
+	}
+	for _, c := range configure {
+		c(&options, pool)
+	}
+	handler := New(options)
+	// Refresh metadata forgets the artwork failures the handler remembers,
+	// as in main.
+	if options.Library != nil {
+		options.Library.UseArtworkFailures(handler)
+	}
+	server := httptest.NewServer(handler)
+	t.Cleanup(server.Close)
+	return testServer{t: t, store: store, addons: addonStore, library: lib, pool: pool, url: server.URL, handler: handler,
+		activity: activityLog, tasks: registry, logs: ring, iptv: channels, warnings: warned}
+}
+
+// setting changes the server's settings.
+func (s testServer) setting(t *testing.T, change func(*accounts.Settings)) {
+	t.Helper()
+	settings := s.store.Settings()
+	change(&settings)
+	if _, err := s.store.UpdateSettings(t.Context(), settings); err != nil {
+		t.Fatal(err)
+	}
+}
+
+// listed asks the addons for the versions and subtitles of titles and
+// waits for them, as PlaybackInfo does: item details then describe them
+// all, instead of those known when they opened.
+func (s testServer) listed(t *testing.T, user accounts.User, items ...string) {
+	t.Helper()
+	for _, item := range items {
+		id, err := accounts.ParseID(item)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if _, err := s.library.Versions(t.Context(), user, id); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := s.library.Subtitles(t.Context(), user, id); err != nil {
+			t.Fatal(err)
+		}
+	}
+}
+
+func (s testServer) user(name string, change func(*accounts.UserChanges)) accounts.User {
+	s.t.Helper()
+	user, err := s.store.CreateUser(s.t.Context(), accounts.NewUser{Name: name, Password: "correct horse", IsHidden: true})
+	if err != nil {
+		s.t.Fatal(err)
+	}
+	if change != nil {
+		var changes accounts.UserChanges
+		change(&changes)
+		if user, err = s.store.UpdateUser(s.t.Context(), user.ID, changes, nil); err != nil {
+			s.t.Fatal(err)
+		}
+	}
+	return user
+}
+
+func app(device, token string) string {
+	header := fmt.Sprintf(`MediaBrowser Client="Test App", Device="%s", DeviceId="%s-id", Version="1.0.0"`, device, device)
+	if token != "" {
+		header += fmt.Sprintf(`, Token="%s"`, token)
+	}
+	return header
+}
+
+// testTransport is the tests' own, and testClient its client:
+// httptest.Server.Close closes the idle connections of
+// http.DefaultTransport, which the connection of a parallel test's answer
+// without a body may have just joined (#958).
+var (
+	testTransport = http.DefaultTransport.(*http.Transport).Clone()
+	testClient    = &http.Client{Transport: testTransport}
+)
+
+// call sends a request and returns the status and body.
+func (s testServer) call(method, path, authorization string, body any) (int, []byte) {
+	s.t.Helper()
+	var reader io.Reader
+	if body != nil {
+		encoded, _ := json.Marshal(body)
+		reader = bytes.NewReader(encoded)
+	}
+	request, _ := http.NewRequestWithContext(s.t.Context(), method, s.url+path, reader)
+	if authorization != "" {
+		request.Header.Set("Authorization", authorization)
+	}
+	if body != nil {
+		request.Header.Set("Content-Type", "application/json")
+	}
+	response, err := testClient.Do(request)
+	if err != nil {
+		s.t.Fatal(err)
+	}
+	defer response.Body.Close()
+	payload, _ := io.ReadAll(response.Body)
+	return response.StatusCode, payload
+}
+
+func (s testServer) signIn(name, device string) string {
+	s.t.Helper()
+	status, body := s.call(http.MethodPost, "/Users/AuthenticateByName", app(device, ""),
+		map[string]string{"Username": name, "Pw": "correct horse"})
+	if status != http.StatusOK {
+		s.t.Fatalf("sign-in of %s: %d %s", name, status, body)
+	}
+	var result AuthenticationResult
+	_ = json.Unmarshal(body, &result)
+	return result.AccessToken
+}
+
+func TestSignInAndSignOut(t *testing.T) {
+	t.Parallel()
+	s := newTestServer(t, 10)
+	s.user("alice", nil)
+	s.user("carol", func(c *accounts.UserChanges) { yes := true; c.IsDisabled = &yes })
+
+	for _, tc := range []struct {
+		name          string
+		authorization string
+		body          map[string]string
+		status        int
+	}{
+		{"no app identity", "", map[string]string{"Username": "alice", "Pw": "correct horse"}, http.StatusBadRequest},
+		{"wrong password", app("tv", ""), map[string]string{"Username": "alice", "Pw": "wrong horse"}, http.StatusUnauthorized},
+		{"unknown user", app("tv", ""), map[string]string{"Username": "nobody", "Pw": "correct horse"}, http.StatusUnauthorized},
+		{"disabled user", app("tv", ""), map[string]string{"Username": "carol", "Pw": "correct horse"}, http.StatusForbidden},
+		// Apps send the body in Jellyfin's PascalCase; some send camelCase.
+		{"camelCase body", app("tv", ""), map[string]string{"username": "ALICE", "pw": "correct horse"}, http.StatusOK},
+	} {
+		if status, body := s.call(http.MethodPost, "/Users/AuthenticateByName", tc.authorization, tc.body); status != tc.status {
+			t.Errorf("%s: got %d %s, want %d", tc.name, status, body, tc.status)
+		}
+	}
+
+	first := s.signIn("alice", "tv")
+	if status, _ := s.call(http.MethodGet, "/Users/Me", app("tv", first), nil); status != http.StatusOK {
+		t.Fatalf("/Users/Me with a fresh token: %d", status)
+	}
+	if status, _ := s.call(http.MethodGet, "/Users/Me?ApiKey="+first, "", nil); status != http.StatusOK {
+		t.Fatalf("/Users/Me with ApiKey: %d", status)
+	}
+	second := s.signIn("alice", "tv")
+	if status, _ := s.call(http.MethodGet, "/Users/Me", app("tv", first), nil); status != http.StatusUnauthorized {
+		t.Errorf("the device's previous token still works: %d", status)
+	}
+	if status, _ := s.call(http.MethodPost, "/Sessions/Logout", app("tv", second), nil); status != http.StatusNoContent {
+		t.Fatalf("logout: %d", status)
+	}
+	if status, _ := s.call(http.MethodGet, "/Users/Me", app("tv", second), nil); status != http.StatusUnauthorized {
+		t.Errorf("token still works after logout: %d", status)
+	}
+}
+
+func TestFailedSignInsAreThrottled(t *testing.T) {
+	t.Parallel()
+	s := newTestServer(t, 2)
+	s.user("alice", nil)
+	wrong := map[string]string{"Username": "alice", "Pw": "wrong horse"}
+	for range 2 {
+		s.call(http.MethodPost, "/Users/AuthenticateByName", app("tv", ""), wrong)
+	}
+	right := map[string]string{"Username": "alice", "Pw": "correct horse"}
+	if status, _ := s.call(http.MethodPost, "/Users/AuthenticateByName", app("tv", ""), right); status != http.StatusTooManyRequests {
+		t.Errorf("sign-in after the failure limit: got %d, want 429", status)
+	}
+}
+
+func TestQuickConnect(t *testing.T) {
+	t.Parallel()
+	s := newTestServer(t, 10)
+	alice := s.user("alice", nil)
+	phone := s.signIn("alice", "phone")
+	tv := app("tv", "")
+
+	status, body := s.call(http.MethodPost, "/QuickConnect/Initiate", tv, nil)
+	if status != http.StatusOK {
+		t.Fatalf("initiate: %d %s", status, body)
+	}
+	var initiated QuickConnectResult
+	_ = json.Unmarshal(body, &initiated)
+	if len(initiated.Code) != 6 || len(initiated.Secret) != 64 || initiated.DeviceName != "tv" {
+		t.Fatalf("unexpected request: %+v", initiated)
+	}
+	secret := map[string]string{"Secret": initiated.Secret}
+	if status, _ := s.call(http.MethodPost, "/Users/AuthenticateWithQuickConnect", tv, secret); status != http.StatusNotFound {
+		t.Errorf("sign-in before approval: got %d, want 404", status)
+	}
+	if status, _ := s.call(http.MethodPost, "/QuickConnect/Authorize?code="+initiated.Code, "", nil); status != http.StatusUnauthorized {
+		t.Errorf("anonymous approval: got %d, want 401", status)
+	}
+	if status, _ := s.call(http.MethodPost, "/QuickConnect/Authorize?Code="+initiated.Code, app("phone", phone), nil); status != http.StatusOK {
+		t.Fatalf("approval: %d", status)
+	}
+	_, body = s.call(http.MethodGet, "/QuickConnect/Connect?secret="+initiated.Secret, "", nil)
+	var polled QuickConnectResult
+	if json.Unmarshal(body, &polled) != nil || !polled.Authenticated {
+		t.Fatalf("poll after approval: %s", body)
+	}
+	status, body = s.call(http.MethodPost, "/Users/AuthenticateWithQuickConnect", tv, secret)
+	var result AuthenticationResult
+	if status != http.StatusOK || json.Unmarshal(body, &result) != nil {
+		t.Fatalf("sign-in after approval: %d %s", status, body)
+	}
+	if result.User.Id != alice.ID.String() || result.SessionInfo.DeviceName != "tv" {
+		t.Errorf("signed in as %s on %s, want alice on tv", result.User.Name, result.SessionInfo.DeviceName)
+	}
+
+	s.setting(t, func(settings *accounts.Settings) { settings.QuickConnectEnabled = false })
+	if _, body := s.call(http.MethodGet, "/QuickConnect/Enabled", "", nil); strings.TrimSpace(string(body)) != "false" {
+		t.Errorf("Enabled after turning Quick Connect off: %s", body)
+	}
+	if status, _ := s.call(http.MethodPost, "/QuickConnect/Initiate", tv, nil); status != http.StatusUnauthorized {
+		t.Errorf("initiate with Quick Connect off: got %d, want 401", status)
+	}
+}
+
+func TestLegacyAuthorizationFollowsTheSetting(t *testing.T) {
+	t.Parallel()
+	s := newTestServer(t, 10)
+	s.user("alice", nil)
+	token := s.signIn("alice", "tv")
+	if status, _ := s.call(http.MethodGet, "/Users/Me?api_key="+token, "", nil); status != http.StatusUnauthorized {
+		t.Errorf("api_key by default: got %d, want 401", status)
+	}
+	s.setting(t, func(settings *accounts.Settings) { settings.LegacyAuthorization = true })
+	if status, _ := s.call(http.MethodGet, "/Users/Me?api_key="+token, "", nil); status != http.StatusOK {
+		t.Errorf("api_key with legacy authorization on: got %d, want 200", status)
+	}
+}
+
+// HasUpdateAvailable tells the new version of Mira the daily check
+// found, while Check for new versions is on.
+func TestSystemInfoTellsANewVersion(t *testing.T) {
+	t.Parallel()
+	github := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		_, _ = io.WriteString(w, `{"tag_name":"v99.0.0","html_url":"https://github.com/ferforastieri/mira/releases/tag/v99.0.0"}`)
+	}))
+	t.Cleanup(github.Close)
+	var checker *updates.Checker
+	s := newProbingServer(t, 10, "ffprobe-not-installed", func(o *Options, pool *pgxpool.Pool) {
+		store := o.Accounts
+		checker = updates.New(updates.Options{DB: pool, Version: "1.2.3", API: github.URL, Logger: slog.New(slog.DiscardHandler),
+			Enabled: func() bool { return store.Settings().UpdateCheck }})
+		o.Updates = checker
+	})
+	s.user("alice", nil)
+	token := app("tv", s.signIn("alice", "tv"))
+	updateAvailable := func() bool {
+		t.Helper()
+		var info SystemInfo
+		if _, body := s.call(http.MethodGet, "/System/Info", token, nil); json.Unmarshal(body, &info) != nil {
+			t.Fatalf("system info: %s", body)
+		}
+		return info.HasUpdateAvailable
+	}
+	if updateAvailable() {
+		t.Error("an update before any check")
+	}
+	if err := checker.Check(t.Context()); err != nil {
+		t.Fatal(err)
+	}
+	if !updateAvailable() {
+		t.Error("no update once 99.0.0 is found")
+	}
+	s.setting(t, func(settings *accounts.Settings) { settings.UpdateCheck = false })
+	if updateAvailable() {
+		t.Error("an update with the check off")
+	}
+}
+
+func TestPublicUsersListsOnlyVisibleEnabledUsers(t *testing.T) {
+	t.Parallel()
+	s := newTestServer(t, 10)
+	no, yes := false, true
+	s.user("hidden", nil)
+	s.user("visible", func(c *accounts.UserChanges) { c.IsHidden = &no })
+	s.user("disabled", func(c *accounts.UserChanges) { c.IsHidden, c.IsDisabled = &no, &yes })
+	_, body := s.call(http.MethodGet, "/Users/Public", "", nil)
+	var users []UserDto
+	if err := json.Unmarshal(body, &users); err != nil {
+		t.Fatal(err)
+	}
+	if len(users) != 1 || users[0].Name != "visible" {
+		t.Errorf("public users: %s", body)
+	}
+}
+
+// TestResponsesMatchJellyfin compares the JSON structure of Mira's
+// responses with fixtures recorded from Jellyfin 12.2 by
+// scripts/jellyfin-fixtures.sh: same keys at every level and same types.
+func TestResponsesMatchJellyfin(t *testing.T) {
+	t.Parallel()
+	s := newTestServer(t, 10)
+	s.user("alice", nil)
+	_, authentication := s.call(http.MethodPost, "/Users/AuthenticateByName", app("tv", ""),
+		map[string]string{"Username": "alice", "Pw": "correct horse"})
+	var result AuthenticationResult
+	_ = json.Unmarshal(authentication, &result)
+	signedIn := app("tv", result.AccessToken)
+	_, quickConnect := s.call(http.MethodPost, "/QuickConnect/Initiate", app("phone", ""), nil)
+	_, publicInfo := s.call(http.MethodGet, "/System/Info/Public", "", nil)
+	_, systemInfo := s.call(http.MethodGet, "/System/Info", signedIn, nil)
+	_, user := s.call(http.MethodGet, "/Users/Me", signedIn, nil)
+	// A new Jellyfin has no custom CSS; a new Mira's loads a theme.
+	settings := s.store.Settings()
+	settings.WebTheme = accounts.WebThemeNone
+	if _, err := s.store.UpdateSettings(t.Context(), settings); err != nil {
+		t.Fatal(err)
+	}
+	_, branding := s.call(http.MethodGet, "/Branding/Configuration", "", nil)
+
+	for fixture, body := range map[string][]byte{
+		"authentication-result":  authentication,
+		"quick-connect-result":   quickConnect,
+		"public-system-info":     publicInfo,
+		"system-info":            systemInfo,
+		"user":                   user,
+		"branding-configuration": branding,
+	} {
+		raw, err := os.ReadFile(filepath.Join("testdata", "jellyfin-12.2", fixture+".json"))
+		if err != nil {
+			t.Fatal(err)
+		}
+		var want, got any
+		if err := json.Unmarshal(raw, &want); err != nil {
+			t.Fatal(err)
+		}
+		if err := json.Unmarshal(body, &got); err != nil {
+			t.Fatalf("%s: %v in %s", fixture, err, body)
+		}
+		for _, difference := range compareShapes(fixture, want, got, shapeRules{}) {
+			t.Error(difference)
+		}
+	}
+}
+
+// shapeRules relaxes a shape comparison where Mira cannot have the data
+// Jellyfin had when the fixture was recorded.
+type shapeRules struct {
+	// dynamic names objects keyed by data, such as image types: their keys
+	// are not compared.
+	dynamic []string
+	// absent maps a field Mira leaves out to the fixtures concerned, or
+	// "*" for all; returned maps a field Mira sends that the recorded
+	// items lacked.
+	absent, returned map[string][]string
+}
+
+// allowed reports whether rules list key for the fixture path belongs to.
+func allowed(rules map[string][]string, path, key string) bool {
+	fixture, _, _ := strings.Cut(path, ".")
+	fixture, _, _ = strings.Cut(fixture, "[")
+	return slices.Contains(rules[key], "*") || slices.Contains(rules[key], fixture)
+}
+
+func compareShapes(path string, want, got any, rules shapeRules) []string {
+	switch want := want.(type) {
+	case map[string]any:
+		object, ok := got.(map[string]any)
+		if !ok {
+			return []string{fmt.Sprintf("%s: got %T, want an object", path, got)}
+		}
+		if key := path[strings.LastIndexAny(path, ".]")+1:]; slices.Contains(rules.dynamic, key) {
+			return nil
+		}
+		var differences []string
+		keys := make([]string, 0, len(want)+len(object))
+		for key := range want {
+			keys = append(keys, key)
+		}
+		for key := range object {
+			if _, known := want[key]; !known {
+				keys = append(keys, key)
+			}
+		}
+		slices.Sort(keys)
+		for _, key := range keys {
+			expected, inWant := want[key]
+			actual, inGot := object[key]
+			switch {
+			case !inGot:
+				if !allowed(rules.absent, path, key) {
+					differences = append(differences, fmt.Sprintf("%s.%s: missing", path, key))
+				}
+			case !inWant:
+				if !allowed(rules.returned, path, key) {
+					differences = append(differences, fmt.Sprintf("%s.%s: not returned by Jellyfin", path, key))
+				}
+			default:
+				differences = append(differences, compareShapes(path+"."+key, expected, actual, rules)...)
+			}
+		}
+		return differences
+	case []any:
+		array, ok := got.([]any)
+		if !ok {
+			return []string{fmt.Sprintf("%s: got %T, want an array", path, got)}
+		}
+		if len(want) > 0 && len(array) > 0 {
+			return compareShapes(path+"[0]", want[0], array[0], rules)
+		}
+		return nil
+	default:
+		if fmt.Sprintf("%T", want) != fmt.Sprintf("%T", got) {
+			return []string{fmt.Sprintf("%s: got %T, want %T", path, got, want)}
+		}
+		return nil
+	}
+}

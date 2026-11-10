@@ -1,0 +1,168 @@
+import type en from '../en/livetv'
+
+const livetv: typeof en = {
+  livetv: {
+    title: 'TV en direct',
+    description:
+      'Les catalogues TV viennent de vos sources. Ouvrez les guides d’un catalogue pour donner un programme à ses chaînes.',
+    recordings: 'Réglages des enregistrements',
+    settings: 'Réglages de la TV en direct',
+    catalogsTitle: 'Catalogues TV',
+    catalogsHelp:
+      'Un catalogue TV affiché comme bibliothèque met ses chaînes dans la TV en direct des applications Jellyfin. Ses guides donnent leurs programmes aux chaînes.',
+    catalogsLabel: 'Catalogues TV',
+    catalogsLoading: 'Chargement des catalogues TV…',
+    catalogsEmptyTitle: 'Aucun catalogue TV pour l’instant',
+    catalogsEmpty:
+      'Installez un addon qui a un catalogue TV, ou ajoutez une source IPTV, dans Sources\u202f: ses chaînes sont listées ici.',
+    addSource: 'Ajouter une source',
+    kinds: { stremio: 'Addon Stremio', iptv: 'Source IPTV' },
+    guides: (count: number) => (count <= 1 ? `${count} guide` : `${count} guides`),
+    failing: (count: number) =>
+      count === 1
+        ? 'Le dernier téléchargement d’un guide a échoué.'
+        : `Le dernier téléchargement de ${count} guides a échoué.`,
+    guideNone: 'Pas de guide des programmes',
+    mapped: (mapped: string, channels: string) => `${mapped} chaînes sur ${channels} avec un guide`,
+    guideLine: (position: number, message: string) => `Guide ${position}\u202f: ${message}`,
+    manage: 'Guides et correspondance',
+    lineup: 'Grille et guides',
+    lineupLabel: (name: string) => `Grille et guides de ${name}`,
+    manageLabel: (name: string) => `Guides et correspondance de ${name}`,
+    notShownHelp:
+      'Affichez-le comme bibliothèque pour mettre ses chaînes dans la TV en direct et lui donner des guides.',
+    openLibraries: 'Ouvrir les bibliothèques',
+    states: {
+      notShown: 'Hors de la TV en direct',
+      addonOff: 'Addon désactivé',
+      missing: 'Plus disponible',
+      failed: 'Échec du guide',
+      noGuide: 'Sans guide',
+      notFetched: 'Pas encore récupéré',
+      incomplete: 'Guide incomplet',
+      complete: 'Guide complet',
+    },
+    iptvTitle: 'Chaînes IPTV',
+    iptvHelp: 'Les chaînes en direct de chaque source IPTV, telles que sa grille les garde.',
+    iptvLoading: 'Chargement des sources IPTV…',
+    iptvEmptyTitle: 'Aucune source IPTV pour l’instant',
+    iptvEmpty:
+      'Ajoutez une playlist M3U ou un compte Xtream Codes dans Sources\u202f: ses chaînes sont comptées ici.',
+    kindM3u: 'Playlist M3U',
+    kindXtream: 'Compte Xtream Codes',
+    kindTuner: 'Tuner HDHomeRun',
+    turnedOff: 'Désactivée',
+    downloadFailed: 'Échec du téléchargement',
+    active: 'Active',
+    lastDownload: 'Dernier téléchargement',
+    nextDownload: 'prochain',
+    never: 'jamais',
+    figuresLabel: (name: string) => `Chaînes de ${name}`,
+    figures: {
+      enabled: 'Chaînes actives',
+      shown: 'Affichées',
+      mapped: 'Avec programme',
+      unmapped: 'Sans programme',
+    },
+    noLiveTv: 'Cette source n’importe aucune chaîne en direct.',
+    importOptions: 'Options d’import',
+    openMapping: 'Ouvrir les correspondances',
+    recordingsTitle: 'Enregistrements',
+    recordingsLoading: 'Chargement des enregistrements…',
+    recordingsOffTitle: 'L’enregistrement est désactivé',
+    recordingsOff:
+      'Activez-le, et choisissez les marges et la durée de conservation, dans Paramètres › Enregistrements.',
+    noTimersTitle: 'Aucun enregistrement prévu',
+    noTimers:
+      'Les enregistrements se programment depuis le guide des programmes des applications Jellyfin. Ils sont listés ici jusqu’à leur fin.',
+    recordingNow: 'En cours',
+    scheduled: 'Prévu',
+    failed: 'Échec',
+    series: 'Série',
+    scheduledBy: (name: string) => `Prévu par ${name}`,
+    unknownChannel: 'Chaîne introuvable',
+    tunersShort: 'Pas assez de tuners',
+    tunersShortHelp:
+      'Plus d’enregistrements sur les chaînes de ce tuner qu’il n’a de tuners ont lieu en même temps\u202f: l’un d’eux peut échouer.',
+    guidesOf: (name: string) => `Guides de ${name}`,
+    spaceSaved: (count: number, saved: string) =>
+      count === 1
+        ? `1 enregistrement converti en HEVC\u202f: ${saved} gagnés.`
+        : `${count} enregistrements convertis en HEVC\u202f: ${saved} gagnés.`,
+  },
+  ownChannels: {
+    title: 'Chaînes de vos titres',
+    help: 'Des chaînes qui diffusent vos films et vos épisodes jour et nuit, à partir d’une collection, d’une liste intelligente, d’une série ou de titres que vous choisissez. Les applications Jellyfin les listent avec les autres chaînes, et leurs programmes dans le guide.',
+    add: 'Ajouter une chaîne',
+    loading: 'Chargement des chaînes…',
+    label: 'Chaînes de vos titres',
+    emptyTitle: 'Aucune chaîne à vous',
+    empty:
+      'Créez-en une à partir d’une collection, d’une liste intelligente, d’une série ou de titres que vous choisissez\u202f: elle les diffuse l’un après l’autre, toute la journée.',
+    off: 'Désactivée',
+    entries: (count: number, formatted: string) =>
+      count === 1 ? '1 film ou épisode' : `${formatted} films et épisodes`,
+    blockCount: (count: number) =>
+      count === 1 ? '1 tranche horaire' : `${count} tranches horaires`,
+    now: (name: string) => `En ce moment\u202f: ${name}`,
+    back: 'TV en direct',
+    newTitle: 'Nouvelle chaîne',
+    lede: 'Ses titres sont lus à l’enregistrement de la chaîne, pour que son guide reste le même\u202f: relisez-les pour y ajouter ceux arrivés depuis.',
+    notFound: 'Cette chaîne n’existe plus.',
+    name: 'Nom',
+    number: 'Numéro',
+    numberHelp: 'Vide\u202f: après les autres chaînes.',
+    enabled: 'Affichée dans les applications',
+    programmes: 'Programmes',
+    programmesHelp:
+      'Ce que diffuse la chaîne. Les séries diffusent leurs épisodes dans l’ordre, sans les épisodes spéciaux. Un titre sans durée compte 90 minutes pour un film, 30 pour un épisode.',
+    kind: 'À partir de',
+    kinds: {
+      collection: 'Collection',
+      smartlist: 'Liste intelligente',
+      series: 'Série',
+      titles: 'Titres',
+    },
+    collection: 'Collection',
+    smartList: 'Liste intelligente',
+    choose: 'Choisir…',
+    noCollections: 'Aucune collection\u202f: créez-en une dans une application Jellyfin.',
+    noSmartLists: 'Aucune liste intelligente\u202f: créez-en une sous Bibliothèques.',
+    search: 'Rechercher',
+    searchTitles: 'Rechercher des films et des séries',
+    searchSeries: 'Rechercher une série',
+    noResults: 'Aucun résultat.',
+    pick: (name: string) => `Ajouter ${name}`,
+    remove: (name: string) => `Retirer ${name}`,
+    picked: 'Choisis',
+    pickedNone: 'Rien de choisi pour l’instant.',
+    movie: 'Film',
+    series: 'Série',
+    shuffle: 'Ordre aléatoire',
+    shuffleHelp: 'Diffuse les titres dans un nouvel ordre à chaque tour, plutôt que dans le leur.',
+    blocks: 'Tranches horaires',
+    blocksHelp:
+      'Chaque jour, une tranche diffuse ses propres titres de son début à sa fin, dans le fuseau horaire du serveur, et les programmes de la chaîne remplissent le reste de la journée. Un programme coupé par la fin d’une tranche est diffusé en entier le lendemain.',
+    addBlock: 'Ajouter une tranche horaire',
+    removeBlock: (n: number) => `Retirer la tranche ${n}`,
+    block: (n: number) => `Tranche ${n}`,
+    from: 'De',
+    until: 'À',
+    airing: 'À l’antenne',
+    airingHelp: 'Ce que diffuse la chaîne maintenant, puis ensuite.',
+    nothing: 'Rien n’est diffusé.',
+    rebuild: 'Relire les titres',
+    rebuildHelp:
+      'Relit les sources pour les titres ajoutés ou retirés depuis. La grille recommence aujourd’hui.',
+    create: 'Créer la chaîne',
+    created: 'Chaîne créée',
+    saved: 'Chaîne enregistrée',
+    delete: 'Supprimer',
+    deleted: 'Chaîne supprimée',
+    deleteTitle: (name: string) => `Supprimer ${name}\u202f?`,
+    deleteBody:
+      'Ses programmes quittent le guide, et les enregistrements prévus sur elle ne peuvent plus se faire.',
+  },
+}
+
+export default livetv

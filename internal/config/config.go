@@ -1,0 +1,384 @@
+// Package config reads Mira's runtime settings from the environment.
+package config
+
+import (
+	"errors"
+	"fmt"
+	"log/slog"
+	"math"
+	"net"
+	"net/url"
+	"os"
+	"path/filepath"
+	"slices"
+	"strconv"
+	"strings"
+
+	"github.com/ferforastieri/mira/internal/accounts"
+	"github.com/ferforastieri/mira/internal/desktop"
+	"github.com/ferforastieri/mira/internal/discovery"
+	"github.com/ferforastieri/mira/internal/dlna"
+	"github.com/ferforastieri/mira/internal/https"
+	"github.com/ferforastieri/mira/internal/iptv"
+	"github.com/ferforastieri/mira/internal/ocr"
+	"github.com/ferforastieri/mira/internal/secrets"
+)
+
+// DefaultListen is the port Jellyfin clients try first when no port is given.
+const DefaultListen = ":8096"
+
+// Config holds the settings needed to start the server.
+type Config struct {
+	// DatabaseURL is a PostgreSQL connection string. It contains credentials:
+	// never log it.
+	DatabaseURL string
+	// Listen is the TCP address of the HTTP server, as host:port.
+	Listen string
+	// DiscoveryPort is the UDP port local network discovery listens on,
+	// 7359, the one Jellyfin apps send to, unless tests choose another.
+	DiscoveryPort int
+	// DLNAPort is the UDP port of SSDP, which DLNA devices search for
+	// servers on, 1900, unless tests choose another.
+	DLNAPort int
+	// HDHomeRunPort is the UDP port Find tuners asks HDHomeRun tuners to
+	// answer on, 65001, unless tests choose another.
+	HDHomeRunPort int
+	// HDHomeRunAddresses are the addresses (host:port) Find tuners asks
+	// instead of broadcasting on the local networks; none broadcasts.
+	HDHomeRunAddresses []string
+	// FFprobe and FFmpeg are the executables, paths or names looked up in
+	// PATH.
+	FFprobe string
+	FFmpeg  string
+	// Tesseract is the executable picture subtitles are read into text
+	// with; TessdataDir a folder of .traineddata files for the languages
+	// Tesseract's own data lacks, empty for none. TessdataURL is the
+	// address those files are downloaded from into it, followed by their
+	// name: Tesseract's own data at a pinned commit (ocr.DataURL), unless
+	// a mirror or tests choose another.
+	Tesseract   string
+	TessdataDir string
+	TessdataURL string
+	// DataDir is the folder Mira keeps its files in, an absolute path:
+	// the cache, unless the settings choose other folders for what it holds
+	// (see ChooseFolders), and the default recordings and backups folders.
+	DataDir string
+	// FontsDir holds the fallback fonts apps load to render subtitles, read
+	// with the folders within, which also write the names of generated
+	// images.
+	FontsDir string
+	// WebDir is the folder of jellyfin-web, the web client served at
+	// /web/. A folder without its index.html leaves the web client off.
+	WebDir string
+	// ACMEDirectory is the directory of the ACME server certificates are
+	// obtained from when the settings choose Let's Encrypt: Let's
+	// Encrypt's own unless tests or a private ACME server choose another.
+	// ACMECAFile is a PEM file of the certificate authorities trusted for
+	// that server's HTTPS, besides the system's; empty for none.
+	ACMEDirectory string
+	ACMECAFile    string
+	// SecretKey is the key the keys, secrets and tokens stored in the
+	// database are sealed with, nil for none. It is a secret: never log it.
+	SecretKey []byte
+	// Environment is what the variables that were options before they were
+	// settings give, copied into the settings once (see
+	// accounts.Store.AdoptEnvironment) and never read after that. A value
+	// that is not valid is left out, and Warnings tell why.
+	Environment accounts.Environment
+	Warnings    []error
+	// Retired are the variables set that the settings hold now, which
+	// Mira no longer reads.
+	Retired []Retired
+	// Desktop tells that Mira Desktop runs Mira, as it says with
+	// desktop.ServerVariable set to 1: it starts Mira again when it
+	// exits, and offers its updates.
+	Desktop bool
+}
+
+// Retired is a variable Mira no longer reads, and the section of the
+// settings that holds its value now.
+type Retired struct {
+	Name    string
+	Section string
+}
+
+// retiredVariables are the variables copied into the settings once since
+// MIRA_DATA_DIR, with the section of the settings holding each.
+var retiredVariables = []Retired{
+	{"MIRA_CACHE_SIZE", "Settings › Playback"},
+	{"MIRA_LOG_LEVEL", "Settings › Diagnostics"},
+	{"MIRA_VAAPI_DEVICE", "Settings › Conversion (transcoding)"},
+	{"MIRA_RECORDINGS_DIR", "Settings › Recordings"},
+	{"MIRA_BACKUP_DIR", "Settings › Backups"},
+}
+
+// defaultFontsDir is the system font folder, which the Docker image fills
+// with DejaVu.
+const defaultFontsDir = "/usr/share/fonts"
+
+// DefaultWebDir is the folder the Docker image puts jellyfin-web in.
+const DefaultWebDir = "/usr/share/mira/jellyfin-web"
+
+// DefaultDataDir is the folder Mira keeps its files in when
+// MIRA_DATA_DIR is not set: a mira folder in the system's temporary
+// folder.
+func DefaultDataDir() string {
+	return filepath.Join(os.TempDir(), "mira")
+}
+
+// Load reads the configuration through getenv, normally os.Getenv. Only
+// the variables still read can make it fail; those copied into the
+// settings give warnings instead (see Config.Warnings).
+func Load(getenv func(string) string) (Config, error) {
+	cfg := Config{
+		DatabaseURL:   strings.TrimSpace(getenv("MIRA_DATABASE_URL")),
+		Listen:        strings.TrimSpace(getenv("MIRA_LISTEN")),
+		FFprobe:       strings.TrimSpace(getenv("MIRA_FFPROBE")),
+		FFmpeg:        strings.TrimSpace(getenv("MIRA_FFMPEG")),
+		Tesseract:     strings.TrimSpace(getenv("MIRA_TESSERACT")),
+		TessdataDir:   strings.TrimSpace(getenv("MIRA_TESSDATA_DIR")),
+		TessdataURL:   strings.TrimSpace(getenv("MIRA_TESSDATA_URL")),
+		DataDir:       strings.TrimSpace(getenv("MIRA_DATA_DIR")),
+		FontsDir:      strings.TrimSpace(getenv("MIRA_FONTS_DIR")),
+		WebDir:        strings.TrimSpace(getenv("MIRA_WEB_DIR")),
+		ACMEDirectory: strings.TrimSpace(getenv("MIRA_ACME_DIRECTORY")),
+		ACMECAFile:    strings.TrimSpace(getenv("MIRA_ACME_CA_FILE")),
+	}
+	if cfg.WebDir == "" {
+		cfg.WebDir = DefaultWebDir
+	}
+	if cfg.FontsDir == "" {
+		cfg.FontsDir = defaultFontsDir
+	}
+	if cfg.FFprobe == "" {
+		cfg.FFprobe = "ffprobe"
+	}
+	if cfg.FFmpeg == "" {
+		cfg.FFmpeg = "ffmpeg"
+	}
+	if cfg.Tesseract == "" {
+		cfg.Tesseract = "tesseract"
+	}
+	var errs []error
+	if cfg.DatabaseURL == "" {
+		errs = append(errs, errors.New("MIRA_DATABASE_URL is required"))
+	}
+	if cfg.Listen == "" {
+		cfg.Listen = DefaultListen
+	} else if err := validateListen(cfg.Listen); err != nil {
+		errs = append(errs, fmt.Errorf("MIRA_LISTEN: %w", err))
+	}
+	cfg.DiscoveryPort = discovery.Port
+	if raw := strings.TrimSpace(getenv("MIRA_DISCOVERY_PORT")); raw != "" {
+		port, err := strconv.ParseUint(raw, 10, 16)
+		if err != nil || port == 0 {
+			errs = append(errs, fmt.Errorf("MIRA_DISCOVERY_PORT: %q is not a port (1-65535)", raw))
+		}
+		cfg.DiscoveryPort = int(port)
+	}
+	cfg.DLNAPort = dlna.Port
+	if raw := strings.TrimSpace(getenv("MIRA_DLNA_PORT")); raw != "" {
+		port, err := strconv.ParseUint(raw, 10, 16)
+		if err != nil || port == 0 {
+			errs = append(errs, fmt.Errorf("MIRA_DLNA_PORT: %q is not a port (1-65535)", raw))
+		}
+		cfg.DLNAPort = int(port)
+	}
+	cfg.HDHomeRunPort = iptv.TunerPort
+	if raw := strings.TrimSpace(getenv("MIRA_HDHOMERUN_PORT")); raw != "" {
+		port, err := strconv.ParseUint(raw, 10, 16)
+		if err != nil || port == 0 {
+			errs = append(errs, fmt.Errorf("MIRA_HDHOMERUN_PORT: %q is not a port (1-65535)", raw))
+		}
+		cfg.HDHomeRunPort = int(port)
+	}
+	for raw := range strings.SplitSeq(getenv("MIRA_HDHOMERUN_ADDRESSES"), ",") {
+		if raw = strings.TrimSpace(raw); raw == "" {
+			continue
+		}
+		// A host alone is asked on MIRA_HDHOMERUN_PORT.
+		host, port, err := net.SplitHostPort(raw)
+		if err != nil {
+			host, port = raw, strconv.Itoa(cfg.HDHomeRunPort)
+		}
+		number, perr := strconv.ParseUint(port, 10, 16)
+		if host == "" || strings.ContainsAny(host, "/@ []") || strings.Contains(host, ":") && net.ParseIP(host) == nil || perr != nil || number == 0 {
+			errs = append(errs, fmt.Errorf("MIRA_HDHOMERUN_ADDRESSES: %q is not a host or host:port", raw))
+			continue
+		}
+		cfg.HDHomeRunAddresses = append(cfg.HDHomeRunAddresses, net.JoinHostPort(host, port))
+	}
+	if cfg.ACMEDirectory == "" {
+		cfg.ACMEDirectory = https.LetsEncrypt
+	} else if address, err := url.Parse(cfg.ACMEDirectory); err != nil || address.Scheme != "https" && address.Scheme != "http" || address.Host == "" {
+		errs = append(errs, fmt.Errorf("MIRA_ACME_DIRECTORY: %q is not an http or https address", cfg.ACMEDirectory))
+	}
+	if cfg.TessdataURL == "" {
+		cfg.TessdataURL = ocr.DataURL
+	} else if address, err := url.Parse(cfg.TessdataURL); err != nil || address.Scheme != "https" && address.Scheme != "http" || address.Host == "" {
+		errs = append(errs, fmt.Errorf("MIRA_TESSDATA_URL: %q is not an http or https address", cfg.TessdataURL))
+	}
+	switch {
+	case cfg.DataDir == "":
+		cfg.DataDir = DefaultDataDir()
+	case !filepath.IsAbs(cfg.DataDir):
+		errs = append(errs, fmt.Errorf("MIRA_DATA_DIR: %q is not an absolute path", cfg.DataDir))
+	default:
+		cfg.DataDir = filepath.Clean(cfg.DataDir)
+	}
+	if raw := strings.TrimSpace(getenv("MIRA_SECRET_KEY")); raw != "" {
+		key, err := secrets.ParseKey(raw)
+		if err != nil {
+			errs = append(errs, fmt.Errorf("MIRA_SECRET_KEY: %w", err))
+		}
+		cfg.SecretKey = key
+	}
+	cfg.Desktop = strings.TrimSpace(getenv(desktop.ServerVariable)) == "1"
+	cfg.readEnvironment(getenv)
+	return cfg, errors.Join(errs...)
+}
+
+// readEnvironment reads the variables copied into the settings once into
+// cfg.Environment, leaving out, with a warning, the values that are not
+// valid, and lists those of them Mira no longer reads that are set.
+func (cfg *Config) readEnvironment(getenv func(string) string) {
+	warn := func(name string, err error) { cfg.Warnings = append(cfg.Warnings, fmt.Errorf("%s: %w", name, err)) }
+	env := &cfg.Environment
+	switch hardware := strings.ToLower(strings.TrimSpace(getenv("MIRA_HWACCEL"))); {
+	case hardware == "":
+	case slices.Contains(accounts.HardwareAccelerations, hardware):
+		env.Hardware = hardware
+	default:
+		warn("MIRA_HWACCEL", fmt.Errorf("%q is not one of %s", hardware, strings.Join(accounts.HardwareAccelerations, ", ")))
+	}
+	if segments, err := parseSegments(getenv("MIRA_SEGMENTS")); err != nil {
+		warn("MIRA_SEGMENTS", err)
+	} else {
+		env.Segments = segments
+	}
+	if raw := strings.TrimSpace(getenv("MIRA_CACHE_SIZE")); raw != "" {
+		if size, err := parseSize(raw); err != nil {
+			warn("MIRA_CACHE_SIZE", err)
+		} else if gigabytes := math.Round(float64(size) / 1e9); gigabytes < accounts.MinCacheSizeGB || gigabytes > accounts.MaxCacheSizeGB {
+			warn("MIRA_CACHE_SIZE", fmt.Errorf("%q is not between %d and %d GB", raw, accounts.MinCacheSizeGB, accounts.MaxCacheSizeGB))
+		} else {
+			env.CacheSizeGB = int(gigabytes)
+		}
+	}
+	if raw := strings.TrimSpace(getenv("MIRA_LOG_LEVEL")); raw != "" {
+		var level slog.Level
+		if err := level.UnmarshalText([]byte(raw)); err != nil {
+			warn("MIRA_LOG_LEVEL", fmt.Errorf("%q is not one of debug, info, warn, error", raw))
+		} else {
+			env.DetailedLog = level <= slog.LevelDebug
+		}
+	}
+	if device := strings.TrimSpace(getenv("MIRA_VAAPI_DEVICE")); accounts.ValidVAAPIDevice(device) {
+		env.VAAPIDevice = device
+	} else {
+		warn("MIRA_VAAPI_DEVICE", fmt.Errorf("%q is not a render node such as /dev/dri/renderD128", device))
+	}
+	for _, folder := range []struct {
+		name string
+		into *string
+	}{{"MIRA_RECORDINGS_DIR", &env.RecordingsFolder}, {"MIRA_BACKUP_DIR", &env.BackupFolder}} {
+		raw := strings.TrimSpace(getenv(folder.name))
+		if cleaned, ok := accounts.CleanFolder(raw); ok {
+			*folder.into = cleaned
+		} else {
+			warn(folder.name, fmt.Errorf("%q is not an absolute path of at most %d bytes", raw, accounts.MaxFolderBytes))
+		}
+	}
+	for _, retired := range retiredVariables {
+		if strings.TrimSpace(getenv(retired.Name)) != "" {
+			cfg.Retired = append(cfg.Retired, retired)
+		}
+	}
+}
+
+// PrepareFolder reports why dir is not a folder Mira can write files
+// into, by writing one; create makes it first, with its parents, as for a
+// default folder under the data folder.
+func PrepareFolder(dir string, create bool) error {
+	if !filepath.IsAbs(dir) {
+		return fmt.Errorf("%q is not an absolute path", dir)
+	}
+	if create {
+		if err := os.MkdirAll(dir, 0o755); err != nil {
+			return err
+		}
+	}
+	info, err := os.Stat(dir)
+	if err != nil {
+		return err
+	}
+	if !info.IsDir() {
+		return fmt.Errorf("%q is not a folder", dir)
+	}
+	file, err := os.CreateTemp(dir, ".mira-check-*")
+	if err != nil {
+		return fmt.Errorf("%q is not writable: %w", dir, err)
+	}
+	_ = file.Close()
+	return os.Remove(file.Name())
+}
+
+// segmentDatabases are the segment databases MIRA_SEGMENTS names, in the
+// default order of preference.
+var segmentDatabases = []string{"theintrodb", "introdb", "publicmetadb", "skipdb"}
+
+// parseSegments reads the segment databases, in order of preference: nil
+// when text is empty, an empty list for none.
+func parseSegments(text string) ([]string, error) {
+	text = strings.ToLower(strings.TrimSpace(text))
+	switch text {
+	case "":
+		return nil, nil
+	case "none":
+		return []string{}, nil
+	}
+	var names []string
+	for name := range strings.SplitSeq(text, ",") {
+		name = strings.TrimSpace(name)
+		if !slices.Contains(segmentDatabases, name) {
+			return nil, fmt.Errorf("%q is not a list of theintrodb, introdb, publicmetadb and skipdb, or none", text)
+		}
+		if !slices.Contains(names, name) {
+			names = append(names, name)
+		}
+	}
+	return names, nil
+}
+
+// units are the size suffixes MIRA_CACHE_SIZE accepts, decimal and
+// binary.
+var units = map[string]float64{
+	"": 1, "b": 1,
+	"kb": 1e3, "mb": 1e6, "gb": 1e9, "tb": 1e12,
+	"k": 1 << 10, "m": 1 << 20, "g": 1 << 30, "t": 1 << 40,
+	"kib": 1 << 10, "mib": 1 << 20, "gib": 1 << 30, "tib": 1 << 40,
+}
+
+// parseSize reads a size such as "10GB", "500 MiB" or "20000000000".
+func parseSize(text string) (int64, error) {
+	number := strings.TrimRightFunc(strings.ToLower(text), func(r rune) bool { return r >= 'a' && r <= 'z' })
+	unit := strings.ToLower(text)[len(number):]
+	factor, known := units[unit]
+	value, err := strconv.ParseFloat(strings.TrimSpace(number), 64)
+	if !known || err != nil || value < 0 || value*factor > math.MaxInt64 {
+		return 0, fmt.Errorf("%q is not a size such as 10GB", text)
+	}
+	return int64(value * factor), nil
+}
+
+func validateListen(address string) error {
+	_, port, err := net.SplitHostPort(address)
+	if err != nil {
+		return fmt.Errorf("%q is not a host:port address", address)
+	}
+	number, err := strconv.ParseUint(port, 10, 16)
+	if err != nil || number == 0 {
+		return fmt.Errorf("%q has no valid port (1-65535)", address)
+	}
+	return nil
+}

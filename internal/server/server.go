@@ -1,0 +1,378 @@
+// Package server assembles Mira's HTTP routes.
+package server
+
+import (
+	"context"
+	"errors"
+	"io/fs"
+	"log/slog"
+	"net/http"
+	"net/url"
+	"path"
+	"strings"
+	"time"
+
+	"github.com/ferforastieri/mira/internal/basepath"
+	"github.com/ferforastieri/mira/internal/forwarded"
+	"github.com/ferforastieri/mira/internal/webtheme"
+)
+
+const (
+	adminPrefix       = "/admin/"
+	shareAssetsPrefix = "/share/assets/"
+	// jellyfinBase is the path apps also reach the Jellyfin API, its
+	// WebSocket and the web client under, as on a Jellyfin server behind a
+	// reverse proxy that serves it at /jellyfin: given an address without a
+	// path, some apps try it before the root.
+	jellyfinBase = "/jellyfin"
+	readyWait    = 2 * time.Second
+	// Hashed build files never change content under the same name.
+	immutableCache = "public, max-age=31536000, immutable"
+	// Addon logos are hosted by each addon, over https.
+	adminPolicy = "default-src 'self'; img-src 'self' https:; base-uri 'none'; object-src 'none'; frame-ancestors 'none'; form-action 'self'"
+)
+
+// Pinger reports whether the database answers.
+type Pinger interface {
+	Ping(context.Context) error
+}
+
+// Options are the dependencies of the HTTP handler.
+type Options struct {
+	Database Pinger
+	// Admin is the built admin application: index.html and its assets.
+	Admin fs.FS
+	// AdminAPI serves /admin/api/.
+	AdminAPI http.Handler
+	// Jellyfin serves every path not owned by Mira itself.
+	Jellyfin http.Handler
+	// Share serves the share links' page and its playback, under /share/;
+	// nil leaves /share/ to the Jellyfin API, which answers 404.
+	Share http.Handler
+	// ShareAssets holds the files of the share links' page, served under
+	// /share/assets/ (see shareAssets); nil leaves them to Share.
+	ShareAssets fs.FS
+	// DLNA serves the routes of DLNA devices, under /dlna/ (see
+	// dlna.Service.Handler); nil leaves /dlna/ to the Jellyfin API, which
+	// answers 404.
+	DLNA http.Handler
+	// Silo serves Silo's API to Silo's apps, under /api/v2/ (see package
+	// silo), which passes requests on to the Jellyfin API while the
+	// settings do not allow those apps; nil leaves /api/v2/ to the
+	// Jellyfin API, which answers 404.
+	Silo http.Handler
+	// Web holds the files of jellyfin-web, the web client served at /web/;
+	// nil serves none.
+	Web fs.FS
+	// SetupRequired reports whether no administrator exists yet. Needed
+	// with Web only.
+	SetupRequired func(context.Context) (bool, error)
+	// WebThemes returns the web player's themes, which the web client's
+	// page picks each user's among (see withWebScripts); nil gives none,
+	// jellyfin-web's own look.
+	WebThemes func() WebThemes
+	// ServerID names the cookie the web client's page tells the server the
+	// theme it shows in (see webtheme.Cookie).
+	ServerID string
+	// SavedThemes is the folder of the copy of a theme's files Mira
+	// keeps (see themecopy), served under /web/mira/themes/saved/;
+	// empty serves none.
+	SavedThemes string
+	// SavedThemeOriginal gives the address a file of the copy kept came
+	// from (see themecopy.Copier.Original), where a file missing from
+	// SavedThemes is redirected; nil redirects none.
+	SavedThemeOriginal func(id, name string) (string, bool)
+	// Proxies tells every route the client of requests that come through
+	// a known proxy (see forwarded.Client); nil reads the connection's
+	// address alone.
+	Proxies *forwarded.Proxies
+	// HTTPS wraps every route, seeing the client Proxies resolves: it
+	// answers the ACME server's checks over HTTP, and sends HTTP to HTTPS
+	// (see https.Service.Handler); nil wraps nothing.
+	HTTPS func(http.Handler) http.Handler
+	// Metrics serves /metrics (see metrics.Handler); nil leaves it to the
+	// Jellyfin API, which answers 404.
+	Metrics http.Handler
+	Logger  *slog.Logger
+	// brotliTurn is the turn the brotli copies of the admin app's and the
+	// share page's files take: brotliTurn, the process's, but in tests.
+	brotliTurn chan struct{}
+}
+
+// New returns the handler serving every Mira route. Answers that gain
+// from it go gzip-compressed to clients that accept it (see compress).
+// Every route sees the client Proxies resolves, and every request is
+// counted in the metrics. The Jellyfin API, its WebSocket and the web
+// client answer under jellyfinBase as at the root; the admin app,
+// /healthz, /readyz and /metrics stay at the root only.
+func New(options Options) http.Handler {
+	if options.brotliTurn == nil {
+		options.brotliTurn = brotliTurn
+	}
+	mux := http.NewServeMux()
+	mux.Handle("GET /healthz", rootOnly(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		writeText(w, http.StatusOK, "ok")
+	}), options.Jellyfin))
+	mux.Handle("GET /readyz", rootOnly(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if !databaseReady(r.Context(), options.Database) {
+			writeText(w, http.StatusServiceUnavailable, "database unavailable")
+			return
+		}
+		writeText(w, http.StatusOK, "ok")
+	}), options.Jellyfin))
+	if options.Metrics != nil {
+		mux.Handle("GET /metrics", rootOnly(options.Metrics, options.Jellyfin))
+	}
+	// Once Mira is set up, its web client is the place to go, as on
+	// Jellyfin; before, or without one, the admin app is.
+	mux.HandleFunc("GET /{$}", func(w http.ResponseWriter, r *http.Request) {
+		target := adminPrefix
+		if options.Web != nil && setUp(r.Context(), options.SetupRequired) {
+			target = basepath.Of(r) + webPrefix
+		}
+		http.Redirect(w, r, target, http.StatusFound)
+	})
+	mux.Handle("/admin/api/", rootOnly(options.AdminAPI, options.Jellyfin))
+	// No method in the pattern: it would conflict with "/admin/api/", which
+	// must answer every method. adminApp restricts methods itself.
+	mux.Handle("/admin/", rootOnly(adminApp(options.Admin, options.brotliTurn, options.Logger), options.Jellyfin))
+	// As the mux would, but at the root only.
+	mux.Handle("/admin", rootOnly(http.RedirectHandler(adminPrefix, http.StatusMovedPermanently), options.Jellyfin))
+	// Silo's TV apps tell people to open /activate, with the code in the
+	// address of their QR code: the admin app's Quick Connect page
+	// approves it (see package silo).
+	mux.Handle("GET /activate", rootOnly(http.HandlerFunc(activate), options.Jellyfin))
+	if options.Share != nil {
+		mux.Handle("/share/", rootOnly(options.Share, options.Jellyfin))
+	}
+	if options.ShareAssets != nil {
+		mux.Handle("GET /share/assets/", rootOnly(shareAssets(options.ShareAssets, options.brotliTurn), options.Jellyfin))
+	}
+	if options.DLNA != nil {
+		mux.Handle("/dlna/", rootOnly(options.DLNA, options.Jellyfin))
+	}
+	if options.Silo != nil {
+		mux.Handle("/api/v2/", rootOnly(options.Silo, options.Jellyfin))
+	}
+	if options.Web != nil {
+		mux.Handle(webPrefix, webClient(options.Web, func(ctx context.Context) bool {
+			return setUp(ctx, options.SetupRequired)
+		}, &webThemes{get: options.WebThemes, cookie: webtheme.Cookie(options.ServerID)}, options.SavedThemes, options.SavedThemeOriginal,
+			options.Jellyfin, options.Logger))
+		// Permanently, as Jellyfin does; the mux's own redirect is a 307.
+		mux.HandleFunc("/web", func(w http.ResponseWriter, r *http.Request) {
+			http.Redirect(w, r, basepath.Of(r)+webPrefix, http.StatusMovedPermanently)
+		})
+		// Jellyfin sends robots.txt to the web client's, which keeps search
+		// engines away.
+		mux.HandleFunc("/robots.txt", func(w http.ResponseWriter, r *http.Request) {
+			http.Redirect(w, r, basepath.Of(r)+webPrefix+"robots.txt", http.StatusFound)
+		})
+	}
+	mux.Handle("/", options.Jellyfin)
+
+	handler := countRequests(securityHeaders(compress(mux)))
+	if options.HTTPS != nil {
+		handler = options.HTTPS(handler)
+	}
+	if options.Proxies != nil {
+		handler = options.Proxies.Handler(handler)
+	}
+	return underJellyfinBase(handler)
+}
+
+// underJellyfinBase serves a request whose path starts with jellyfinBase,
+// matched without regard to case, as the same request without it, before
+// anything else sees the path: jellyfinBase alone stands for the root.
+// basepath.Of tells the routes the base the app wrote.
+func underJellyfinBase(next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		rest, ok := cutBase(r.URL.Path)
+		if !ok {
+			next.ServeHTTP(w, r)
+			return
+		}
+		base := r.URL.Path[:len(jellyfinBase)]
+		stripped := r.WithContext(basepath.With(r.Context(), base))
+		stripped.URL = new(url.URL)
+		*stripped.URL = *r.URL
+		stripped.URL.Path = rest
+		stripped.URL.RawPath = ""
+		if raw, ok := cutBase(r.URL.RawPath); ok {
+			stripped.URL.RawPath = raw
+		}
+		next.ServeHTTP(w, stripped)
+	})
+}
+
+// cutBase returns p without jellyfinBase, and whether p was under it.
+func cutBase(p string) (string, bool) {
+	if len(p) < len(jellyfinBase) || !strings.EqualFold(p[:len(jellyfinBase)], jellyfinBase) {
+		return "", false
+	}
+	rest := p[len(jellyfinBase):]
+	switch {
+	case rest == "":
+		return "/", true
+	case rest[0] == '/':
+		return rest, true
+	}
+	return "", false
+}
+
+// rootOnly serves requests with h at the root only: under jellyfinBase,
+// other answers them, as a Jellyfin server at /jellyfin would.
+func rootOnly(h, other http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if basepath.Of(r) != "" {
+			other.ServeHTTP(w, r)
+			return
+		}
+		h.ServeHTTP(w, r)
+	})
+}
+
+// quickConnectPage is the admin app's page that approves an app's code.
+const quickConnectPage = adminPrefix + "me/quick-connect"
+
+// activate leads to the admin app's Quick Connect page, with the code the
+// address names, in digits, as the page takes it.
+func activate(w http.ResponseWriter, r *http.Request) {
+	code := strings.Map(func(c rune) rune {
+		if c < '0' || c > '9' {
+			return -1
+		}
+		return c
+	}, r.URL.Query().Get("code"))
+	target := quickConnectPage
+	if code != "" && len(code) <= 8 {
+		target += "?" + url.Values{"code": {code}}.Encode()
+	}
+	http.Redirect(w, r, target, http.StatusFound)
+}
+
+func databaseReady(ctx context.Context, db Pinger) bool {
+	ctx, cancel := context.WithTimeout(ctx, readyWait)
+	defer cancel()
+	return db.Ping(ctx) == nil
+}
+
+// setUp reports whether an administrator exists; an unreachable database
+// counts as not set up, so that the admin app tells why.
+func setUp(ctx context.Context, setupRequired func(context.Context) (bool, error)) bool {
+	ctx, cancel := context.WithTimeout(ctx, readyWait)
+	defer cancel()
+	required, err := setupRequired(ctx)
+	return err == nil && !required
+}
+
+// adminApp serves the single-page application. Paths without a file
+// extension are client-side routes and receive index.html; a missing file
+// with an extension is a real 404, so a stale asset never loads the page.
+// The hashed files of assets/ are cached for good; the others, index.html
+// first, are checked again at each load, by their ETag. Text files go in
+// brotli, made in turn, or gzip to clients that take them, compressed once
+// each (see staticFiles).
+func adminApp(files fs.FS, turn chan struct{}, logger *slog.Logger) http.Handler {
+	static := newOwnFiles(files, turn)
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodGet && r.Method != http.MethodHead {
+			w.Header().Set("Allow", "GET, HEAD")
+			http.Error(w, http.StatusText(http.StatusMethodNotAllowed), http.StatusMethodNotAllowed)
+			return
+		}
+		name := strings.TrimPrefix(r.URL.Path, adminPrefix)
+		if name == "" || name == "index.html" {
+			serveIndex(w, r, static, logger)
+			return
+		}
+		if info, err := fs.Stat(files, name); err == nil && !info.IsDir() {
+			if strings.HasPrefix(name, "assets/") {
+				w.Header().Set("Cache-Control", immutableCache)
+			} else {
+				w.Header().Set("Cache-Control", "no-cache")
+			}
+			if !static.serve(w, r, name, info, "") {
+				w.Header().Del("Cache-Control")
+				http.NotFound(w, r)
+			}
+			return
+		}
+		if path.Ext(name) != "" {
+			http.NotFound(w, r)
+			return
+		}
+		serveIndex(w, r, static, logger)
+	})
+}
+
+// serveIndex serves index.html, checked again at each load.
+func serveIndex(w http.ResponseWriter, r *http.Request, static *staticFiles, logger *slog.Logger) {
+	info, err := fs.Stat(static.files, "index.html")
+	if err == nil {
+		w.Header().Set("Cache-Control", "no-cache")
+		if static.serve(w, r, "index.html", info, "text/html; charset=utf-8") {
+			return
+		}
+		w.Header().Del("Cache-Control")
+		err = errors.New("index.html cannot be read")
+	}
+	logger.Error("The admin application is missing; build it with `make web`", "error", err)
+	http.Error(w, "The admin application is not built.", http.StatusInternalServerError)
+}
+
+// shareAssets serves the files of the share links' page, under
+// /share/assets/. A file the page links with its version, its ETag
+// without quotes in v, is cached for good; the fonts, which the style
+// links by name, for a day; the others are checked again at each load.
+// Every file has an ETag, and text files go in brotli, made in turn, or
+// gzip to clients that take them, compressed once each (see staticFiles).
+func shareAssets(files fs.FS, turn chan struct{}) http.Handler {
+	static := newOwnFiles(files, turn)
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		name := strings.TrimPrefix(r.URL.Path, shareAssetsPrefix)
+		header := w.Header()
+		header.Set("X-Robots-Tag", "noindex, nofollow")
+		info, err := fs.Stat(files, name)
+		if err != nil || !info.Mode().IsRegular() {
+			http.NotFound(w, r)
+			return
+		}
+		switch {
+		case static.versioned(name, info, r.URL.Query().Get("v")):
+			header.Set("Cache-Control", immutableCache)
+		case strings.HasPrefix(name, "figtree"):
+			header.Set("Cache-Control", "public, max-age=86400")
+		default:
+			header.Set("Cache-Control", "no-cache")
+		}
+		if !static.serve(w, r, name, info, "") {
+			header.Del("Cache-Control")
+			http.NotFound(w, r)
+		}
+	})
+}
+
+// securityHeaders sets the headers every answer gets, and the admin app's
+// Content-Security-Policy. jellyfin-web at /web/ gets no such policy, as
+// from Jellyfin, which sends none: the admin app's would break it, as it
+// needs inline styles, blob: workers and media, WebAssembly, images and
+// frames from elsewhere (trailers), and pages that frame it.
+func securityHeaders(next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		header := w.Header()
+		header.Set("X-Content-Type-Options", "nosniff")
+		header.Set("Referrer-Policy", "no-referrer")
+		if basepath.Of(r) == "" && (r.URL.Path == "/admin" || strings.HasPrefix(r.URL.Path, adminPrefix)) {
+			header.Set("Content-Security-Policy", adminPolicy)
+		}
+		next.ServeHTTP(w, r)
+	})
+}
+
+func writeText(w http.ResponseWriter, status int, body string) {
+	w.Header().Set("Content-Type", "text/plain; charset=utf-8")
+	w.Header().Set("Cache-Control", "no-store")
+	w.WriteHeader(status)
+	_, _ = w.Write([]byte(body))
+}

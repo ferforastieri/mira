@@ -1,0 +1,704 @@
+package trackers
+
+import (
+	"context"
+	"errors"
+	"slices"
+	"time"
+
+	"github.com/jackc/pgx/v5"
+
+	"github.com/ferforastieri/mira/internal/accounts"
+	"github.com/ferforastieri/mira/internal/importlinks"
+	"github.com/ferforastieri/mira/internal/library"
+	"github.com/ferforastieri/mira/internal/metrics"
+	"github.com/ferforastieri/mira/internal/userdata"
+	"github.com/ferforastieri/mira/internal/watchlist"
+)
+
+// Titles finds the items of titles named by other services' identifiers
+// (see library.Service.Resolve), and tells which IMDb identifiers a
+// service gives for a title Mira's own data contradicts (see
+// library.Service.ContradictedIMDb).
+type Titles interface {
+	Resolve(ctx context.Context, refs []library.TitleRef) ([][]library.TitleTarget, error)
+	ContradictedIMDb(ctx context.Context, ref library.TitleRef, candidates []string) (map[string]bool, error)
+}
+
+// ErrImportOff reports an import asked of a service whose history is not
+// imported. ErrNotConnected (see connections.go) reports a service the
+// user did not connect.
+var ErrImportOff = errors.New("watch history import is off")
+
+// ProblemRateLimited is a last import the service kept asking to wait
+// for longer than an import waits.
+const ProblemRateLimited = "rate_limited"
+
+// importBatch is how many items an import writes at a time.
+const importBatch = 500
+
+// ImportResult is how an import of a watch history went.
+type ImportResult struct {
+	// At is when it ended.
+	At time.Time
+	// Played counts the titles it marked played, Resumed the resume
+	// points it set, Watchlist the titles it added to the user's
+	// watchlist, and Unmapped the titles of the history and the watchlist
+	// Mira could not identify.
+	Played, Resumed, Watchlist, Unmapped int
+	// Rated counts the titles it gave the service's score, and
+	// RatingsSkipped the ratings of series spread over several entries it
+	// skipped, with those sent since (AniList, MyAnimeList).
+	Rated, RatingsSkipped int
+	// Problem is empty, ProblemReconnect, ProblemUnreachable or
+	// ProblemRateLimited: the history could not be read whole, and what
+	// was read was imported.
+	Problem string
+}
+
+// importRun is an import running. again has it run once more when it
+// ends: a switch was turned on while it ran, maybe after it read them.
+type importRun struct {
+	cancel context.CancelFunc
+	again  bool
+}
+
+// importStatus completes status with the imports of its service, and when
+// the next one runs: the last import plus the interval the settings give,
+// while an import is on and the connection works.
+func (s *Service) importStatus(ctx context.Context, key laneKey, status *Status) error {
+	var last *time.Time
+	var result ImportResult
+	var problem *string
+	err := s.db.QueryRow(ctx, `SELECT enabled, watchlist, ratings, last_import_at, played, resumed, watchlisted, unmapped, rated, ratings_skipped, problem
+		FROM tracking_imports WHERE user_id = $1 AND service = $2`, key.user, key.service).Scan(&status.ImportHistory, &status.ImportWatchlist,
+		&status.SyncRatings, &last, &result.Played, &result.Resumed, &result.Watchlist, &result.Unmapped, &result.Rated, &result.RatingsSkipped, &problem)
+	if errors.Is(err, pgx.ErrNoRows) {
+		return nil
+	}
+	if err != nil {
+		return err
+	}
+	if last != nil {
+		result.At = *last
+		if problem != nil {
+			result.Problem = *problem
+		}
+		status.LastImport = &result
+		if (status.ImportHistory || status.ImportWatchlist || status.SyncRatings) && status.Available && status.Problem != ProblemReconnect {
+			next := last.Add(s.settings().ImportEvery())
+			status.NextImport = &next
+		}
+	}
+	s.mu.Lock()
+	_, status.Importing = s.importing[key]
+	s.mu.Unlock()
+	return nil
+}
+
+// SetImport turns the import of user's watch history from service on or
+// off. Turned on, it imports at once, then as often as the settings say.
+// The music services have no watch history: ErrUnknownService.
+func (s *Service) SetImport(ctx context.Context, user accounts.ID, service string, on bool) (Status, error) {
+	if !imports(service) {
+		return Status{}, ErrUnknownService
+	}
+	return s.setImport(ctx, user, service, "enabled", on)
+}
+
+// SetWatchlistImport turns the import of user's watchlist from service on
+// or off: Trakt's watchlist, Simkl's, AniList's and MyAnimeList's Plan to
+// Watch, imported with the imports of the history, whether those import
+// the history or not. Turned on, it imports at once. Turned off, the
+// titles the list alone held leave the watchlist. The other services have
+// no watchlist Mira imports: ErrUnknownService.
+func (s *Service) SetWatchlistImport(ctx context.Context, user accounts.ID, service string, on bool) (Status, error) {
+	if !watchlists(service) {
+		return Status{}, ErrUnknownService
+	}
+	return s.setImport(ctx, user, service, "watchlist", on)
+}
+
+// SetRatingsSync turns the sync of user's ratings with service on or off:
+// the ratings they give movies and series are sent as their entries'
+// scores, and the imports give their unrated titles the entries' scores.
+// Turned on, it imports at once. Only AniList and MyAnimeList keep
+// ratings: ErrUnknownService for the others.
+func (s *Service) SetRatingsSync(ctx context.Context, user accounts.ID, service string, on bool) (Status, error) {
+	if !animeLists(service) {
+		return Status{}, ErrUnknownService
+	}
+	return s.setImport(ctx, user, service, "ratings", on)
+}
+
+// setImport turns the import of what column of tracking_imports names,
+// "enabled" for the history, "watchlist" or "ratings", on or off. Turned
+// on, it imports at once; the imports stop once all are off.
+func (s *Service) setImport(ctx context.Context, user accounts.ID, service, column string, on bool) (Status, error) {
+	key := laneKey{user, service}
+	if _, ok, err := s.connection(ctx, user, service); err != nil {
+		return Status{}, err
+	} else if !ok {
+		return Status{}, ErrNotConnected
+	}
+	was := map[string]bool{}
+	err := pgx.BeginFunc(ctx, s.db, func(tx pgx.Tx) error {
+		var history, list, ratings bool
+		err := tx.QueryRow(ctx, "SELECT enabled, watchlist, ratings FROM tracking_imports WHERE user_id = $1 AND service = $2 FOR UPDATE",
+			user, service).Scan(&history, &list, &ratings)
+		if err != nil && !errors.Is(err, pgx.ErrNoRows) {
+			return err
+		}
+		was = map[string]bool{"enabled": history, "watchlist": list, "ratings": ratings}
+		_, err = tx.Exec(ctx, `INSERT INTO tracking_imports (user_id, service, `+column+`) VALUES ($1, $2, $3)
+			ON CONFLICT (user_id, service) DO UPDATE SET `+column+` = excluded.`+column, user, service, on)
+		return err
+	})
+	if err != nil {
+		return Status{}, err
+	}
+	other := false
+	for name, enabled := range was {
+		other = other || name != column && enabled
+	}
+	switch {
+	case on && !was[column]:
+		s.startImport(key, true)
+	case !on && (!other || column == "watchlist"):
+		// An import running may be reading the list: it stops, and the
+		// history, if on, is imported again when due.
+		s.stopImport(key)
+	}
+	if !on && column == "watchlist" {
+		if err := s.watchlist.Drop(ctx, user, watchlist.Tracking(service)); err != nil {
+			return Status{}, err
+		}
+	}
+	return s.status(ctx, user, service)
+}
+
+// ImportNow imports user's watch history, or watchlist, from service at
+// once, unless an import of it runs already.
+func (s *Service) ImportNow(ctx context.Context, user accounts.ID, service string) (Status, error) {
+	if !imports(service) {
+		return Status{}, ErrUnknownService
+	}
+	if _, ok, err := s.connection(ctx, user, service); err != nil {
+		return Status{}, err
+	} else if !ok {
+		return Status{}, ErrNotConnected
+	}
+	var on bool
+	err := s.db.QueryRow(ctx, "SELECT enabled OR watchlist OR ratings FROM tracking_imports WHERE user_id = $1 AND service = $2", user, service).Scan(&on)
+	if err != nil && !errors.Is(err, pgx.ErrNoRows) {
+		return Status{}, err
+	}
+	if !on {
+		return Status{}, ErrImportOff
+	}
+	s.startImport(laneKey{user, service}, false)
+	return s.status(ctx, user, service)
+}
+
+// startImport imports the history of key in the background, unless an
+// import of it runs already. Then, if again, that import runs once more
+// when it ends, to import what was turned on since it started.
+func (s *Service) startImport(key laneKey, again bool) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.titles == nil || s.userData == nil {
+		return
+	}
+	if run := s.importing[key]; run != nil {
+		run.again = run.again || again
+		return
+	}
+	ctx, cancel := context.WithCancel(s.ctx)
+	run := &importRun{cancel: cancel}
+	s.importing[key] = run
+	if !s.spawn(func() {
+		defer cancel()
+		for {
+			s.runImport(ctx, key)
+			s.mu.Lock()
+			current := s.importing[key] == run
+			again := current && run.again && ctx.Err() == nil
+			run.again = false
+			if current && !again {
+				delete(s.importing, key)
+			}
+			s.mu.Unlock()
+			if !again {
+				return
+			}
+		}
+	}) {
+		delete(s.importing, key)
+		cancel()
+	}
+}
+
+// stopImport stops the import of key running, if any.
+func (s *Service) stopImport(key laneKey) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if run := s.importing[key]; run != nil {
+		run.cancel()
+		delete(s.importing, key)
+	}
+}
+
+// forgetImport stops the imports of key, as its service is disconnected:
+// the next connection starts with them off, and the titles its watchlist
+// alone held leave the user's watchlist.
+func (s *Service) forgetImport(ctx context.Context, key laneKey) error {
+	s.stopImport(key)
+	if _, err := s.db.Exec(ctx, "DELETE FROM tracking_imports WHERE user_id = $1 AND service = $2", key.user, key.service); err != nil {
+		return err
+	}
+	return s.watchlist.Drop(ctx, key.user, watchlist.Tracking(key.service))
+}
+
+// importDue starts the imports due: turned on, of a connection that works,
+// and not run for the interval the settings give. A new interval applies
+// at once, to every import.
+func (s *Service) importDue() {
+	if s.titles == nil || s.userData == nil {
+		return
+	}
+	settings := s.settings()
+	rows, err := s.db.Query(s.ctx, `SELECT i.user_id, i.service FROM tracking_imports i
+		JOIN tracking_connections c ON c.user_id = i.user_id AND c.service = i.service
+		WHERE (i.enabled OR i.watchlist OR i.ratings) AND c.problem IS DISTINCT FROM 'reconnect' AND (i.last_import_at IS NULL OR i.last_import_at <= $1)`,
+		s.now().Add(-settings.ImportEvery()))
+	if err != nil {
+		s.logger.Warn("The watch history imports due could not be read", "error", err)
+		return
+	}
+	due, err := pgx.CollectRows(rows, func(row pgx.CollectableRow) (laneKey, error) {
+		var key laneKey
+		return key, row.Scan(&key.user, &key.service)
+	})
+	if err != nil {
+		s.logger.Warn("The watch history imports due could not be read", "error", err)
+		return
+	}
+	for _, key := range due {
+		if Available(key.service, settings) {
+			s.startImport(key, false)
+		}
+	}
+}
+
+// watchedEntry is a title a history says the user watched, at a date when
+// it gives one. A title no mapping knows has no ref, but unmapped.
+type watchedEntry struct {
+	ref      library.TitleRef
+	at       *time.Time
+	unmapped *unmappedTitle
+}
+
+// resumeEntry is a resume point a service keeps: at Percent of the title,
+// or at Position of Runtime when the service tells them, set at At. A
+// title no mapping knows has no ref, but unmapped.
+type resumeEntry struct {
+	ref               library.TitleRef
+	percent           float64
+	position, runtime time.Duration
+	at                time.Time
+	unmapped          *unmappedTitle
+}
+
+// unmappedTitle is a title a history names that no mapping knows, which
+// counts as not found: its entry key, empty when nothing names it the
+// same way from one import to the next, and its label (see package
+// importlinks).
+type unmappedTitle struct {
+	key   string
+	label importlinks.Label
+}
+
+// history is what an import read of a service: what it watched and its
+// resume points.
+type watchHistory struct {
+	watched []watchedEntry
+	resumes []resumeEntry
+}
+
+// runImport imports the watch history of key, and its watchlist, as
+// turned on: reads them from the service, finds their titles, and adds
+// what Mira lacks to the user's data and watchlist.
+func (s *Service) runImport(ctx context.Context, key laneKey) {
+	var cursor string
+	var cursorFor *time.Time
+	var history, list, ratings bool
+	err := s.db.QueryRow(ctx, `SELECT cursor, cursor_for, enabled, watchlist, ratings FROM tracking_imports
+		WHERE user_id = $1 AND service = $2 AND (enabled OR watchlist OR ratings)`,
+		key.user, key.service).Scan(&cursor, &cursorFor, &history, &list, &ratings)
+	if err != nil {
+		if !errors.Is(err, pgx.ErrNoRows) && ctx.Err() == nil {
+			s.logger.Warn("A watch history import could not start", "service", key.service, "error", err)
+		}
+		return
+	}
+	conn, ok, err := s.connection(ctx, key.user, key.service)
+	if err != nil || !ok || conn.problem == ProblemReconnect || !Available(key.service, s.settings()) {
+		return
+	}
+	// A cursor tells where the history of the account it was read from
+	// stood: a new connection reads it whole.
+	if cursorFor == nil || !cursorFor.Equal(conn.connectedAt) {
+		cursor = ""
+	}
+	r := &reader{s: s, key: key, token: conn.token, settings: s.settings()}
+	var read watchHistory
+	var listed watchlistRead
+	next := cursor
+	readErr := r.authorize(ctx)
+	if readErr == nil && history {
+		read, next, readErr = r.read(ctx, cursor)
+	}
+	if readErr == nil && list && watchlists(key.service) {
+		listed, readErr = r.readWatchlist(ctx)
+	}
+	ratings = ratings && animeLists(key.service)
+	if readErr == nil && ratings && s.anime.Ready() {
+		_, readErr = r.animeList(ctx)
+	}
+	if ctx.Err() != nil {
+		// Turned off, disconnected, or the server stops.
+		return
+	}
+	result := ImportResult{Problem: importProblem(readErr)}
+	if readErr != nil {
+		next = cursor
+		s.logger.Info("A watch history could not be read whole: what was read is imported", "user_id", key.user.String(),
+			"service", key.service, "problem", result.Problem)
+	}
+	// The titles linked by hand are named by their links.
+	var linked importlinks.Linked
+	if s.links != nil {
+		linked, err = s.links.Linked(ctx, key.user, key.service)
+	}
+	var kept []importlinks.Entry
+	if err == nil {
+		kept, err = s.merge(ctx, r, read, linked, &result)
+	}
+	if err == nil && list && watchlists(key.service) {
+		var listKept []importlinks.Entry
+		listKept, err = s.mergeWatchlist(ctx, r, listed, linked, &result)
+		kept = append(kept, listKept...)
+	}
+	if err == nil && ratings && readErr == nil {
+		err = s.mergeRatings(ctx, r, &result)
+	}
+	if err != nil {
+		if ctx.Err() == nil {
+			metrics.Imported(key.service, false)
+			s.logger.Warn("A watch history could not be imported", "service", key.service, "error", err)
+		}
+		return
+	}
+	if s.links != nil {
+		// A history read from no cursor and without a problem was read
+		// whole: what it no longer holds leaves the titles kept. Else what
+		// was read adds to them.
+		whole := history && cursor == "" && readErr == nil
+		if err := s.links.Save(ctx, key.user, key.service, kept, whole); err != nil && ctx.Err() == nil {
+			s.logger.Warn("The titles a watch history import did not find could not be kept", "service", key.service, "error", err)
+		}
+	}
+	metrics.Imported(key.service, result.Problem == "")
+	result.At = s.now().UTC()
+	var problem *string
+	if result.Problem != "" {
+		problem = &result.Problem
+	}
+	if _, err := s.db.Exec(ctx, `UPDATE tracking_imports SET last_import_at = $3, played = $4, resumed = $5, unmapped = $6, problem = $7,
+			cursor = $8, cursor_for = $9, watchlisted = $10, rated = $11, ratings_skipped = $12
+		WHERE user_id = $1 AND service = $2`, key.user, key.service, result.At, result.Played, result.Resumed, result.Unmapped, problem,
+		next, conn.connectedAt, result.Watchlist, result.Rated, result.RatingsSkipped); err != nil && ctx.Err() == nil {
+		s.logger.Warn("A watch history import could not be recorded", "service", key.service, "error", err)
+	}
+	s.logger.Debug("Imported a watch history", "user_id", key.user.String(), "service", key.service, "played", result.Played,
+		"resumed", result.Resumed, "watchlist", result.Watchlist, "unmapped", result.Unmapped)
+}
+
+// importProblem names what stopped reading a history.
+func importProblem(err error) string {
+	switch {
+	case err == nil:
+		return ""
+	case errors.Is(err, errTokenRefused):
+		return ProblemReconnect
+	case errors.Is(err, errRateLimited):
+		return ProblemRateLimited
+	}
+	return ProblemUnreachable
+}
+
+// played is an item an import marks played, at the latest date the history
+// gives, nil when it gives none. counts tells whether marking it counts in
+// the import's result (see counts).
+type played struct {
+	item   userdata.Item
+	at     *time.Time
+	counts bool
+}
+
+// resumed is a resume point an import sets.
+type resumed struct {
+	item   userdata.Item
+	counts bool
+	userdata.ImportedResume
+}
+
+// counts reports whether t, among the targets found of one title, counts
+// in the import's result: the title an anime catalog lists under the
+// title's anime entry is the one also found by its usual identifiers,
+// counted once, unless it was found that way only.
+func counts(found []library.TitleTarget, t library.TitleTarget) bool {
+	return !t.Anime || !slices.ContainsFunc(found, func(o library.TitleTarget) bool { return !o.Anime })
+}
+
+// The reasons the imports keep the titles they did not find for (see
+// importlinks.Entry): identifiers no title has, and titles no mapping
+// knows.
+const (
+	reasonNotFound  = "not_found"
+	reasonNotMapped = "not_mapped"
+)
+
+// keptTitle names the title ref names, or unmapped when no mapping knows
+// it, as the import resolves it: by its link when it was linked by hand
+// (see importlinks.Linked). It also returns what the import keeps of it
+// when it does not find it, but for what it would bring. An episode
+// numbered absolutely is not kept, as no season and number place it, but
+// its series' link names it.
+func keptTitle(linked importlinks.Linked, ref library.TitleRef, unmapped *unmappedTitle) (library.TitleRef, importlinks.Entry) {
+	e := importlinks.Entry{Reason: reasonNotFound}
+	switch key := importlinks.RefKey(ref); {
+	case unmapped != nil:
+		e.Key, e.Label, e.Reason = unmapped.key, unmapped.label, reasonNotMapped
+	case key == "" && ref.Anime != (library.AnimeRef{}):
+		e.Key, e.Label = animeRefEntry(ref)
+	default:
+		e.Key, e.Label = key, refLabel(ref)
+	}
+	named := ref
+	if to, ok := linked.Ref(e.Key, e.Label); ok {
+		named = to
+		named.Absolute = ref.Absolute
+	}
+	if ref.Absolute {
+		e.Key = ""
+	}
+	return named, e
+}
+
+// refLabel describes the title ref names to the user.
+func refLabel(ref library.TitleRef) importlinks.Label {
+	label := importlinks.Label{Kind: importlinks.KindMovie, Name: ref.Name, IDs: importlinks.RefIDs(ref)}
+	switch {
+	case ref.Episode:
+		label.Kind, label.Season, label.Episode = importlinks.KindEpisode, ref.Season, ref.Number
+	case ref.Series:
+		label.Kind = importlinks.KindSeries
+	}
+	return label
+}
+
+// merge finds the titles of h and adds them to the user's data: played
+// marks, then resume points of the titles still unplayed. The titles
+// linked by hand are named by their links. The episodes of a service
+// numbering them as TMDB does are found by TMDB's numbers. It returns
+// what the import keeps of the titles it did not find.
+func (s *Service) merge(ctx context.Context, r *reader, h watchHistory, linked importlinks.Linked,
+	result *ImportResult) ([]importlinks.Entry, error) {
+	key := r.key
+	tmdbNumbers := numbersByTMDB(key.service)
+	named := func(ref library.TitleRef) library.TitleRef {
+		if tmdbNumbers {
+			ref.TMDBNumbered = ref.Episode && !ref.Absolute
+		}
+		return ref
+	}
+	refs := make([]library.TitleRef, 0, len(h.watched)+len(h.resumes))
+	entries := make([]importlinks.Entry, 0, len(h.watched)+len(h.resumes))
+	for _, w := range h.watched {
+		ref, e := keptTitle(linked, w.ref, w.unmapped)
+		e.Played, e.PlayedAt = true, w.at
+		refs, entries = append(refs, named(ref)), append(entries, e)
+	}
+	for _, point := range h.resumes {
+		ref, e := keptTitle(linked, point.ref, point.unmapped)
+		e.Resume = &userdata.ImportedResume{Percent: point.percent, Position: point.position, Runtime: point.runtime, At: point.at}
+		refs, entries = append(refs, named(ref)), append(entries, e)
+	}
+	targets, err := s.resolve(ctx, r, refs)
+	if err != nil {
+		return nil, err
+	}
+	// The titles not found count once each: by their refs, and those no
+	// mapping knows by what names them and their place in their series.
+	unmapped := map[library.TitleRef]bool{}
+	unknown := map[unmappedTitle]bool{}
+	var kept []importlinks.Entry
+	notFound := func(i int, u *unmappedTitle) {
+		if u != nil && refs[i] == (library.TitleRef{}) {
+			counted := unmappedTitle{key: u.key, label: importlinks.Label{Kind: u.label.Kind, Season: u.label.Season, Episode: u.label.Episode}}
+			if u.key == "" {
+				counted.label.Name = u.label.Name
+			}
+			unknown[counted] = true
+		} else {
+			unmapped[refs[i]] = true
+		}
+		kept = append(kept, entries[i])
+	}
+	marks := map[accounts.ID]*played{}
+	var markOrder []accounts.ID
+	for i, w := range h.watched {
+		if len(targets[i]) == 0 {
+			notFound(i, w.unmapped)
+		}
+		for _, t := range targets[i] {
+			item := userdata.Item{ID: t.ID, Series: t.Series, Season: t.Season}
+			p := marks[t.ID]
+			if p == nil {
+				p = &played{item: item}
+				marks[t.ID] = p
+				markOrder = append(markOrder, t.ID)
+			}
+			p.counts = p.counts || counts(targets[i], t)
+			if w.at != nil && (p.at == nil || w.at.After(*p.at)) {
+				p.at = w.at
+			}
+		}
+	}
+	points := map[accounts.ID]*resumed{}
+	var pointOrder []accounts.ID
+	for i, r := range h.resumes {
+		found := targets[len(h.watched)+i]
+		if len(found) == 0 {
+			notFound(len(h.watched)+i, r.unmapped)
+		}
+		for _, t := range found {
+			if p := points[t.ID]; p != nil && !r.at.After(p.At) {
+				continue
+			}
+			if _, listed := points[t.ID]; !listed {
+				pointOrder = append(pointOrder, t.ID)
+			}
+			runtime := r.runtime
+			if runtime <= 0 {
+				runtime = t.Runtime
+			}
+			points[t.ID] = &resumed{item: userdata.Item{ID: t.ID, Series: t.Series, Season: t.Season}, counts: counts(found, t),
+				ImportedResume: userdata.ImportedResume{Percent: r.percent, Position: r.position, Runtime: runtime, At: r.at}}
+		}
+	}
+	result.Unmapped = len(unmapped) + len(unknown)
+
+	for batch := range chunks(markOrder) {
+		items := make([]userdata.Item, 0, len(batch))
+		for _, id := range batch {
+			items = append(items, marks[id].item)
+		}
+		if _, err := s.userData.ChangeEach(ctx, key.user, items, func(item userdata.Item, d *userdata.Data) {
+			if d.ImportPlayed(marks[item.ID].at) && marks[item.ID].counts {
+				result.Played++
+			}
+		}); err != nil {
+			return nil, err
+		}
+	}
+	settings := s.settings()
+	thresholds := userdata.Thresholds{Resume: settings.ResumePercent, Played: settings.PlayedPercent}
+	for batch := range chunks(pointOrder) {
+		items := make([]userdata.Item, 0, len(batch))
+		for _, id := range batch {
+			items = append(items, points[id].item)
+		}
+		if _, err := s.userData.ChangeEach(ctx, key.user, items, func(item userdata.Item, d *userdata.Data) {
+			point := points[item.ID]
+			switch d.ImportResume(point.ImportedResume, thresholds) {
+			case userdata.ResumePlayed:
+				if point.counts {
+					result.Played++
+				}
+			case userdata.ResumeSet:
+				if point.counts {
+					result.Resumed++
+				}
+			}
+		}); err != nil {
+			return nil, err
+		}
+	}
+	return kept, nil
+}
+
+// chunks yields ids importBatch at a time.
+func chunks(ids []accounts.ID) func(func([]accounts.ID) bool) {
+	return func(yield func([]accounts.ID) bool) {
+		for start := 0; start < len(ids); start += importBatch {
+			if !yield(ids[start:min(start+importBatch, len(ids))]) {
+				return
+			}
+		}
+	}
+}
+
+// resolve finds the items of refs, none of an empty ref (a title no
+// mapping knows). PublicMetaDB names titles by their TMDB identifier
+// only: those Mira does not know by it are looked up by the IMDb
+// identifier PublicMetaDB maps them to.
+func (s *Service) resolve(ctx context.Context, r *reader, refs []library.TitleRef) ([][]library.TitleTarget, error) {
+	if slices.Contains(refs, library.TitleRef{}) {
+		var named []library.TitleRef
+		var at []int
+		for i, ref := range refs {
+			if ref != (library.TitleRef{}) {
+				named, at = append(named, ref), append(at, i)
+			}
+		}
+		found, err := s.resolve(ctx, r, named)
+		if err != nil {
+			return nil, err
+		}
+		targets := make([][]library.TitleTarget, len(refs))
+		for j, i := range at {
+			targets[i] = found[j]
+		}
+		return targets, nil
+	}
+	targets, err := s.titles.Resolve(ctx, refs)
+	if err != nil || r.key.service != PublicMetaDB {
+		return targets, err
+	}
+	var missing []int
+	var again []library.TitleRef
+	for i, ref := range refs {
+		if len(targets[i]) > 0 || ref.IMDb != "" || ref.TMDB == 0 {
+			continue
+		}
+		imdb := s.mapPublicMetaDB(ctx, r, ref)
+		if imdb == "" {
+			continue
+		}
+		ref.IMDb = imdb
+		missing, again = append(missing, i), append(again, ref)
+	}
+	if len(again) == 0 || ctx.Err() != nil {
+		return targets, ctx.Err()
+	}
+	found, err := s.titles.Resolve(ctx, again)
+	if err != nil {
+		return nil, err
+	}
+	for j, i := range missing {
+		targets[i] = found[j]
+	}
+	return targets, nil
+}

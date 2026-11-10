@@ -1,0 +1,87 @@
+package localization
+
+import (
+	"strings"
+	"testing"
+)
+
+func TestLanguagesCompareWhicheverCodeNamesThem(t *testing.T) {
+	t.Parallel()
+	for _, test := range []struct {
+		a, b string
+		same bool
+	}{
+		{"fre", "fra", true},
+		{"ger", "deu", true},
+		{"chi", "zh", true},
+		{"FR", "fre", true},
+		{"fr-CA", "fra", true},
+		{"pt_BR", "por", true},
+		{"eng", "eng", true},
+		{"fil", "FIL", true},
+		{"eng", "fre", false},
+		{"", "", false},
+		{"", "und", false},
+		{"klingon", "Klingon", true},
+	} {
+		if got := SameLanguage(test.a, test.b); got != test.same {
+			t.Errorf("SameLanguage(%q, %q) = %v", test.a, test.b, got)
+		}
+	}
+}
+
+// A title's language, as addons give it, names languages by code or by
+// name, in English, in French or in the language itself.
+func TestLanguagesAreReadFromTheirCodesAndNames(t *testing.T) {
+	t.Parallel()
+	for text, want := range map[string]string{
+		"fr":                          "fre",
+		"French":                      "fre",
+		"français":                    "fre",
+		"en, Deutsch / Spanish; xx-y": "eng ger spa",
+		"Allemand|fr-CA|fr":           "ger fre",
+		"none":                        "",
+	} {
+		if got := strings.Join(LanguageCodes(text), " "); got != want {
+			t.Errorf("LanguageCodes(%q) = %q, want %q", text, got, want)
+		}
+	}
+}
+
+func TestEveryLanguageHasACode(t *testing.T) {
+	t.Parallel()
+	for _, language := range Languages() {
+		if len(language.Bibliographic) != 3 || language.Name == "" || LanguageCode(language.Bibliographic) != language.Bibliographic {
+			t.Errorf("language %+v", language)
+		}
+	}
+	for _, country := range Countries() {
+		if len(country.Alpha2) != 2 || len(country.Alpha3) != 3 || country.Name == "" {
+			t.Errorf("country %+v", country)
+		}
+	}
+}
+
+func TestCountriesAreTheAssignedCodes(t *testing.T) {
+	t.Parallel()
+	codes := map[string]Country{}
+	for _, country := range Countries() {
+		codes[country.Alpha2] = country
+	}
+	// Reserved (UK, EU), withdrawn (YU, ZR) and user-assigned (XK, ZZ)
+	// codes are left out.
+	for _, code := range []string{"UK", "EU", "YU", "ZR", "XK", "ZZ"} {
+		if country, ok := codes[code]; ok {
+			t.Errorf("%s is listed: %+v", code, country)
+		}
+	}
+	if gb := codes["GB"]; gb.Alpha3 != "GBR" || gb.Name != "United Kingdom" {
+		t.Errorf("GB: %+v", gb)
+	}
+	if len(codes) != 249 {
+		t.Errorf("%d countries, ISO 3166-1 assigns 249 codes", len(codes))
+	}
+	if list := Countries(); list[1].Alpha2 != "AX" {
+		t.Errorf("Åland Islands sorted at %+v", list[1])
+	}
+}

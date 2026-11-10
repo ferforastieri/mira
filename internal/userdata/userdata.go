@@ -1,0 +1,424 @@
+// Package userdata keeps what each user did with each item: whether it was
+// played and how often, where playback stopped, and whether the user marked
+// it as a favorite or rated it. It applies the rules a Jellyfin server
+// applies to playback reports and to played marks.
+package userdata
+
+import (
+	"context"
+	"slices"
+	"time"
+
+	"github.com/jackc/pgx/v5"
+	"github.com/jackc/pgx/v5/pgconn"
+	"github.com/jackc/pgx/v5/pgtype"
+	"github.com/jackc/pgx/v5/pgxpool"
+
+	"github.com/ferforastieri/mira/internal/accounts"
+)
+
+// tick is Jellyfin's unit of time.
+const tick = 100 * time.Nanosecond
+
+// Data is a user's state for one item. The zero value is an item the user
+// never touched.
+type Data struct {
+	Played    bool
+	PlayCount int
+	// Position is the resume point, zero when there is none; Runtime is the
+	// runtime it was measured against, zero when unknown.
+	Position time.Duration
+	Runtime  time.Duration
+	Favorite bool
+	// Rating is the user's rating from 0 to 10, nil when the item is not
+	// rated.
+	Rating     *float64
+	LastPlayed *time.Time
+	// ResumeRemoved is when the user last took the item off Continue
+	// Watching (see RemoveResume), nil if never.
+	ResumeRemoved *time.Time
+}
+
+// Likes tells whether the user likes the item, as Jellyfin reads a
+// rating: nil when the item is not rated.
+func (d Data) Likes() *bool {
+	if d.Rating == nil {
+		return nil
+	}
+	return new(*d.Rating >= 5)
+}
+
+// Item names an item whose data changes. Episodes name their series and
+// season, which count their played episodes.
+type Item struct {
+	ID, Series, Season accounts.ID
+}
+
+// Entry is the data of one item, as lists return it; Series and Season are
+// zero but for episodes.
+type Entry struct {
+	Item, Series, Season accounts.ID
+	Data
+}
+
+// Counts are the episodes under a series or season the user played, and
+// those with a resume point.
+type Counts struct {
+	Played, Resumable int
+}
+
+// Store keeps user data in PostgreSQL.
+type Store struct {
+	db db
+}
+
+// db is a pool, or a transaction in tests that count the rows a change
+// writes.
+type db interface {
+	Begin(ctx context.Context) (pgx.Tx, error)
+	Exec(ctx context.Context, sql string, arguments ...any) (pgconn.CommandTag, error)
+	Query(ctx context.Context, sql string, args ...any) (pgx.Rows, error)
+}
+
+// New returns a store backed by db.
+func New(db *pgxpool.Pool) *Store {
+	return &Store{db: db}
+}
+
+const columns = `item_id, coalesce(series_id, '00000000-0000-0000-0000-000000000000'),
+	coalesce(season_id, '00000000-0000-0000-0000-000000000000'),
+	played, play_count, position_ticks, runtime_ticks, favorite, rating, last_played_at, resume_removed_at`
+
+func scanEntry(row pgx.Row) (Entry, error) {
+	var e Entry
+	var position, runtime int64
+	var rating pgtype.Float8
+	var lastPlayed, resumeRemoved pgtype.Timestamptz
+	if err := row.Scan(&e.Item, &e.Series, &e.Season, &e.Played, &e.PlayCount, &position, &runtime, &e.Favorite, &rating, &lastPlayed,
+		&resumeRemoved); err != nil {
+		return Entry{}, err
+	}
+	e.Position, e.Runtime = time.Duration(position)*tick, time.Duration(runtime)*tick
+	if rating.Valid {
+		e.Rating = new(rating.Float64)
+	}
+	if lastPlayed.Valid {
+		e.LastPlayed = new(lastPlayed.Time.UTC())
+	}
+	if resumeRemoved.Valid {
+		e.ResumeRemoved = new(resumeRemoved.Time.UTC())
+	}
+	return e, nil
+}
+
+func (s *Store) entries(ctx context.Context, query string, args ...any) ([]Entry, error) {
+	rows, err := s.db.Query(ctx, query, args...)
+	if err != nil {
+		return nil, err
+	}
+	return pgx.CollectRows(rows, func(row pgx.CollectableRow) (Entry, error) { return scanEntry(row) })
+}
+
+// Get returns the user's data for those of ids that have any.
+func (s *Store) Get(ctx context.Context, user accounts.ID, ids []accounts.ID) (map[accounts.ID]Data, error) {
+	result := make(map[accounts.ID]Data, len(ids))
+	if len(ids) == 0 {
+		return result, nil
+	}
+	entries, err := s.entries(ctx, "SELECT "+columns+" FROM user_data WHERE user_id = $1 AND item_id = ANY($2)", user, ids)
+	if err != nil {
+		return nil, err
+	}
+	for _, e := range entries {
+		result[e.Item] = e.Data
+	}
+	return result, nil
+}
+
+// EpisodeCounts counts, for each series or season in parents, the episodes
+// under it the user played and those with a resume point.
+func (s *Store) EpisodeCounts(ctx context.Context, user accounts.ID, parents []accounts.ID) (map[accounts.ID]Counts, error) {
+	result := make(map[accounts.ID]Counts, len(parents))
+	if len(parents) == 0 {
+		return result, nil
+	}
+	rows, err := s.db.Query(ctx, `
+		SELECT series_id, count(*) FILTER (WHERE played), count(*) FILTER (WHERE position_ticks > 0)
+		FROM user_data WHERE user_id = $1 AND series_id = ANY($2) GROUP BY series_id
+		UNION ALL
+		SELECT season_id, count(*) FILTER (WHERE played), count(*) FILTER (WHERE position_ticks > 0)
+		FROM user_data WHERE user_id = $1 AND season_id = ANY($2) GROUP BY season_id`,
+		user, parents)
+	if err != nil {
+		return nil, err
+	}
+	var parent accounts.ID
+	var counts Counts
+	_, err = pgx.ForEachRow(rows, []any{&parent, &counts.Played, &counts.Resumable}, func() error {
+		result[parent] = counts
+		return nil
+	})
+	return result, err
+}
+
+// SeriesLastPlayed returns, for each series in series, when the user last
+// played one of its episodes they played through, as Jellyfin's
+// SeriesDatePlayed sort reads it; series without one are missing.
+func (s *Store) SeriesLastPlayed(ctx context.Context, user accounts.ID, series []accounts.ID) (map[accounts.ID]time.Time, error) {
+	result := make(map[accounts.ID]time.Time, len(series))
+	if len(series) == 0 {
+		return result, nil
+	}
+	rows, err := s.db.Query(ctx, `SELECT series_id, max(last_played_at) FROM user_data
+		WHERE user_id = $1 AND series_id = ANY($2) AND played AND last_played_at IS NOT NULL GROUP BY series_id`, user, series)
+	if err != nil {
+		return nil, err
+	}
+	var id accounts.ID
+	var at time.Time
+	_, err = pgx.ForEachRow(rows, []any{&id, &at}, func() error {
+		result[id] = at.UTC()
+		return nil
+	})
+	return result, err
+}
+
+// Resumable lists the items with a resume point, most recently played
+// first; those never started come last.
+func (s *Store) Resumable(ctx context.Context, user accounts.ID) ([]Entry, error) {
+	return s.entries(ctx, "SELECT "+columns+` FROM user_data WHERE user_id = $1 AND position_ticks > 0
+		ORDER BY last_played_at DESC NULLS LAST, item_id`, user)
+}
+
+// Favorites lists the user's favorite items.
+func (s *Store) Favorites(ctx context.Context, user accounts.ID) ([]Entry, error) {
+	return s.entries(ctx, "SELECT "+columns+" FROM user_data WHERE user_id = $1 AND favorite ORDER BY item_id", user)
+}
+
+// Liked lists the items the user likes.
+func (s *Store) Liked(ctx context.Context, user accounts.ID) ([]Entry, error) {
+	return s.entries(ctx, "SELECT "+columns+" FROM user_data WHERE user_id = $1 AND rating >= 5 ORDER BY item_id", user)
+}
+
+// Played lists the items the user played, most recently played first.
+func (s *Store) Played(ctx context.Context, user accounts.ID) ([]Entry, error) {
+	return s.entries(ctx, "SELECT "+columns+` FROM user_data WHERE user_id = $1 AND played
+		ORDER BY last_played_at DESC NULLS LAST, item_id`, user)
+}
+
+// Touched lists the data of every item the user played, started, rated
+// or marked as a favorite, most recently played first: what taste
+// profiles are built from (see package taste).
+func (s *Store) Touched(ctx context.Context, user accounts.ID) ([]Entry, error) {
+	return s.entries(ctx, "SELECT "+columns+` FROM user_data
+		WHERE user_id = $1 AND (played OR favorite OR rating IS NOT NULL OR last_played_at IS NOT NULL OR position_ticks > 0)
+		ORDER BY last_played_at DESC NULLS LAST, item_id`, user)
+}
+
+// Episodes lists the data of the episodes the user played, started or
+// has a resume point in, of every series, most recently played first. An
+// episode started and stopped before the resume threshold is only dated.
+func (s *Store) Episodes(ctx context.Context, user accounts.ID) ([]Entry, error) {
+	return s.entries(ctx, "SELECT "+columns+` FROM user_data
+		WHERE user_id = $1 AND series_id IS NOT NULL AND (played OR position_ticks > 0 OR last_played_at IS NOT NULL)
+		ORDER BY last_played_at DESC NULLS LAST, item_id`, user)
+}
+
+// Change applies change to the data of each item, in one transaction, and
+// returns the data of the items afterwards, in order. An item listed twice
+// is changed once.
+func (s *Store) Change(ctx context.Context, user accounts.ID, items []Item, change func(*Data)) ([]Data, error) {
+	return s.ChangeEach(ctx, user, items, func(_ Item, d *Data) { change(d) })
+}
+
+// ChangeEach is Change with change told which item it changes.
+func (s *Store) ChangeEach(ctx context.Context, user accounts.ID, items []Item, change func(Item, *Data)) ([]Data, error) {
+	seen := make(map[accounts.ID]bool, len(items))
+	items = slices.DeleteFunc(slices.Clone(items), func(item Item) bool {
+		duplicate := seen[item.ID]
+		seen[item.ID] = true
+		return duplicate
+	})
+	if len(items) == 0 {
+		return nil, nil
+	}
+	ids := make([]accounts.ID, len(items))
+	series := make([]pgtype.UUID, len(items))
+	seasons := make([]pgtype.UUID, len(items))
+	for i, item := range items {
+		ids[i], series[i], seasons[i] = item.ID, optionalID(item.Series), optionalID(item.Season)
+	}
+	var result []Data
+	err := pgx.BeginFunc(ctx, s.db, func(tx pgx.Tx) error {
+		// Rows are created first, so that concurrent changes of a new item
+		// wait for each other below. Neither statement rewrites a row whose
+		// values stay the same: imports and app connections re-apply whole
+		// histories, mostly unchanged.
+		if _, err := tx.Exec(ctx, `INSERT INTO user_data (user_id, item_id, series_id, season_id)
+			SELECT $1, * FROM unnest($2::uuid[], $3::uuid[], $4::uuid[])
+			ON CONFLICT (user_id, item_id) DO UPDATE
+			SET series_id = coalesce(excluded.series_id, user_data.series_id), season_id = coalesce(excluded.season_id, user_data.season_id)
+			WHERE excluded.series_id IS NOT NULL AND excluded.series_id IS DISTINCT FROM user_data.series_id
+				OR excluded.season_id IS NOT NULL AND excluded.season_id IS DISTINCT FROM user_data.season_id`,
+			user, ids, series, seasons); err != nil {
+			return err
+		}
+		rows, err := tx.Query(ctx, "SELECT "+columns+" FROM user_data WHERE user_id = $1 AND item_id = ANY($2) FOR UPDATE", user, ids)
+		if err != nil {
+			return err
+		}
+		current, err := pgx.CollectRows(rows, func(row pgx.CollectableRow) (Entry, error) { return scanEntry(row) })
+		if err != nil {
+			return err
+		}
+		byID := make(map[accounts.ID]Data, len(current))
+		for _, e := range current {
+			byID[e.Item] = e.Data
+		}
+		result = make([]Data, len(items))
+		played := make([]bool, len(items))
+		counts := make([]int32, len(items))
+		positions := make([]int64, len(items))
+		runtimes := make([]int64, len(items))
+		favorites := make([]bool, len(items))
+		ratings := make([]pgtype.Float8, len(items))
+		lastPlayed := make([]pgtype.Timestamptz, len(items))
+		resumeRemoved := make([]pgtype.Timestamptz, len(items))
+		for i, id := range ids {
+			data := byID[id]
+			change(items[i], &data)
+			result[i] = data
+			played[i], counts[i], favorites[i] = data.Played, int32(max(data.PlayCount, 0)), data.Favorite
+			positions[i], runtimes[i] = int64(max(data.Position, 0)/tick), int64(max(data.Runtime, 0)/tick)
+			if data.Rating != nil {
+				ratings[i] = pgtype.Float8{Float64: min(max(*data.Rating, 0), 10), Valid: true}
+			}
+			if data.LastPlayed != nil {
+				lastPlayed[i] = pgtype.Timestamptz{Time: *data.LastPlayed, Valid: true}
+			}
+			if data.ResumeRemoved != nil {
+				resumeRemoved[i] = pgtype.Timestamptz{Time: *data.ResumeRemoved, Valid: true}
+			}
+		}
+		_, err = tx.Exec(ctx, `UPDATE user_data SET played = c.played, play_count = c.play_count, position_ticks = c.position_ticks,
+				runtime_ticks = c.runtime_ticks, favorite = c.favorite, rating = c.rating, last_played_at = c.last_played_at,
+				resume_removed_at = c.resume_removed_at
+			FROM unnest($2::uuid[], $3::bool[], $4::int[], $5::bigint[], $6::bigint[], $7::bool[], $8::float8[], $9::timestamptz[], $10::timestamptz[])
+				AS c (item_id, played, play_count, position_ticks, runtime_ticks, favorite, rating, last_played_at, resume_removed_at)
+			WHERE user_data.user_id = $1 AND user_data.item_id = c.item_id
+				AND (user_data.played, user_data.play_count, user_data.position_ticks, user_data.runtime_ticks, user_data.favorite,
+					user_data.rating, user_data.last_played_at, user_data.resume_removed_at)
+				IS DISTINCT FROM (c.played, c.play_count, c.position_ticks, c.runtime_ticks, c.favorite,
+					c.rating, c.last_played_at, c.resume_removed_at)`,
+			user, ids, played, counts, positions, runtimes, favorites, ratings, lastPlayed, resumeRemoved)
+		return err
+	})
+	return result, err
+}
+
+func optionalID(id accounts.ID) pgtype.UUID {
+	return pgtype.UUID{Bytes: id, Valid: id != accounts.ID{}}
+}
+
+// Move names items whose data follows other items: what users did with
+// From goes to To (see Store.Follow).
+type Move struct {
+	From []accounts.ID
+	To   []Item
+}
+
+// Follow gives what each user did with the items each move comes from to
+// the items it goes to, under thresholds (see Data.Follow). A resume point
+// moves: the item it comes from loses it once an item it goes to records
+// as recent a play.
+func (s *Store) Follow(ctx context.Context, moves []Move, thresholds Thresholds) error {
+	var from []accounts.ID
+	for _, move := range moves {
+		from = append(from, move.From...)
+	}
+	if len(from) == 0 {
+		return nil
+	}
+	rows, err := s.db.Query(ctx, "SELECT DISTINCT user_id FROM user_data WHERE item_id = ANY($1)", from)
+	if err != nil {
+		return err
+	}
+	users, err := pgx.CollectRows(rows, pgx.RowTo[accounts.ID])
+	if err != nil {
+		return err
+	}
+	for _, user := range users {
+		kept, err := s.Get(ctx, user, from)
+		if err != nil {
+			return err
+		}
+		gains := map[accounts.ID][]Data{}
+		var items []Item
+		// The items whose resume point is given, in order, with the items
+		// it goes to.
+		var resumed []accounts.ID
+		resumes := map[accounts.ID][]accounts.ID{}
+		for _, move := range moves {
+			for _, id := range move.From {
+				data, ok := kept[id]
+				if !ok || !data.follows() {
+					continue
+				}
+				for _, to := range move.To {
+					if to.ID == id {
+						continue
+					}
+					if gains[to.ID] == nil {
+						items = append(items, to)
+					}
+					gains[to.ID] = append(gains[to.ID], data)
+					if data.givesResume() {
+						if resumes[id] == nil {
+							resumed = append(resumed, id)
+						}
+						resumes[id] = append(resumes[id], to.ID)
+					}
+				}
+			}
+		}
+		changed, err := s.ChangeEach(ctx, user, items, func(item Item, d *Data) {
+			for _, gain := range gains[item.ID] {
+				d.Follow(gain, thresholds)
+			}
+		})
+		if err != nil {
+			return err
+		}
+		after := make(map[accounts.ID]Data, len(items))
+		for i, item := range items {
+			after[item.ID] = changed[i]
+		}
+		// The moves come from folders whose files changed kind: a resume
+		// point was recorded through the file, which its former title no
+		// longer plays, so it moves with the file, and Continue Watching
+		// lists the file once. The former title loses it once one of its
+		// new titles records the file as recently: by that resume point or
+		// a newer one, or by a later played mark. A new title played before
+		// it, which an import's rules give no resume point, leaves it where
+		// it is rather than lost. Played marks and favorites are only given.
+		var losing []Item
+		for _, id := range resumed {
+			at := *kept[id].LastPlayed
+			if slices.ContainsFunc(resumes[id], func(to accounts.ID) bool {
+				d := after[to]
+				return d.LastPlayed != nil && !d.LastPlayed.Before(at)
+			}) {
+				losing = append(losing, Item{ID: id})
+			}
+		}
+		if _, err := s.ChangeEach(ctx, user, losing, func(item Item, d *Data) {
+			// Unless it was played since it was read.
+			if d.LastPlayed != nil && d.LastPlayed.Equal(*kept[item.ID].LastPlayed) {
+				d.Position = 0
+			}
+		}); err != nil {
+			return err
+		}
+	}
+	return nil
+}

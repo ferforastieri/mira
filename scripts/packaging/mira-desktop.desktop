@@ -1,0 +1,12 @@
+[Desktop Entry]
+Type=Application
+Name=Mira
+GenericName=Media server
+Comment=Run Mira, your media server, from the tray
+Comment[fr]=Lancer Mira, votre serveur multimédia, depuis la zone de notification
+Exec=mira-desktop
+Icon=mira-desktop
+Terminal=false
+Categories=AudioVideo;Video;
+Keywords=media;server;movies;series;
+StartupNotify=false

@@ -1,0 +1,790 @@
+package jellyfin
+
+import (
+	"bytes"
+	"context"
+	"errors"
+	"math"
+	"net/http"
+	"net/url"
+	"os"
+	"slices"
+	"strconv"
+	"strings"
+	"time"
+
+	"github.com/ferforastieri/mira/internal/accounts"
+	"github.com/ferforastieri/mira/internal/hls"
+	"github.com/ferforastieri/mira/internal/library"
+	"github.com/ferforastieri/mira/internal/media"
+	"github.com/ferforastieri/mira/internal/playback"
+	"github.com/ferforastieri/mira/internal/source"
+	"github.com/ferforastieri/mira/internal/subtitles"
+)
+
+// transcodingURL is a remux's TranscodingUrl: relative, with Jellyfin's
+// parameters in Jellyfin's order. Mira reads back the play session, the
+// audio track and the segment container; the rest describes the stream as
+// Jellyfin would. A stream as one file is /videos/{id}/stream.{container},
+// without segments, as Jellyfin gives a progressive one. A play over HLS
+// starting with fast segments, from fastStart, has Mira's
+// FastStartTicks last (see playback.Remux.FastStart): every request of
+// the play then cuts it the same way.
+func transcodingURL(r *http.Request, item, sourceID accounts.ID, version library.Version, analysis media.Analysis, streams []playback.MediaStream,
+	decision playback.Decision, limit int64, session string, fastStart *time.Duration) string {
+	t := decision.Transcoding
+	var audio *playback.MediaStream
+	for i := range streams {
+		if streams[i].Type == "Audio" && streams[i].Index == decision.AudioStreamIndex {
+			audio = &streams[i]
+		}
+	}
+	var q orderedQuery
+	q.add("DeviceId", callerFrom(r.Context()).Device.DeviceID)
+	q.add("MediaSourceId", sourceID.String())
+	q.add("VideoCodec", t.VideoCodec)
+	// The audio codecs t takes that its segments carry, as Jellyfin
+	// writes them: an HLS request converting the audio converts it to the
+	// first FFmpeg encodes (see remuxFor).
+	q.add("AudioCodec", playback.StreamAudioCodecs(t))
+	if audio != nil {
+		q.add("AudioStreamIndex", strconv.Itoa(audio.Index))
+	}
+	// A subtitle in HLS is the one the master playlist selects; one burned
+	// in, the one FFmpeg draws onto the video.
+	method := ""
+	if decision.SubtitleStreamIndex >= 0 {
+		method = decision.Subtitles[decision.SubtitleStreamIndex].Method
+	}
+	if method == "Hls" || method == "Encode" {
+		q.add("SubtitleStreamIndex", strconv.Itoa(decision.SubtitleStreamIndex))
+	}
+	// The video takes what the limit leaves once the audio sent is taken
+	// off, the audio's bitrate going with it: the HLS requests read both
+	// back (see conversionLimits). Under the app's bitrate cap, the limit
+	// is the one the conversion counts with (see playback.Decision.Limit).
+	audioBitrate := playback.SentAudioBitrate(audio, decision.Audio)
+	if decision.Limit > 0 {
+		limit = decision.Limit
+	}
+	if limit > 0 {
+		q.add("VideoBitrate", strconv.FormatInt(playback.VideoLimit(limit, audioBitrate), 10))
+	}
+	if audio != nil {
+		if audioBitrate > 0 {
+			q.add("AudioBitrate", strconv.FormatInt(audioBitrate, 10))
+		}
+		// Jellyfin gives the sample rate of the audio it keeps.
+		if audio.SampleRate != nil && decision.Audio == nil {
+			q.add("AudioSampleRate", strconv.Itoa(*audio.SampleRate))
+		}
+	}
+	// The frame rate, and the frame converted video keeps within, as the
+	// app's profile allows them, which the HLS requests read back.
+	caps := decision.Caps
+	if video, ok := videoStream(analysis); ok && video.AverageRate > 0 {
+		rate := math.Round(video.AverageRate*1000) / 1000
+		if caps.FrameRate > 0 {
+			rate = min(rate, caps.FrameRate)
+		}
+		q.add("MaxFramerate", strconv.FormatFloat(rate, 'f', -1, 64))
+	} else if caps.FrameRate > 0 {
+		q.add("MaxFramerate", strconv.FormatFloat(caps.FrameRate, 'f', -1, 64))
+	}
+	if caps.Width > 0 {
+		q.add("MaxWidth", strconv.Itoa(caps.Width))
+	}
+	if caps.Height > 0 {
+		q.add("MaxHeight", strconv.Itoa(caps.Height))
+	}
+	if !decision.Progressive {
+		q.add("SegmentContainer", t.Container)
+		if t.MinSegments != "" {
+			q.add("MinSegments", t.MinSegments.String())
+		}
+	}
+	q.add("PlaySessionId", session)
+	if token := callerFrom(r.Context()).Token; token != "" {
+		q.add("ApiKey", token)
+	}
+	if t.MaxAudioChannels != "" {
+		q.add("TranscodingMaxAudioChannels", t.MaxAudioChannels)
+	}
+	q.add("RequireAvc", "false")
+	q.add("EnableAudioVbrEncoding", "true")
+	q.add("Tag", version.ID.String())
+	switch {
+	case method == "Hls" || method == "Encode":
+		q.add("SubtitleMethod", method)
+	case decision.SubtitleStreamIndex < 0:
+		q.add("SubtitleMethod", "Encode")
+	}
+	// The app's codec level and H.264 profiles, as Jellyfin's codec
+	// options name them, which the HLS requests read back.
+	for _, codec := range []string{"h264", "hevc"} {
+		if level := caps.Levels[codec]; level > 0 {
+			q.add(codec+"-level", strconv.Itoa(level))
+		}
+		if codec == "h264" && caps.H264Profiles != nil {
+			q.add("h264-profile", strings.Join(caps.H264Profiles, ","))
+		}
+	}
+	q.add("TranscodeReasons", strings.Join(decision.Reasons, ","))
+	// Video and audio converted rather than copied are asked as Jellyfin's
+	// own parameters do it, after the reasons.
+	if decision.Video != nil {
+		q.add("allowVideoStreamCopy", "false")
+	}
+	if decision.Audio != nil {
+		q.add("allowAudioStreamCopy", "false")
+	}
+	if decision.Progressive {
+		return "/videos/" + hyphenated(item) + "/stream." + strings.ToLower(t.Container) + "?" + q.String()
+	}
+	if fastStart != nil {
+		q.add("FastStartTicks", strconv.FormatInt(int64(*fastStart/100), 10))
+	}
+	return "/videos/" + hyphenated(item) + "/master.m3u8?" + q.String()
+}
+
+// orderedQuery writes URL parameters in order, with commas left as they
+// are, as Jellyfin writes its lists.
+type orderedQuery struct{ parts []string }
+
+func (q *orderedQuery) add(name, value string) {
+	q.parts = append(q.parts, name+"="+strings.ReplaceAll(url.QueryEscape(value), "%2C", ","))
+}
+
+func (q *orderedQuery) String() string {
+	return strings.Join(q.parts, "&")
+}
+
+func videoStream(analysis media.Analysis) (media.Stream, bool) {
+	for _, stream := range analysis.Streams {
+		if stream.Type == "video" && !stream.AttachedPicture {
+			return stream, true
+		}
+	}
+	return media.Stream{}, false
+}
+
+// remuxRequest is what an HLS request is about.
+type remuxRequest struct {
+	remux    playback.Remux
+	user     accounts.User
+	item     library.Item
+	analysis media.Analysis
+	// files are the subtitle files addons offer: the first of the
+	// version's subtitle streams.
+	files []library.ExternalSubtitle
+	// live is set for a channel, whose stream FFmpeg converts as it comes.
+	live bool
+	// uris is the query the playlists' URIs repeat, which carries the
+	// play session of an app; renditions lists the text subtitles in the
+	// master playlist.
+	uris       string
+	renditions bool
+}
+
+// withQuery is uri with query, if any.
+func withQuery(uri, query string) string {
+	if query == "" {
+		return uri
+	}
+	return uri + "?" + query
+}
+
+// remuxOf reads which remux an HLS request is about. HLS requests carry
+// no credentials but the play session, signed for the user and version.
+func (h *Handler) remuxOf(w http.ResponseWriter, r *http.Request) (remuxRequest, bool) {
+	opened, ok := parseGUID(r.PathValue("itemId"))
+	if !ok {
+		validationProblem(w, map[string][]string{"itemId": {notValid(r.PathValue("itemId"))}})
+		return remuxRequest{}, false
+	}
+	session := query(r, "playSessionId")
+	grant, err := h.Playback.Signer().Verify(session)
+	if err != nil {
+		w.WriteHeader(http.StatusUnauthorized)
+		return remuxRequest{}, false
+	}
+	user, err := h.Accounts.User(r.Context(), grant.User)
+	// Like Jellyfin's HLS endpoints, the user's allowed hours apply, and
+	// so does their access from outside the local network.
+	if err != nil || user.Refused(h.now()) || h.outsideHours(user) || remoteRefused(r, user) {
+		w.WriteHeader(http.StatusUnauthorized)
+		return remuxRequest{}, false
+	}
+	req, ok := h.remuxFor(w, r, user, opened, grant.Version, session)
+	req.uris, req.renditions = r.URL.RawQuery, strings.EqualFold(query(r, "subtitleMethod"), "Hls")
+	return req, ok
+}
+
+// remuxFor reads the remux of version of the item opened, for user, in the
+// play session session, from the parameters of r's query, as
+// PlaybackInfo's TranscodingUrl gives them.
+func (h *Handler) remuxFor(w http.ResponseWriter, r *http.Request, user accounts.User, opened, versionID accounts.ID, session string) (remuxRequest, bool) {
+	// A conversion the user may not have is refused, as Jellyfin refuses
+	// it once FFmpeg is about to start. PlaybackInfo plans none: this
+	// guards URLs kept from before a permission was taken away, or made up.
+	allowed := h.Accounts.Conversions(user)
+	if !allowed.Video && strings.EqualFold(query(r, "allowVideoStreamCopy"), "false") ||
+		!allowed.Audio && strings.EqualFold(query(r, "allowAudioStreamCopy"), "false") {
+		h.Logger.Info("A conversion the user may not have was refused")
+		processingError(w, http.StatusBadRequest)
+		return remuxRequest{}, false
+	}
+	item, err := h.played(r.Context(), user, opened)
+	if err != nil {
+		processingError(w, http.StatusNotFound)
+		return remuxRequest{}, false
+	}
+	version, err := h.version(r.Context(), user, item, versionID)
+	if err != nil {
+		processingError(w, http.StatusNotFound)
+		return remuxRequest{}, false
+	}
+	// A channel's stream, and a video's with no end, are converted as they
+	// come.
+	live := h.playsLive(r.Context(), item, version)
+	format, ok := hls.ParseFormat(query(r, "segmentContainer"))
+	if !ok {
+		format = hls.TS
+	}
+	var analysis media.Analysis
+	var files []library.ExternalSubtitle
+	if live {
+		analysis, err = h.Playback.AnalyzeLive(r.Context(), version)
+	} else {
+		analysis, err = h.Playback.Analyze(r.Context(), version)
+		if cached, ok := h.keptSubtitles(user, item.ID); ok {
+			files = cached
+		} else {
+			files, _ = h.Library.Subtitles(r.Context(), user, item.ID)
+		}
+		files = h.versionFiles(r.Context(), files, version)
+	}
+	if err != nil {
+		processingError(w, http.StatusNotFound)
+		return remuxRequest{}, false
+	}
+	// The device, which the URL tells as PlaybackInfo's does, sets apart
+	// the converted video kept for a new session of the same playback.
+	remux := playback.Remux{Session: session, User: user.ID, Device: query(r, "deviceId"), Version: version,
+		Audio: audioTrack(analysis, len(files), query(r, "audioStreamIndex")), Format: format}
+	// The segments the app asks the first live playlist to list, as the
+	// TranscodingUrl carries them from its profile; the channel, named in
+	// the log lines of its encoding.
+	if live {
+		remux.MinSegments, _ = strconv.Atoi(query(r, "minSegments"))
+		remux.Channel = item.Name
+	} else if item.Kind != library.KindRecording {
+		// The versions the play may go on from once its version's source
+		// fails: those the user is offered, in their order, from what is
+		// known already (see playback.Remux.Alternates).
+		remux.Alternates = func(ctx context.Context) []library.Version {
+			versions, ok := h.Library.CachedVersions(ctx, user, item.ID)
+			if ok && h.reordered(ctx, user) {
+				versions = h.ordered(ctx, user, item, versions)
+			}
+			return h.pinnedFirst(ctx, versions)
+		}
+	}
+	// A play PlaybackInfo started with fast segments, which convert the
+	// video: a user who may not have it converted gets none, as from a URL
+	// kept from before the permission was taken away, or made up.
+	if ticks, err := strconv.ParseInt(query(r, "fastStartTicks"), 10, 64); err == nil && ticks >= 0 && !live && allowed.Video {
+		remux.FastStart, remux.Start = true, time.Duration(ticks)*100
+	}
+	// The conversions PlaybackInfo chose follow from the URL, as they
+	// would for Jellyfin, through the same functions, under the limit it
+	// played under. Converted video is scaled down to the user's quality
+	// group and to the height the settings allow, the lower winning, as
+	// the encoding starts: settings Jellyfin does not have.
+	limits := h.conversionLimits(r, user)
+	if strings.EqualFold(query(r, "allowVideoStreamCopy"), "false") {
+		convert := func() {
+			streams := playback.MediaStreams(analysis, externalStreams(files), h.Accounts.Settings().Language)
+			if i := slices.IndexFunc(streams, func(s playback.MediaStream) bool { return s.Type == "Video" }); i >= 0 {
+				remux.ConvertVideo = playback.ConvertVideo(query(r, "videoCodec"), limits, streams[i], h.Playback.Capabilities())
+			}
+		}
+		convert()
+		// HDR left to the processor for want of its mastering display, on
+		// an Intel GPU, has it learned once. Live channels are not read
+		// twice.
+		if !live {
+			if learned, ok := h.Playback.LearnMasteringDisplay(r.Context(), version, analysis, remux.ConvertVideo); ok {
+				analysis = learned
+				convert()
+			}
+		}
+	}
+	// A subtitle burned in is a picture file, among the files counted
+	// first, read from its address, or an image track inside the file;
+	// never a picture subtitle's text copy, listed after the tracks, which
+	// goes out as text.
+	if index, err := strconv.Atoi(query(r, "subtitleStreamIndex")); err == nil && index >= 0 && remux.ConvertVideo != nil &&
+		strings.EqualFold(query(r, "subtitleMethod"), "Encode") {
+		switch {
+		case index < len(files):
+			if pictureFile(files[index]) {
+				remux.BurnFile = files[index].URL
+			}
+		case playback.BurnableSubtitle(analysis, index-len(files)):
+			remux.Burn = new(index - len(files))
+		}
+	}
+	if strings.EqualFold(query(r, "allowAudioStreamCopy"), "false") {
+		var source playback.AudioSource
+		for _, stream := range analysis.Streams {
+			if stream.Index == remux.Audio {
+				source = playback.AudioTrack(stream)
+			}
+		}
+		// A user who has their sound converted gets it evened, whatever
+		// the settings, and so does a source the play switches to.
+		tuning := h.Playback.Capabilities().Tuning
+		if user.ConvertSound {
+			tuning.Normalize, remux.Normalize = true, true
+		}
+		remux.ConvertAudio = playback.ConvertAudio(query(r, "audioCodec"), query(r, "transcodingMaxAudioChannels"), source,
+			limits.Bitrate, tuning)
+	}
+	// PlaybackInfo copies no video above the user's bitrate limit, nor
+	// taller than their quality group: this guards URLs kept from before
+	// the limit or the group was set, or made up.
+	if remux.ConvertVideo == nil && overUserLimit(int64(user.MaxBitrate), analysis.Bitrate) {
+		h.Logger.Info("A remux above the user's bitrate limit was refused")
+		processingError(w, http.StatusBadRequest)
+		return remuxRequest{}, false
+	}
+	if remux.ConvertVideo == nil && !user.FitsGroup(videoHeight(analysis)) {
+		h.Logger.Info("A remux taller than the user's quality group was refused")
+		processingError(w, http.StatusBadRequest)
+		return remuxRequest{}, false
+	}
+	return remuxRequest{remux: remux, user: user, item: item, analysis: analysis, files: files, live: live}, true
+}
+
+// conversionLimits are what video converted for an HLS request is scaled
+// down within: the bitrate its URL gives the video, which with the audio's
+// is the limit PlaybackInfo played under, never above the user's limit
+// whatever the URL says, the heights the user's group and the settings
+// cap it at, and what the app's profile allows it, as PlaybackInfo wrote
+// it (see transcodingURL). The limit is the user's when the app's was not
+// lower.
+func (h *Handler) conversionLimits(r *http.Request, user accounts.User) playback.Limits {
+	var limits playback.Limits
+	limits.Group, limits.Server = h.Accounts.ConversionCaps(user)
+	limits.Video, _ = strconv.ParseInt(query(r, "videoBitrate"), 10, 64)
+	if limits.Video > 0 {
+		audio, _ := strconv.ParseInt(query(r, "audioBitrate"), 10, 64)
+		limits.Bitrate = limits.Video + max(audio, 0)
+	}
+	if most := int64(user.MaxBitrate); most > 0 {
+		if limits.Video <= 0 || limits.Video > most {
+			limits.Video = most
+		}
+		if limits.Video == most || limits.Bitrate >= most {
+			limits.Bitrate, limits.ByUser = most, true
+		}
+	}
+	app := &limits.App
+	app.Width, _ = strconv.Atoi(query(r, "maxWidth"))
+	app.Height, _ = strconv.Atoi(query(r, "maxHeight"))
+	app.FrameRate, _ = strconv.ParseFloat(query(r, "maxFramerate"), 64)
+	for _, codec := range []string{"h264", "hevc"} {
+		if level, err := strconv.Atoi(query(r, codec+"-level")); err == nil && level > 0 {
+			if app.Levels == nil {
+				app.Levels = map[string]int{}
+			}
+			app.Levels[codec] = level
+		}
+	}
+	if profiles, ok := queryParam(r, "h264-profile"); ok {
+		app.H264Profiles = strings.Split(strings.ToLower(profiles), ",")
+	}
+	return limits
+}
+
+// audioTrack converts a Jellyfin audio stream index, counted after the
+// subtitle files addons offer, to the version's own: the one PlaybackInfo
+// described, else the version's default audio track.
+func audioTrack(analysis media.Analysis, files int, asked string) int {
+	if index, err := strconv.Atoi(asked); err == nil {
+		for _, stream := range analysis.Streams {
+			if stream.Type == "audio" && stream.Index == index-files {
+				return stream.Index
+			}
+		}
+	}
+	fallback := -1
+	for _, stream := range analysis.Streams {
+		if stream.Type != "audio" {
+			continue
+		}
+		if stream.Default {
+			return stream.Index
+		}
+		if fallback < 0 {
+			fallback = stream.Index
+		}
+	}
+	return fallback
+}
+
+// remuxer reads which remux an HLS request is about, or answers it.
+type remuxer func(http.ResponseWriter, *http.Request) (remuxRequest, bool)
+
+// hlsPlaylist serves master.m3u8 and main.m3u8, or live.m3u8 for a
+// channel. Their URIs are relative and repeat the query, which carries the
+// play session.
+func (h *Handler) hlsPlaylist(w http.ResponseWriter, r *http.Request, name string) {
+	h.servePlaylist(w, r, name, h.remuxOf)
+}
+
+// servePlaylist serves the playlist name of the remux remuxOf reads. The
+// master playlist of converted video offers lower qualities too as the
+// settings allow (see adaptiveQuality), each with its own media playlist
+// under hls1/main{variant}.
+func (h *Handler) servePlaylist(w http.ResponseWriter, r *http.Request, name string, remuxOf remuxer) {
+	req, ok := remuxOf(w, r)
+	if !ok {
+		return
+	}
+	if reasons := query(r, "transcodeReasons"); reasons != "" {
+		h.reasons.Put(req.remux.Session, strings.Split(reasons, ","))
+	}
+	if video := req.remux.ConvertVideo; video != nil {
+		h.sizes.Put(req.remux.Session, video.Size)
+	}
+	if req.live {
+		h.livePlaylist(w, r, req.remux, name)
+		return
+	}
+	if strings.EqualFold(name, "live") {
+		processingError(w, http.StatusNotFound)
+		return
+	}
+	if strings.EqualFold(name, "master") {
+		h.masterPlaylist(w, r, req)
+		return
+	}
+	h.mediaPlaylist(w, r, req, "hls1/main/")
+}
+
+// masterPlaylist serves the master playlist of a remux: the quality it
+// plays, then the lower ones apps may step down to, with the subtitles
+// they share.
+func (h *Handler) masterPlaylist(w http.ResponseWriter, r *http.Request, req remuxRequest) {
+	variants, err := h.Playback.Variants(r.Context(), req.remux, h.adaptiveQuality(r))
+	if err != nil {
+		h.remuxError(w, r, req.remux, err)
+		return
+	}
+	heights := make([]int, len(variants))
+	for i := range variants {
+		heights[i] = variants[i].Height
+		if i == 0 {
+			variants[i].URI = withQuery("main.m3u8", req.uris)
+		} else {
+			variants[i].URI = withQuery("hls1/main"+strconv.Itoa(i)+"/main.m3u8", req.uris)
+		}
+	}
+	if len(variants) > 1 {
+		h.qualities.Put(req.remux.Session, heights)
+	} else {
+		h.qualities.Delete(req.remux.Session)
+	}
+	var subtitles []hls.Rendition
+	if req.renditions {
+		subtitles = h.renditions(r.Context(), req, query(r, "subtitleStreamIndex"), req.uris)
+	}
+	w.Header().Set("Content-Type", "application/vnd.apple.mpegurl")
+	w.Header().Set("Cache-Control", "no-cache")
+	if err := hls.WriteMaster(w, variants, subtitles); err != nil {
+		h.remuxError(w, r, req.remux, err)
+	}
+}
+
+// mediaPlaylist serves the media playlist of a remux's variant, its
+// segments at prefix and their number, the initialization segment of its
+// fast segments, if any, as -2.
+func (h *Handler) mediaPlaylist(w http.ResponseWriter, r *http.Request, req remuxRequest, prefix string) {
+	plan, err := h.Playback.RemuxPlan(r.Context(), req.remux)
+	if err != nil {
+		h.remuxError(w, r, req.remux, err)
+		return
+	}
+	w.Header().Set("Content-Type", "application/vnd.apple.mpegurl")
+	w.Header().Set("Cache-Control", "no-cache")
+	extension := req.remux.Format.Extension()
+	if err := hls.WriteMedia(w, plan, req.remux.Format, func(n int) string {
+		return withQuery(prefix+strconv.Itoa(n)+"."+extension, req.uris)
+	}, h.Playback.Discontinuities(req.remux.Session, req.remux.Version.ID)...); err != nil {
+		h.remuxError(w, r, req.remux, err)
+	}
+}
+
+// adaptiveQuality reports whether the master playlist of converted video
+// offers lower qualities to the app asking: as the settings' Several
+// qualities when converting say, the local network being what it is for
+// sign-in PINs, through the known proxies.
+func (h *Handler) adaptiveQuality(r *http.Request) bool {
+	switch h.Accounts.Settings().AdaptiveQuality {
+	case accounts.AdaptiveQualityAlways:
+		return true
+	case accounts.AdaptiveQualityRemote:
+		_, inNetwork := inLocalNetwork(r)
+		return !inNetwork
+	}
+	return false
+}
+
+// renditions are the text subtitles a remux offers in HLS, the one the
+// app chose shown by default: the text files, the embedded tracks FFmpeg
+// extracts, and the text copies of picture subtitles. The app's player can
+// switch between them.
+func (h *Handler) renditions(ctx context.Context, req remuxRequest, selected, rawQuery string) []hls.Rendition {
+	language := h.Accounts.Settings().Language
+	streams := playback.MediaStreams(req.analysis, externalStreams(req.files), language)
+	streams = playback.AppendTextCopies(streams, h.Playback.TextCopies(ctx, req.remux.Version, req.analysis, req.files), language)
+	shown, err := strconv.Atoi(selected)
+	if err != nil {
+		shown = -1
+	}
+	h.markSynced(ctx, req.remux.Version.ID, req.files, streams, shown)
+	var renditions []hls.Rendition
+	for _, stream := range streams {
+		if stream.Type != "Subtitle" || !(stream.IsExternal && stream.IsTextSubtitleStream || playback.ExtractableSubtitle(req.analysis, stream.Index-len(req.files))) {
+			continue
+		}
+		index := strconv.Itoa(stream.Index)
+		renditions = append(renditions, hls.Rendition{Name: stream.DisplayTitle, Language: playback.LanguageTag(stream.Language),
+			Default: index == selected, Forced: stream.IsForced, URI: withQuery("hls1/subtitles"+index+"/main.m3u8", rawQuery)})
+	}
+	return renditions
+}
+
+// hlsSegment serves the segments of a remux under hls1/main, the
+// initialization segment as -1, that of its fast segments as -2, those of
+// its lower qualities and their media playlists under hls1/main{variant},
+// and its subtitle renditions under hls1/subtitles{index}.
+func (h *Handler) hlsSegment(w http.ResponseWriter, r *http.Request) {
+	h.serveSegment(w, r, h.remuxOf)
+}
+
+// serveSegment serves a segment of the remux remuxOf reads.
+func (h *Handler) serveSegment(w http.ResponseWriter, r *http.Request, remuxOf remuxer) {
+	playlist := strings.ToLower(r.PathValue("playlistId"))
+	if raw, ok := strings.CutPrefix(playlist, "subtitles"); ok {
+		if index, err := strconv.Atoi(raw); err == nil && index >= 0 {
+			h.hlsSubtitles(w, r, index, remuxOf)
+			return
+		}
+	}
+	variant, ok := playlistVariant(playlist)
+	if !ok {
+		processingError(w, http.StatusNotFound)
+		return
+	}
+	if variant > 0 && strings.EqualFold(r.PathValue("file"), "main.m3u8") {
+		req, ok := remuxOf(w, r)
+		if !ok {
+			return
+		}
+		req.remux.Variant = variant
+		if req.live || !req.remux.HasVariant() {
+			processingError(w, http.StatusNotFound)
+			return
+		}
+		h.mediaPlaylist(w, r, req, "")
+		return
+	}
+	name, extension, _ := strings.Cut(r.PathValue("file"), ".")
+	n, err := strconv.Atoi(name)
+	if err != nil || n < hls.FastInit {
+		processingError(w, http.StatusNotFound)
+		return
+	}
+	req, ok := remuxOf(w, r)
+	if !ok {
+		return
+	}
+	if req.live {
+		processingError(w, http.StatusNotFound)
+		return
+	}
+	remux := req.remux
+	remux.Variant = variant
+	// The initialization segments of fragmented MP4 are -1.mp4, and -2.mp4
+	// for the fast segments.
+	if !strings.EqualFold(extension, remux.Format.Extension()) {
+		processingError(w, http.StatusNotFound)
+		return
+	}
+	// A segment far ahead of FFmpeg waits for a new run to reach it, as
+	// long as FFmpeg makes progress: one that made none for 20 s, or did
+	// not reach the segment in 2 min, is answered 503 (see remuxError).
+	ctx, cancel := context.WithTimeout(r.Context(), segmentWait)
+	defer cancel()
+	var file *os.File
+	if n < 0 {
+		file, err = h.Playback.RemuxInit(ctx, remux, n == hls.FastInit)
+	} else {
+		file, err = h.Playback.RemuxSegment(ctx, remux, n)
+	}
+	if err != nil {
+		if h.remuxError(w, r, remux, err) {
+			h.streamFailed(r, req.user, req.item, remux.Device)
+		}
+		return
+	}
+	defer file.Close()
+	w.Header().Set("Content-Type", remux.Format.ContentType())
+	http.ServeContent(w, r, "", time.Time{}, file)
+}
+
+// playlistVariant reads the variant of a playlist's name: main is the
+// first, main1 and on the lower ones.
+func playlistVariant(playlist string) (int, bool) {
+	raw, ok := strings.CutPrefix(playlist, "main")
+	if !ok {
+		return 0, false
+	}
+	if raw == "" {
+		return 0, true
+	}
+	variant, err := strconv.Atoi(raw)
+	return variant, err == nil && variant > 0 && strconv.Itoa(variant) == raw
+}
+
+// hlsSubtitles serves the playlist and the WebVTT segments of a subtitle
+// rendition, index being the Jellyfin index of its stream. The segments of
+// an addon's file, or of a picture subtitle's text copy, are cut from its
+// text; those of an embedded track wait for FFmpeg to extract them.
+func (h *Handler) hlsSubtitles(w http.ResponseWriter, r *http.Request, index int, remuxOf remuxer) {
+	name, extension, _ := strings.Cut(r.PathValue("file"), ".")
+	req, ok := remuxOf(w, r)
+	if !ok {
+		return
+	}
+	if req.live {
+		processingError(w, http.StatusNotFound)
+		return
+	}
+	stream := index - len(req.files)
+	copied := index >= len(req.files) && playback.IsTextCopy(req.analysis, req.files, index)
+	if !copied && (index >= len(req.files) && !playback.ExtractableSubtitle(req.analysis, stream) || index < len(req.files) && pictureFile(req.files[index])) {
+		processingError(w, http.StatusNotFound)
+		return
+	}
+	// An index past the tracks is a text copy only once it is read.
+	var copyCues []subtitles.Cue
+	if copied {
+		cues, found := h.Playback.TextCopyCues(r.Context(), req.remux.Version, req.analysis, req.files, index)
+		if !found {
+			processingError(w, http.StatusNotFound)
+			return
+		}
+		copyCues = cues
+	}
+	plan, err := h.Playback.RemuxPlan(r.Context(), req.remux)
+	if err != nil {
+		h.remuxError(w, r, req.remux, err)
+		return
+	}
+	if strings.EqualFold(r.PathValue("file"), "main.m3u8") {
+		w.Header().Set("Content-Type", "application/vnd.apple.mpegurl")
+		w.Header().Set("Cache-Control", "no-cache")
+		if err := hls.WriteSubtitlePlaylist(w, plan, func(n int) string { return withQuery(strconv.Itoa(n)+".vtt", req.uris) }); err != nil {
+			h.remuxError(w, r, req.remux, err)
+		}
+		return
+	}
+	n, err := strconv.Atoi(name)
+	if err != nil || n < 0 || n >= plan.Len() || !strings.EqualFold(extension, "vtt") {
+		processingError(w, http.StatusNotFound)
+		return
+	}
+	var data []byte
+	switch {
+	case copied:
+		data = hls.SubtitleSegment(copyCues, plan, n)
+	case index < len(req.files):
+		var file library.ExternalSubtitle
+		var text subtitleText
+		if file, err = h.currentFile(r.Context(), req.remux.Version, req.files, index); err == nil {
+			text, err = h.subtitleFile(r.Context(), file)
+		}
+		if err == nil {
+			data = hls.SubtitleSegment(h.syncedSubtitle(r.Context(), req.remux.Version.ID, file, text).cues, plan, n)
+		}
+	default:
+		ctx, cancel := context.WithTimeout(r.Context(), segmentWait)
+		defer cancel()
+		data, err = h.Playback.RemuxSubtitle(ctx, req.remux, stream, n)
+	}
+	if err != nil {
+		h.remuxError(w, r, req.remux, err)
+		return
+	}
+	w.Header().Set("Content-Type", "text/vtt")
+	http.ServeContent(w, r, "", time.Time{}, bytes.NewReader(data))
+}
+
+// segmentWait bounds the wait for a segment whose FFmpeg makes progress.
+const segmentWait = 2 * time.Minute
+
+// remuxError answers err, which came of serving remux, and reports
+// whether the stream broke: its source failed, or its encoding did.
+func (h *Handler) remuxError(w http.ResponseWriter, r *http.Request, remux playback.Remux, err error) (broke bool) {
+	logger := h.Logger
+	if remux.Channel != "" {
+		// A live stream's lines name its channel.
+		logger = logger.With("channel", remux.Channel)
+	}
+	switch {
+	case r.Context().Err() != nil:
+	case errors.Is(err, playback.ErrLiveRefused):
+		// The source refused the stream, as when a recording took the
+		// tuner or the provider's connections are all in use: a normal
+		// event, which lasts while they are. Even once the encoding gave up
+		// after its restarts, a 503 tells the app to ask again later.
+		logger.Info("A live stream was refused by its source", "addon", remux.Version.Addon, "error", err)
+		processingError(w, http.StatusServiceUnavailable)
+	case errors.Is(err, hls.ErrNotFound), errors.Is(err, hls.ErrStopped), errors.Is(err, playback.ErrNotRemuxable):
+		processingError(w, http.StatusNotFound)
+	case errors.Is(err, hls.ErrBusy):
+		// The server runs as many live encodings, or converts the video of
+		// as many playbacks, as it may. Jellyfin has no such limits: its
+		// nearest, a tuner's stream limit, fails with a 500. A 503 says the
+		// same to apps, which take both as a server error, and that the
+		// refusal lasts only while the server is busy.
+		logger.Info("An encoding was refused: the server runs as many as it may", "addon", remux.Version.Addon)
+		processingError(w, http.StatusServiceUnavailable)
+	case errors.Is(err, hls.ErrStalled), errors.Is(err, context.DeadlineExceeded), errors.Is(err, source.ErrUnavailable):
+		// The source is slow, stopped answering, or failed: the app hears
+		// it within seconds, rather than after minutes, and may ask again,
+		// which waits for the same encoding, or reopens one once the
+		// source failed.
+		logger.Warn("A segment could not be served in time: its source is slow or failed", "addon", remux.Version.Addon, "error", err)
+		processingError(w, http.StatusServiceUnavailable)
+		return true
+	default:
+		logger.Warn("A remux could not be served", "addon", remux.Version.Addon, "error", err)
+		processingError(w, http.StatusInternalServerError)
+		return true
+	}
+	return false
+}
+
+// stopEncodings answers DELETE /Videos/ActiveEncodings, which apps send
+// when they leave a remux, for instance to play another audio track.
+func (h *Handler) stopEncodings(w http.ResponseWriter, r *http.Request) {
+	if session := query(r, "playSessionId"); session != "" {
+		h.Playback.StopRemux(session)
+	}
+	w.WriteHeader(http.StatusNoContent)
+}

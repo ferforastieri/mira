@@ -1,0 +1,166 @@
+import { useMutation } from '@tanstack/react-query'
+import { useId, useState, type FormEvent } from 'react'
+import { useNavigate } from 'react-router'
+import { ApiError, createUser, queryClient, queryKeys, type GroupSummary, type User } from '@/api'
+import { errorMessage } from '@/format'
+import { useI18n } from '@/i18n'
+import { Button, Checkbox, Modal, Field, Notice, Select, TextInput, useToast } from '@/ui'
+
+/** Codes about one field, shown under it rather than above the buttons. */
+const nameCodes = ['invalid_name', 'name_taken']
+const passwordCodes = ['invalid_password']
+
+/**
+ * The form to create a user, in a floating panel over the list. The account may join a group and
+ * follow it, unless it is an administrator's.
+ */
+export default function CreateUserModal({
+  open,
+  onClose,
+  groups,
+}: {
+  open: boolean
+  onClose: () => void
+  groups: readonly GroupSummary[]
+}) {
+  const { t } = useI18n()
+  const toast = useToast()
+  const navigate = useNavigate()
+  const formId = useId()
+  const [name, setName] = useState('')
+  const [password, setPassword] = useState('')
+  const [isAdministrator, setIsAdministrator] = useState(false)
+  // Hidden by default, like Jellyfin.
+  const [showOnSignIn, setShowOnSignIn] = useState(false)
+  const [groupId, setGroupId] = useState('')
+  // An account signing in through the identity provider only needs no password.
+  const [providerOnly, setProviderOnly] = useState(false)
+
+  const mutation = useMutation({
+    mutationFn: createUser,
+    onSuccess: (created) => {
+      setName('')
+      setPassword('')
+      setIsAdministrator(false)
+      setShowOnSignIn(false)
+      setGroupId('')
+      setProviderOnly(false)
+      // The new user's page needs it in the list before the refresh comes back.
+      queryClient.setQueryData<User[]>(queryKeys.users, (old) => old && [...old, created])
+      void queryClient.invalidateQueries({ queryKey: queryKeys.users })
+      if (created.groupId !== null) {
+        void queryClient.invalidateQueries({ queryKey: queryKeys.groups })
+      }
+      toast(t.users.created(created.name))
+      onClose()
+      void navigate(`/users/${created.id}`)
+    },
+  })
+
+  const code = mutation.error instanceof ApiError ? mutation.error.code : null
+  const message = mutation.isError ? errorMessage(t, mutation.error) : undefined
+  const nameError = code !== null && nameCodes.includes(code) ? message : undefined
+  const passwordError = code !== null && passwordCodes.includes(code) ? message : undefined
+  const otherError = mutation.isError && !nameError && !passwordError ? message : undefined
+
+  function submit(event: FormEvent<HTMLFormElement>) {
+    event.preventDefault()
+    mutation.mutate({
+      name: name.trim(),
+      password: providerOnly ? '' : password,
+      providerOnly,
+      isAdministrator,
+      isHidden: !showOnSignIn,
+      groupId: isAdministrator || groupId === '' ? null : groupId,
+    })
+  }
+
+  return (
+    <Modal
+      open={open}
+      onClose={() => {
+        mutation.reset()
+        onClose()
+      }}
+      title={t.users.createTitle}
+      width={480}
+      footer={
+        <>
+          <Button variant="ghost" onClick={onClose}>
+            {t.common.cancel}
+          </Button>
+          <Button variant="primary" type="submit" form={formId} loading={mutation.isPending}>
+            {mutation.isPending ? t.users.creating : t.users.create}
+          </Button>
+        </>
+      }
+    >
+      <form id={formId} onSubmit={submit} noValidate className="space-y-4 p-5">
+        <Field label={t.users.name} help={t.common.nameRule} error={nameError}>
+          <TextInput
+            value={name}
+            onValue={(value) => {
+              mutation.reset()
+              setName(value)
+            }}
+            autoComplete="off"
+            maxLength={64}
+            required
+            invalid={nameError !== undefined}
+          />
+        </Field>
+        <Checkbox
+          label={t.users.providerOnly}
+          help={t.users.providerOnlyHelp}
+          checked={providerOnly}
+          onChange={setProviderOnly}
+        />
+        {!providerOnly && (
+          <Field label={t.users.password} help={t.common.passwordRule} error={passwordError}>
+            <TextInput
+              type="password"
+              revealable
+              value={password}
+              onValue={(value) => {
+                mutation.reset()
+                setPassword(value)
+              }}
+              autoComplete="new-password"
+              required
+              invalid={passwordError !== undefined}
+            />
+          </Field>
+        )}
+        <Checkbox
+          label={t.users.isAdministrator}
+          help={t.users.isAdministratorHelp}
+          checked={isAdministrator}
+          onChange={setIsAdministrator}
+        />
+        <Checkbox
+          label={t.users.showOnSignIn}
+          help={t.users.showOnSignInHelp}
+          checked={showOnSignIn}
+          onChange={setShowOnSignIn}
+        />
+        {groups.length > 0 && (
+          <Field
+            label={t.groups.group}
+            help={isAdministrator ? t.groups.administratorNoGroup : t.groups.newUserGroupHelp}
+          >
+            <Select
+              value={isAdministrator ? '' : groupId}
+              onValue={setGroupId}
+              disabled={isAdministrator}
+              options={[
+                { value: '', label: t.groups.noGroup },
+                ...groups.map((group) => ({ value: group.id, label: group.name })),
+              ]}
+            />
+          </Field>
+        )}
+        {otherError && <Notice tone="danger">{otherError}</Notice>}
+      </form>
+    </Modal>
+  )
+}

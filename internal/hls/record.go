@@ -1,0 +1,193 @@
+package hls
+
+import (
+	"bytes"
+	"context"
+	"errors"
+	"fmt"
+	"os"
+	"os/exec"
+	"path/filepath"
+	"strconv"
+	"strings"
+	"time"
+
+	"github.com/ferforastieri/mira/internal/process"
+)
+
+const (
+	// recordGrace is how long FFmpeg is given to stop a recording at its
+	// first interrupt before it gets a second. FFmpeg looks for interrupts
+	// every half second, then stops at the next packet it reads: a source
+	// that flows stops well within. A read waiting for its source, as for a
+	// live playlist that lists no new segment, ends only at the second
+	// interrupt (see Record).
+	recordGrace = 2 * time.Second
+	// recordKill is how long after its first interrupt FFmpeg is killed,
+	// as a last resort.
+	recordKill = 10 * time.Second
+)
+
+// userLives counts the live encodings and recordings of user, with the
+// oldest of their live encodings, which a new one may replace. The caller
+// holds m.mu.
+func (m *Manager) userLives(user string) (int, *live) {
+	var oldest *live
+	mine := 0
+	for k, other := range m.lives {
+		if k.User == user {
+			mine++
+			if oldest == nil || other.created.Before(oldest.created) {
+				oldest = other
+			}
+		}
+	}
+	for k := range m.recordings {
+		if k.User == user {
+			mine++
+		}
+	}
+	return mine, oldest
+}
+
+// Record copies the stream open opens into the MPEG-TS file at path, as it
+// comes, until ctx ends or the stream does. A recording takes one of the
+// live slots of key.User like a live encoding (see LivePlaylist): past
+// userLives, it replaces the user's oldest live encoding, and it starts
+// neither past serverLives nor while key records already, which ErrBusy
+// reports. It returns nil once the stream ended, ctx's error once ctx
+// ended, and FFmpeg's error otherwise.
+//
+// When ctx ends, FFmpeg is interrupted, so that it writes what it holds.
+// Its first interrupt does not end a read that waits for its source: one
+// still running recordGrace later is interrupted again, which ends that
+// read. FFmpeg writes nothing more after its second interrupt, so it
+// writes each packet as it comes (see recordArgs): all that is lost is
+// the few packets it was still putting in order, past the recording's end.
+// FFmpeg writes nothing until it has probed the first seconds of its
+// input, then writes what it read at once: a first interrupt that comes
+// while it still writes them out loses the rest of them, so a recording
+// stopped that early keeps less than FFmpeg read.
+// It is killed recordKill after the first interrupt, as a last resort.
+func (m *Manager) Record(ctx context.Context, key Key, open Opener, path string) error {
+	ctx, cancel := context.WithCancel(ctx)
+	defer cancel()
+	m.mu.Lock()
+	if m.closed {
+		m.mu.Unlock()
+		return ErrStopped
+	}
+	if _, running := m.recordings[key]; running {
+		m.mu.Unlock()
+		return ErrBusy
+	}
+	mine, oldest := m.userLives(key.User)
+	var replaced *live
+	switch {
+	case mine >= userLives && oldest == nil:
+		m.mu.Unlock()
+		return ErrBusy
+	case mine >= userLives:
+		replaced = oldest
+		delete(m.lives, replaced.key)
+	case len(m.lives)+len(m.recordings)+len(m.playouts) >= serverLives:
+		m.mu.Unlock()
+		return ErrBusy
+	}
+	m.recordings[key] = cancel
+	m.mu.Unlock()
+	defer func() {
+		m.mu.Lock()
+		delete(m.recordings, key)
+		m.mu.Unlock()
+	}()
+	if replaced != nil {
+		replaced.stop()
+	}
+	remux, release, err := open(ctx)
+	if err != nil {
+		return err
+	}
+	defer release()
+	cmd := exec.CommandContext(ctx, m.ffmpegPath(), remux.recordArgs(path)...)
+	interrupt, err := process.Interruptible(cmd)
+	if err != nil {
+		return err
+	}
+	var again *time.Timer
+	cmd.Cancel = func() error {
+		err := interrupt()
+		if err == nil {
+			again = time.AfterFunc(m.grace, func() { _ = interrupt() })
+		}
+		return err
+	}
+	cmd.WaitDelay = recordKill
+	stderr := &tail{limit: 4096}
+	cmd.Stderr = stderr
+	m.logger.Debug("Started a recording")
+	err = cmd.Run()
+	// Cancel, if it ran, returned before Run did. Once FFmpeg was waited
+	// for, the second interrupt is not sent: one due meanwhile finds the
+	// process done, and is not sent either (see os.ErrProcessDone).
+	if again != nil {
+		again.Stop()
+	}
+	switch {
+	case ctx.Err() != nil:
+		return ctx.Err()
+	case err != nil:
+		return fmt.Errorf("FFmpeg failed: %w: %s", err, bytes.TrimSpace(stderr.bytes()))
+	}
+	return nil
+}
+
+// ErrRecording reports a recording file FFmpeg could not finish.
+var ErrRecording = errors.New("the recording could not be finished")
+
+// Finish joins the MPEG-TS parts of a recording, in order, into one
+// Matroska file at path, its streams copied: a file with an index, which
+// players seek in and Mira cuts into HLS segments. FFmpeg's list of the
+// parts is written next to path: the container's root, and its temporary
+// folder, may be read-only.
+func (m *Manager) Finish(ctx context.Context, parts []string, path string) error {
+	list, err := os.CreateTemp(filepath.Dir(path), ".parts-*.txt")
+	if err != nil {
+		return err
+	}
+	defer os.Remove(list.Name())
+	for _, part := range parts {
+		// The concat demuxer's list quotes names between single quotes.
+		quoted := "'" + strings.ReplaceAll(part, "'", `'\''`) + "'"
+		if _, err := fmt.Fprintln(list, "file "+quoted); err != nil {
+			_ = list.Close()
+			return err
+		}
+	}
+	if err := list.Close(); err != nil {
+		return err
+	}
+	cmd := exec.CommandContext(ctx, m.ffmpegPath(), "-hide_banner", "-nostdin", "-loglevel", "error", "-y",
+		"-f", "concat", "-safe", "0", "-i", list.Name(), "-map", "0", "-c", "copy", "-f", "matroska", path)
+	stderr := &tail{limit: 4096}
+	cmd.Stderr = stderr
+	if err := cmd.Run(); err != nil {
+		_ = os.Remove(path)
+		return fmt.Errorf("%w: %w: %s", ErrRecording, err, bytes.TrimSpace(stderr.bytes()))
+	}
+	return nil
+}
+
+// recordArgs is FFmpeg's command line copying the stream into path as
+// MPEG-TS, which stays readable however the recording stops. Each packet
+// is written as it comes, rather than kept in FFmpeg's buffer, which a
+// second interrupt would lose (see Record).
+func (r Remux) recordArgs(path string) []string {
+	args := []string{"-hide_banner", "-nostdin", "-loglevel", "error", "-y"}
+	args = append(args, r.InputOptions...)
+	args = append(args, "-i", r.Input, "-map", "0:"+strconv.Itoa(r.Video))
+	if r.Audio >= 0 {
+		args = append(args, "-map", "0:"+strconv.Itoa(r.Audio))
+	}
+	return append(args, "-map_metadata", "-1", "-c", "copy", "-flush_packets", "1", "-f", "mpegts", path)
+}

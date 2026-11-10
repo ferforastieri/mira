@@ -1,0 +1,249 @@
+package stremio
+
+import (
+	"cmp"
+	"context"
+	"errors"
+	"net/http"
+	"net/url"
+	"strings"
+	"sync"
+	"time"
+
+	"github.com/ferforastieri/mira/internal/metrics"
+)
+
+// The failures Health reports, as codes the admin app translates.
+const (
+	// FailureUnreachable: no answer, the connection failed or broke.
+	FailureUnreachable = "unreachable"
+	// FailureTimeout: no answer within the time a request is given.
+	FailureTimeout = "timeout"
+	// FailurePrivateNetwork: the addon is on a local network, which the
+	// request was not allowed to reach.
+	FailurePrivateNetwork = "private_network"
+	// FailureRateLimited: the addon asked to slow down (HTTP 429).
+	FailureRateLimited = "rate_limited"
+	// FailureServerError: the addon failed (HTTP 5xx).
+	FailureServerError = "server_error"
+	// FailureHTTPError: the addon refused the request (another HTTP error).
+	FailureHTTPError = "http_error"
+	// FailureInvalidResponse: the answer was too large to be read.
+	FailureInvalidResponse = "invalid_response"
+)
+
+// healthLimit bounds the addons whose health is kept: past it, the one
+// asked least recently is forgotten.
+const healthLimit = 1000
+
+// Health is how the requests Mira made to an addon for apps went since
+// the server started: nothing is requested to learn it. An answer the
+// addon gave, even "not found", is a success.
+type Health struct {
+	// LastSuccess and LastFailure are when a request last succeeded and
+	// failed, zero when none did.
+	LastSuccess time.Time
+	LastFailure time.Time
+	// Failure is the code of the last failure, one of the Failure
+	// constants; empty when the last request succeeded.
+	Failure string
+	// ResponseTime is how long the last answer took to arrive whole.
+	ResponseTime time.Duration
+	// Requests and Failures count the requests and those that failed.
+	Requests int
+	Failures int
+	// CatalogsWaitUntil is when the wait an addon on the same host asked
+	// for ends, its catalog pages not asked for meanwhile (see
+	// Client.CatalogsWait); zero when none runs. Failure is then
+	// FailureRateLimited, whatever answered since.
+	CatalogsWaitUntil time.Time
+}
+
+// healthRecords keeps the Health of each addon, by base URL: the address
+// is a key only, never shown; and waits, the end of the wait each host
+// asked for.
+type healthRecords struct {
+	mu      sync.Mutex
+	byAddon map[string]*Health
+	waits   map[string]time.Time
+}
+
+// record accounts for a request for target to the addon manifestURL
+// installs, started at started, which failed with the code failure, or
+// succeeded when it is empty, and counts it in the metrics. A request the
+// caller gave up on tells nothing of the addon.
+func (h *healthRecords) record(ctx context.Context, manifestURL, target string, started time.Time, failure string) {
+	if errors.Is(ctx.Err(), context.Canceled) {
+		return
+	}
+	now := time.Now()
+	key := BaseURL(manifestURL)
+	metrics.AddonRequest(key, resourceOf(manifestURL, target), now.Sub(started), failure == "")
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	health := h.byAddon[key]
+	if health == nil {
+		if len(h.byAddon) >= healthLimit {
+			h.forgetOldest()
+		}
+		health = &Health{}
+		h.byAddon[key] = health
+	}
+	health.Requests++
+	health.Failure = failure
+	if failure != "" {
+		health.Failures++
+		health.LastFailure = now
+		return
+	}
+	health.LastSuccess = now
+	health.ResponseTime = now.Sub(started)
+}
+
+// resourceOf names the resource target asks of the addon manifestURL
+// installs, as the metrics count it: manifest, catalog, meta, stream,
+// subtitles, or other, for the addons of other protocols.
+func resourceOf(manifestURL, target string) string {
+	if target == manifestURL {
+		return "manifest"
+	}
+	base, _ := SplitManifestURL(manifestURL)
+	rest, ok := strings.CutPrefix(target, base+"/")
+	resource, _, _ := strings.Cut(rest, "/")
+	switch {
+	case !ok:
+		return "other"
+	case resource == "catalog", resource == "meta", resource == "stream", resource == "subtitles":
+		return resource
+	}
+	return "other"
+}
+
+// forgetOldest drops the addon asked least recently; h.mu is held.
+func (h *healthRecords) forgetOldest() {
+	var oldest string
+	var at time.Time
+	for key, health := range h.byAddon {
+		last := health.LastSuccess
+		if health.LastFailure.After(last) {
+			last = health.LastFailure
+		}
+		if oldest == "" || last.Before(at) {
+			oldest, at = key, last
+		}
+	}
+	delete(h.byAddon, oldest)
+}
+
+// Health tells how the requests to the addon manifestURL installs went;
+// false when none was made since the server started.
+func (c *Client) Health(manifestURL string) (Health, bool) {
+	c.health.mu.Lock()
+	defer c.health.mu.Unlock()
+	health, ok := c.health.byAddon[BaseURL(manifestURL)]
+	if !ok {
+		return Health{}, false
+	}
+	result := *health
+	if until := c.health.waits[HostOf(manifestURL)]; time.Now().Before(until) {
+		result.CatalogsWaitUntil, result.Failure = until, FailureRateLimited
+	}
+	return result, true
+}
+
+// KeepHealth forgets the health of the addons whose base URL (see BaseURL)
+// keep does not keep, as once they are removed: an address installed
+// again starts anew.
+func (c *Client) KeepHealth(keep func(base string) bool) {
+	c.health.mu.Lock()
+	defer c.health.mu.Unlock()
+	for base := range c.health.byAddon {
+		if !keep(base) {
+			delete(c.health.byAddon, base)
+		}
+	}
+}
+
+// CatalogsWait records that the catalog pages of the addons on the host of
+// manifestURL are not asked for until until, as one of them asked to wait,
+// for Health to tell.
+func (c *Client) CatalogsWait(manifestURL string, until time.Time) {
+	c.health.mu.Lock()
+	defer c.health.mu.Unlock()
+	if c.health.waits == nil {
+		c.health.waits = map[string]time.Time{}
+	}
+	host := HostOf(manifestURL)
+	for key, end := range c.health.waits {
+		if time.Now().After(end) {
+			delete(c.health.waits, key)
+		}
+	}
+	if until.After(c.health.waits[host]) {
+		c.health.waits[host] = until
+	}
+}
+
+// HostOf is the host, its port included, of the addon manifestURL
+// installs: the server an addon's requests go to, whose limits all the
+// addons it serves share. It is the base URL when there is no host.
+func HostOf(manifestURL string) string {
+	if parsed, err := url.Parse(manifestURL); err == nil && parsed.Host != "" {
+		return strings.ToLower(parsed.Host)
+	}
+	return BaseURL(manifestURL)
+}
+
+// failureOf names the failure of a request that got no answer.
+func failureOf(ctx context.Context, err error) string {
+	switch {
+	case errors.Is(err, ErrPrivateNetwork):
+		return FailurePrivateNetwork
+	case errors.Is(err, context.DeadlineExceeded), errors.Is(ctx.Err(), context.DeadlineExceeded):
+		return FailureTimeout
+	default:
+		return FailureUnreachable
+	}
+}
+
+// FailureOf names the failure of a request to an addon that returned err,
+// with the codes Health reports, for a feature telling why an addon failed
+// it: an answer "not found" is FailureHTTPError there, and an answer that
+// could not be read, too large or not of the expected form,
+// FailureInvalidResponse. It is empty for an error that is no addon's.
+func FailureOf(err error) string {
+	if _, waits := RetryAfter(err); waits || errors.Is(err, ErrAskedToWait) || errors.Is(err, ErrRateLimited) {
+		return FailureRateLimited
+	}
+	if status := StatusOf(err); status != 0 {
+		return cmp.Or(failureOfStatus(status), FailureHTTPError)
+	}
+	switch {
+	case errors.Is(err, ErrInvalidResponse):
+		return FailureInvalidResponse
+	case errors.Is(err, ErrPrivateNetwork):
+		return FailurePrivateNetwork
+	case errors.Is(err, context.DeadlineExceeded):
+		return FailureTimeout
+	case errors.Is(err, ErrUnreachable):
+		return FailureUnreachable
+	}
+	return ""
+}
+
+// failureOfStatus names the failure an HTTP status tells, none for an
+// answer the addon chose to give, such as "not found".
+func failureOfStatus(status int) string {
+	switch {
+	case status == http.StatusTooManyRequests:
+		return FailureRateLimited
+	case status >= 500:
+		return FailureServerError
+	case status == http.StatusNotFound:
+		return ""
+	case status >= 400:
+		return FailureHTTPError
+	default:
+		return ""
+	}
+}

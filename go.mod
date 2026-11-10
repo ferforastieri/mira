@@ -1,0 +1,55 @@
+module github.com/ferforastieri/mira
+
+go 1.27.1
+
+require (
+	fyne.io/systray v1.12.2
+	github.com/andybalholm/brotli v1.2.8
+	github.com/cloudsoda/go-smb2 v0.0.0-20260918041005-0c5d69b69701
+	github.com/coder/websocket v1.8.15
+	github.com/evanw/esbuild v0.28.2
+	github.com/fsnotify/fsnotify v1.10.1
+	github.com/jackc/pgx/v5 v5.11.0
+	github.com/pkg/sftp v1.13.11
+	github.com/prometheus/client_golang v1.25.0
+	github.com/prometheus/client_model v0.6.3
+	github.com/ulikunitz/xz v0.5.17
+	github.com/zalando/go-keyring v0.2.8
+	golang.org/x/crypto v0.58.0
+	golang.org/x/image v0.46.0
+	golang.org/x/net v0.60.0
+	golang.org/x/sync v0.24.0
+	golang.org/x/sys v0.49.0
+	golang.org/x/text v0.43.0
+	golang.zx2c4.com/wireguard v0.0.0-20261006164505-2631ce99a06f
+	gvisor.dev/gvisor v0.0.0-20250503011706-39ed1f5ac29c
+)
+
+require (
+	github.com/beorn7/perks v1.0.1 // indirect
+	github.com/cespare/xxhash/v2 v2.3.0 // indirect
+	github.com/cloudsoda/sddl v0.0.0-20250224235906-926454e91efc // indirect
+	github.com/danieljoos/wincred v1.2.3 // indirect
+	github.com/geoffgarside/ber v1.1.0 // indirect
+	github.com/godbus/dbus/v5 v5.2.2 // indirect
+	github.com/google/btree v1.1.2 // indirect
+	github.com/hashicorp/go-uuid v1.0.3 // indirect
+	github.com/jackc/pgpassfile v1.0.0 // indirect
+	github.com/jackc/pgservicefile v0.0.0-20240606120523-5a60cdf6a761 // indirect
+	github.com/jackc/puddle/v2 v2.2.2 // indirect
+	github.com/jcmturner/aescts/v2 v2.0.0 // indirect
+	github.com/jcmturner/dnsutils/v2 v2.0.0 // indirect
+	github.com/jcmturner/gofork v1.7.6 // indirect
+	github.com/jcmturner/goidentity/v6 v6.0.1 // indirect
+	github.com/jcmturner/gokrb5/v8 v8.4.4 // indirect
+	github.com/jcmturner/rpc/v2 v2.0.3 // indirect
+	github.com/kr/fs v0.1.0 // indirect
+	github.com/munnerz/goautoneg v0.0.0-20191010083416-a7dc8b61c822 // indirect
+	github.com/prometheus/common v0.72.0 // indirect
+	github.com/prometheus/procfs v0.22.0 // indirect
+	golang.org/x/time v0.7.0 // indirect
+	golang.zx2c4.com/wintun v0.0.0-20230126152724-0fa3db229ce2 // indirect
+	google.golang.org/protobuf v1.36.12 // indirect
+)
+
+replace github.com/cloudsoda/go-smb2 => ./third_party/go-smb2

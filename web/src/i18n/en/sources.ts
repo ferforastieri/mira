@@ -1,0 +1,678 @@
+/** Sources: the server's sources, each user's own sources, adding one, and music addon settings. */
+const sources = {
+  sources: {
+    title: 'Sources',
+    add: 'Add a source',
+    listLabel: 'Sources',
+    listNote: 'Members’ own sources only serve their owner.',
+    loading: 'Loading the sources',
+    kindFilter: 'Filter by kind',
+    all: 'All',
+    kinds: { stremio: 'Stremio', eclipse: 'Eclipse', iptv: 'IPTV', local: 'Folders' },
+    owner: 'Owner',
+    everyOwner: 'Every owner',
+    server: 'The server',
+    search: 'Search the sources',
+    searchPlaceholder: 'Search by name',
+    clearFilters: 'Clear the filters',
+    emptyTitle: 'No source yet',
+    emptyShared:
+      'Add a Stremio addon, an Eclipse addon, an IPTV source or a local folder: it serves every user of this server.',
+    emptyMine:
+      'Add a Stremio addon, an Eclipse addon or an IPTV source: it serves only you, after the server’s.',
+    noMatchTitle: 'No source matches',
+    noMatch: 'Change the kind, the owner or the search.',
+    tag: {
+      stremio: 'Stremio',
+      eclipse: 'Eclipse',
+      m3u: 'M3U',
+      xtream: 'Xtream',
+      hdhomerun: 'HDHomeRun',
+      local: 'Folder',
+    },
+    kindName: {
+      stremio: 'Stremio addon',
+      eclipse: 'Eclipse addon',
+      m3u: 'M3U playlist',
+      xtream: 'Xtream Codes account',
+      hdhomerun: 'HDHomeRun tuner',
+      local: 'Local folder',
+    },
+    ownedBy: (name: string) => `Source of ${name}`,
+    yours: 'Your own source',
+    active: 'Active',
+    off: 'Off',
+    failed: 'Download failed',
+    channelsShown: (count: string) => `${count} channels shown`,
+    notDownloaded: 'Not downloaded yet',
+    moreActions: (name: string) => `More actions for ${name}`,
+    enabled: 'Enabled',
+    enabledLabel: (name: string) => `Enabled: ${name}`,
+    forWhom: 'For whom',
+    descriptions: 'Descriptions',
+    enabledHelp: 'Turning a source off hides its libraries in Jellyfin apps without losing them.',
+    order: 'Order',
+    position: (position: number, count: number) => `${position} of ${count}`,
+    moved: (name: string, position: number, count: number) =>
+      `${name} moved to position ${position} of ${count}.`,
+    description: 'Description',
+    details: 'Details',
+    manifestUrl: 'Manifest address',
+    address: 'Address',
+    version: 'Version',
+    provides: 'Provides',
+    types: 'Types',
+    catalogs: 'Catalogs',
+    catalogCount: (count: number) => (count === 1 ? '1 catalog' : `${count} catalogs`),
+    lastRefresh: 'Last refresh',
+    channels: 'Channels',
+    notImported: 'Not imported',
+    shownOf: (shown: string, total: string) => `${shown} shown of ${total}`,
+    vod: 'Movies and series',
+    vodShort: (movies: string, series: string) => `${movies} movies and ${series} series imported`,
+    lastFetch: 'Last download',
+    nextFetch: 'Next download',
+    never: 'Never',
+    openSource: 'Open the source',
+    iptvHint:
+      'What to import, categories, channels, numbers and guides are set on the source page.',
+    refresh: 'Refresh',
+    refreshLabel: (name: string) => `Refresh ${name}`,
+    refreshed: (name: string) => `${name}: the manifest was downloaded again.`,
+    refreshedList: (name: string) => `${name}: the list was downloaded again.`,
+    replace: 'Replace the address',
+    newManifestUrl: 'New manifest address',
+    replaceHint:
+      'Use this after reconfiguring the addon on its configure page. Its libraries are kept, and its version lists are forgotten, so that each title asks it again.',
+    replaceSubmit: 'Replace',
+    replaced: 'The manifest address was replaced.',
+    language: 'Language of its descriptions',
+    languageHelp:
+      'Leave it at None on the server’s only metadata addon, whatever language its configure page sets: an addon with a language describes titles for the users who chose that language only, unless no addon left at None describes them. To let users read titles in other languages, add the same metadata addon once more for each language, configured in that language on its configure page, and name the language here on each of these extra copies only: users who choose that metadata language see its names, overviews and images. An addon with a language and no library of its own only describes titles.',
+    languageNone: 'None',
+    languageSaved: (name: string) => `${name}: the language of its descriptions was saved.`,
+    edit: 'Edit the account',
+    saved: 'Source saved.',
+    remove: 'Remove',
+    removeTitle: (name: string) => `Remove ${name}?`,
+    removeShared:
+      'Its libraries disappear from Jellyfin apps for every user. This cannot be undone.',
+    removeMine: 'Its libraries disappear from your Jellyfin apps. This cannot be undone.',
+    removal: {
+      lead: 'Also lost with it:',
+      homeRows: (count: number, figure: string) =>
+        count === 1 ? '1 home row' : `${figure} home rows`,
+      libraries: (count: number, figure: string) =>
+        count === 1
+          ? '1 library, with its name, image and settings'
+          : `${figure} libraries, with their names, images and settings`,
+      hiddenLibraries: (count: number, figure: string) =>
+        count === 1
+          ? 'Its libraries hidden from 1 user (if you add it again, they will see them)'
+          : `Its libraries hidden from ${figure} users (if you add it again, they will see them)`,
+      recordings: (count: number, figure: string) =>
+        count === 1 ? '1 scheduled recording' : `${figure} scheduled recordings`,
+    },
+    removed: (name: string) => `${name} was removed.`,
+    readOnly: (name: string) =>
+      `This is ${name}’s own source. Only they can change it, from their My sources page.`,
+    back: 'Sources',
+    backMine: 'My sources',
+    notFoundTitle: 'Source not found',
+    notFound: 'This source does not exist, or is not one you can manage.',
+  },
+  sourceAdd: {
+    title: 'Add a source',
+    kind: 'Kind of source',
+    kinds: {
+      stremio: 'Stremio addon',
+      music: 'Eclipse addon',
+      iptv: 'IPTV source',
+      tuner: 'HDHomeRun tuner',
+      local: 'Folder',
+    },
+    stremioHelp: 'A Stremio addon brings catalogs, metadata and streams. Paste its install link.',
+    musicHelp:
+      'An Eclipse music addon brings music, audiobooks or podcasts. Paste its manifest address.',
+    manifestUrl: 'Manifest address',
+    manifestUrlPlaceholder: 'https://…/manifest.json',
+    manifestUrlHint:
+      'Copy the install link from the addon’s configure page. It often contains your settings or keys: Mira keeps it private and only ever shows a shortened form.',
+    install: 'Install',
+    installed: (name: string) => `${name} was installed.`,
+    installedNoLibraries: (name: string) =>
+      `${name} was installed. None of its catalogs is a library yet: enable them under Content › Libraries.`,
+    installedNoLibrariesMine: (name: string) =>
+      `${name} was installed. None of its catalogs is a library yet: enable them under My sources.`,
+    installedLibraryLimit: (name: string, limit: number) =>
+      `${name} was installed. The server already has ${limit} libraries, the most Mira makes automatically, so none of its catalogs became one: enable them under Content › Libraries.`,
+    installedLibraryLimitMine: (name: string, limit: number) =>
+      `${name} was installed. You already have ${limit} libraries, the most Mira makes automatically, so none of its catalogs became one: enable them under My sources.`,
+    installedMyMusic: (name: string) =>
+      `${name} was installed. It has no catalogs of its own, so its library is My music, which starts empty: it lists what each user plays or marks favorite. Find its music with search in the apps.`,
+    iptvHelp:
+      'Import the channels of an M3U playlist or an Xtream Codes account directly. They appear in Live TV like a TV catalog, which you can order under Libraries. The list is downloaded again at the interval set under Settings › Live TV.',
+    steps: 'Steps',
+    stepAccount: 'Account',
+    stepImport: 'What to import',
+    name: 'Name',
+    account: 'Account',
+    m3u: 'M3U playlist',
+    xtream: 'Xtream Codes account',
+    playlistUrl: 'Playlist address',
+    playlistUrlHint:
+      'The M3U address your provider gives. It may contain your login: it is never shown in full.',
+    playlistUrlOrFile: 'Playlist address or file',
+    playlistUrlOrFileHint:
+      'The M3U address your provider gives, or the path of a file on the server, such as /iptv/custom.m3u, or C:\\IPTV\\custom.m3u on Windows. With Docker, the file must be in a mounted volume, by its path in the container. An address may contain your login: it is never shown in full.',
+    server: 'Server address',
+    serverHint: 'For example https://server:8080, as your provider gives it.',
+    username: 'Username',
+    password: 'Password',
+    keepHint: 'Leave empty to keep the current one.',
+    passwordKeepHint: 'Leave empty to keep the current password.',
+    userAgent: 'User agent (optional)',
+    userAgentHint:
+      'Left empty, channels are requested as a web browser requests them. Set the one your provider asks for when it only serves certain players: the list and the channels are then requested with it. A user agent the list gives a channel comes first.',
+    providerGuide: 'Use the provider’s programme guide',
+    providerGuideHelp:
+      'Xtream Codes servers publish a guide for the account: it fills the channels’ programmes.',
+    guideUrl: 'Programme guide address (XMLTV, optional)',
+    guideUrlHint:
+      'Plain or compressed XMLTV file. You can also add or change it later under Libraries.',
+    guideUrlOrFile: 'Programme guide address or file (XMLTV, optional)',
+    guideUrlOrFileHint:
+      'Plain or compressed XMLTV file, by its address or its path on the server. You can also add or change it later under Libraries.',
+    next: 'Next: choose what to import',
+    back: 'Back to the account',
+    import: 'Import',
+    added: (name: string, parts: string[]) => `${name} was added: ${parts.join(', ')}.`,
+    channels: (count: string) => `${count} channels`,
+    movies: (count: string) => `${count} movies`,
+    series: (count: string) => `${count} series`,
+    tunerHelp:
+      'An HDHomeRun tuner on your network brings the channels it receives by antenna or cable. They appear in Live TV like an IPTV source’s, and the tuner plays as many channels at once as it has tuners.',
+    findTuners: 'Find tuners',
+    findTunersHelp: 'Asks the local network which tuners are there; it takes a few seconds.',
+    finding: 'Asking the local network…',
+    foundTitle: 'Tuners on the network',
+    tunerCount: (count: number, formatted: string) =>
+      count === 1 ? '1 tuner' : `${formatted} tuners`,
+    addTuner: 'Add',
+    addTunerLabel: (name: string) => `Add ${name}`,
+    tunerAdded: 'Added',
+    openTuner: (name: string) => `Open ${name}`,
+    noTuners: 'No tuner answered.',
+    noTunersHelp:
+      'In Docker, Mira only hears tuners with host networking (network_mode: host). You can also add a tuner by its address.',
+    byAddress: 'Add by address',
+    tunerAddress: 'Tuner address',
+    tunerAddressHint: 'Its IP address, such as 192.168.1.20, or its http:// address.',
+    tunerAddressInvalid:
+      'Enter the tuner’s IP address, such as 192.168.1.20, or its http:// address.',
+    tunerName: 'Name (optional)',
+    tunerNameHint: 'Left empty, the tuner’s own name.',
+    favoritesOnly: 'Only the tuner’s favorite channels',
+    favoritesOnlyHelp:
+      'Keeps the channels marked favorite on the tuner, in its app or its web page, and leaves out the others.',
+  },
+  localFolders: {
+    help: {
+      container:
+        'A folder mounted in Mira’s container, read-only is enough. Its videos are matched to titles by their names and play as versions of those titles, beside the addons’ streams; a folder of music becomes a music library. Mira runs as user 65532, which must be able to read it.',
+      computer:
+        'A folder of the computer Mira runs on, or of a disk or share it reaches, read-only is enough. Its videos are matched to titles by their names and play as versions of those titles, beside the addons’ streams; a folder of music becomes a music library. The account Mira runs as must be able to read it.',
+    },
+    location: 'Where',
+    locations: {
+      local: 'Local folder',
+      smb: 'SMB share',
+      webdav: 'WebDAV folder',
+      s3: 'S3 bucket',
+      sftp: 'SFTP folder',
+      rclone: 'rclone remote',
+    },
+    shareHelp: {
+      smb: 'A folder shared over SMB (Windows file sharing) by a NAS or another computer, which Mira reads itself, without mounting it. Its videos are matched to titles by their names and play as versions of those titles, beside the addons’ streams; a folder of music becomes a music library.',
+      webdav:
+        'A folder a server shares over WebDAV, which Mira reads itself, without mounting it. Its videos are matched to titles by their names and play as versions of those titles, beside the addons’ streams; a folder of music becomes a music library.',
+      s3: 'A prefix of a bucket of S3-compatible storage, which Mira reads itself, without mounting it. Its videos are matched to titles by their names and play as versions of those titles, beside the addons’ streams, read through the cache of files being read; a folder of music becomes a music library.',
+      sftp: 'A folder of a server reached over SSH, which Mira reads itself, without mounting it. Its videos are matched to titles by their names and play as versions of those titles, beside the addons’ streams, read through the cache of files being read; a folder of music becomes a music library.',
+      rclone:
+        'A folder of one of the storages rclone reaches, read through an rclone instance running rclone rcd --rc-serve, such as a container next to Mira. Its videos are matched to titles by their names and play as versions of those titles, beside the addons’ streams, read through the cache of files being read; a folder of music becomes a music library.',
+    },
+    address: 'Address',
+    addressHint: {
+      smb: 'smb:// then the server, the share, and the folder in it if any. Add :port after the server for a port other than 445.',
+      webdav:
+        'The folder’s WebDAV address. Prefer https://, since http:// sends the password unencrypted.',
+      s3: 's3:// then the bucket, and the prefix in it if any. Its objects are listed as folders by /.',
+      sftp: 'sftp:// then the server, and the folder’s full path on it. Add :port after the server for a port other than 22.',
+      rclone: '',
+    },
+    addressPlaceholder: {
+      smb: 'smb://nas.local/media/movies',
+      webdav: 'https://nas.local/dav/movies',
+      s3: 's3://media/movies',
+      sftp: 'sftp://nas.local/srv/media/movies',
+      rclone: '',
+    },
+    user: 'User',
+    userHint: {
+      smb: 'Empty for a share open to guests. DOMAIN\\user for a domain account.',
+      webdav: 'Empty for a folder open to everyone.',
+      s3: 'Both empty for a bucket everyone may read.',
+      sftp: 'The account Mira signs in as.',
+      rclone: 'The user of rclone’s remote control (--rc-user), empty without one.',
+    },
+    password: 'Password',
+    passwordHint: 'Mira never shows it again.',
+    sftpPasswordHint: 'Empty when the private key signs in. Mira never shows it again.',
+    accessKey: 'Access key',
+    secretKey: 'Secret key',
+    endpoint: 'Endpoint',
+    endpointHint:
+      'The address of the storage’s S3 service. Mira names the bucket in the path, as every S3-compatible storage accepts, but at Amazon’s own endpoints.',
+    region: 'Region',
+    regionHint: 'Empty for us-east-1, which most S3-compatible storages accept.',
+    privateKey: 'Private key',
+    privateKeyHint:
+      'An OpenSSH or PEM private key, in place of the password or beside it. Mira never shows it again.',
+    privateKeySaved: 'A key is saved. Paste another to replace it.',
+    privateKeyNotSent:
+      'The saved key is not sent to another server: paste it again, or it is removed on save.',
+    secretNotSent:
+      'The saved one is not sent to another server: type it again, or it is removed on save.',
+    privateKeyRemove: 'Remove the saved key',
+    passphrase: 'Passphrase',
+    passphraseHint: 'Only for a private key that has one.',
+    hostKey: 'Host key',
+    hostKeyHint:
+      'Saved at the first connection. Mira refuses the server when it offers another one.',
+    hostKeyNone: 'Saved at the first connection',
+    hostKeyOffered: (fingerprint: string) =>
+      `The server now offers another host key, ${fingerprint}, and Mira refuses it. Accept it only if the server was reinstalled or its key was changed on purpose.`,
+    acceptHostKey: 'Accept the new key',
+    hostKeyAccepted: 'The new host key is accepted. Mira scans the folder again.',
+    rcloneInstance: 'rclone address',
+    rcloneInstanceHint:
+      'Where rclone rcd --rc-serve answers, reached over http://, such as http://rclone:5572 for a container next to Mira.',
+    rcloneRemote: 'Remote',
+    rcloneRemoteHint: 'One of the remotes of rclone’s configuration.',
+    listRemotes: 'List the remotes',
+    remotesListed: (count: number, figure: string) =>
+      count === 1 ? 'rclone has one remote.' : `rclone has ${figure} remotes.`,
+    noRemotes: 'rclone has no remote in its configuration.',
+    remotesFailed: {
+      unreachable: 'rclone does not answer at this address.',
+      refused: 'rclone refuses this user or password.',
+    } as Record<string, string>,
+    rcloneFolder: 'Path in the remote',
+    rcloneFolderHint: 'The folder of the remote to read, empty for its root.',
+    pollMinutes: 'Look for changes every (minutes, 0 = only at scans)',
+    pollMinutesHint: {
+      s3: 'The bucket’s folders are listed again this often to find the files added and removed. Providers may bill each listing. 30 by default.',
+      sftp: 'The folder and its subfolders are listed again this often to find the files added and removed. 2 by default.',
+      rclone:
+        'The remote’s folders are listed again this often to find the files added and removed. 2 by default.',
+    },
+    name: 'Name',
+    nameHint: 'The name of its library in Jellyfin apps.',
+    path: { container: 'Path in the container', computer: 'Path' },
+    pathHint: {
+      container: 'Where the folder is mounted in Mira’s container, not its path on the host.',
+      linux: 'The full path of the folder on the computer Mira runs on.',
+      macos:
+        'The full path of the folder on the Mac Mira runs on; an external disk’s folders are under /Volumes.',
+      windows:
+        'The full path of the folder on the PC Mira runs on: on a drive, such as D:\\Movies, or on a share, such as \\\\nas\\media\\Movies.',
+    },
+    pathPlaceholder: {
+      container: '/media/movies',
+      linux: '/srv/media/movies',
+      macos: '/Users/me/Movies',
+      windows: 'D:\\Movies',
+    },
+    kind: 'It holds',
+    kinds: { movies: 'Movies', shows: 'Shows', music: 'Music', homevideos: 'Home videos' },
+    kindHelp: {
+      movies:
+        'One file per movie, alone or in a folder of its own, named after the movie and its year.',
+      shows: 'A folder per show, with the season and episode in each file’s name, such as S01E02.',
+      music:
+        'Audio files read with their tags, else their names, such as Artist/Album/01 Title.flac, grouped into albums and artists.',
+      homevideos:
+        'Each video is a title of its own, named after its file, or its folder when it is alone in it, and dated by its NFO file, its recording or the file. No metadata addon is asked.',
+    },
+    kindNouns: { movies: 'movies', shows: 'shows', music: 'music', homevideos: 'home videos' },
+    changeKind: 'Change it',
+    changeKindTitle: (name: string) => `Change what ${name} holds?`,
+    changeKindScan: (from: string, to: string) =>
+      `It holds ${from}; it will hold ${to}. The folder and its library keep their identifiers, its address and its settings, and Mira scans it again as ${to}, in the background.`,
+    changeKindFollows:
+      'What users did with each video, its watch state, resume point and favorite, follows it to its new title: played marks and favorites are given, and the former title keeps them; the resume point moves with the file, and the former title loses it.',
+    changeKindNothing:
+      'Nothing follows: songs and videos are other files. What users did with its titles stays with them and no longer shows.',
+    changeKindBack:
+      'Its home videos are remembered for 30 days: holding home videos again within that time, it lists them as the same titles, with what users did with them.',
+    linksDropped: (count: number, figure: string) =>
+      count === 1 ? 'the link made by hand' : `the ${figure} links made by hand`,
+    episodesDropped: (count: number, figure: string) =>
+      count === 1
+        ? 'the episodes given to a disc’s title'
+        : `the episodes given to ${figure} titles of discs`,
+    changeKindDrops: (parts: string[]) =>
+      `Dropped, as they were made for what it holds now: ${parts.join(' and ')}.`,
+    useArtwork: 'Use its artwork',
+    useArtworkHelp:
+      'Posters, backdrops and logos beside the files, such as poster.jpg or Movie (2001)-fanart.jpg, show in place of the metadata addons’ for their titles, and episodes’ images in place of their stills. Off, the addons’ show.',
+    readExtras: 'Read extras and theme media',
+    readExtrasHelp:
+      'Extras, local trailers and theme music beside the titles, as Jellyfin names them, such as Extras/Making of.mkv, Movie (2001)-trailer.mkv or theme.mp3, show under their titles’ special features, play from the Trailer button, or play behind their pages. Off, the next scan leaves them out.',
+    add: 'Add the folder',
+    added: (name: string) => `${name} was added. Its first scan has started.`,
+    edit: 'Edit the folder',
+    save: 'Save',
+    cancel: 'Cancel',
+    saved: 'Folder saved.',
+    movedHint: 'A new path forgets the files found in the former one, links included.',
+    movedShareHint: 'A new address forgets the files found in the former one, links included.',
+    scan: 'Scan now',
+    scanLabel: (name: string) => `Scan ${name} now`,
+    scanStarted: (name: string) => `${name}: the scan has started.`,
+    scanning: 'Scanning',
+    unreadable: 'Cannot be read',
+    figuresTitle: 'Files',
+    files: 'Video files',
+    matched: 'Matched to a title',
+    unmatched: 'Unmatched',
+    extras: 'Extras',
+    tracks: 'Tracks',
+    albums: 'Albums',
+    artists: 'Artists',
+    gained: 'With a gain',
+    measured: 'Measured',
+    leftOut: 'Left out',
+    videos: 'Videos',
+    datedBy: {
+      nfo: 'Dated by an NFO file',
+      created: 'Dated by the recording',
+      file: 'Dated by the file',
+    },
+    matchedBy: (parts: string[]) => `Matched: ${parts.join(', ')}.`,
+    matchMethods: {
+      name: (count: string) => `${count} by an identifier in the name`,
+      nfo: (count: string) => `${count} by an NFO file`,
+      search: (count: string) => `${count} by a search`,
+      year: (count: string) => `${count} by a search, of a year one apart`,
+      numerals: (count: string) => `${count} by a search, with numerals read alike`,
+      yearNumerals: (count: string) =>
+        `${count} by a search, of a year one apart and with numerals read alike`,
+      link: (count: string) => `${count} by hand`,
+      tmdb: (count: string) => `${count} by a TMDB search, as the metadata addons’ searches failed`,
+    },
+    holds: 'Holds',
+    lastScan: 'Last scan',
+    lastAttempt: 'Last attempt',
+    never: 'Not yet',
+    errorTitle: 'Mira cannot read this folder',
+    errorTitleShare: 'Mira cannot read this share',
+    errors: {
+      missing:
+        'The path does not exist where Mira runs: check that the folder, or the disk or share it is on, is there, and in Docker that it is mounted in the container.',
+      unreadable:
+        'The folder exists but Mira cannot list it: give the account it runs as, user 65532 in Docker, the right to read it and to open its folders.',
+      not_folder: 'This path is a file, not a folder.',
+    } as Record<string, string>,
+    shareErrors: {
+      missing: 'The share, or the folder in it, does not exist: check the address.',
+      unreadable: 'The share’s user may not list this folder: check its permissions on the server.',
+      not_folder: 'This address is a file, not a folder.',
+      unreachable:
+        'Mira cannot reach the share: check that the server is on, and the server and port of the address.',
+      refused: 'The share refuses the user or password: check them, and enter them again.',
+      host_key_changed:
+        'The SFTP server offers another host key than the one saved at the first connection, and Mira refuses it. If the change is expected, accept the new key under Edit the folder.',
+    } as Record<string, string>,
+    keptNote: 'The files found before stay in the library until the folder can be read again.',
+    unmatchedTitle: 'Unmatched files',
+    unmatchedHelp:
+      'No title was found for these files. Rename them with the title and year, or add an NFO file giving the title’s identifier, then scan; or link them to the IMDb identifier in the title’s IMDb address (tt followed by digits). A link survives rescans; in a shows folder, it covers the whole show, and for a Blu-ray disc or a DVD, the whole disc, or one movie of a disc that holds several. The titles of a show’s disc take their episode as a file’s name gives it, such as S01E05, or S01E05-E06 for two; the episodes suggested for a disc follow those of the season’s discs before it.',
+    noUnmatched: 'Every file is matched to a title.',
+    leftOutTitle: 'Tracks left out',
+    leftOutHelp:
+      'Neither the tags nor the names of these files give a title or an album. Tag them, or move them into an Artist/Album folder, then scan.',
+    noLeftOut: 'Every track is in an album.',
+    shownOf: (shown: string, total: string) => `${shown} shown of ${total}.`,
+    reasons: {
+      unreadable_name: 'Its name gives no title, or no episode number',
+      disc_title: 'Another movie of the disc: link it to its title',
+      disc_episode: 'A title of a show’s disc: give its episode',
+      lone_extra: 'An extra without its title beside it: link it to make it a title',
+      no_season:
+        'Its name gives an episode number but no season: put it in its season’s folder, such as Season 02, or name it with its season, such as S02E05',
+      air_date:
+        'Its name gives an air date, which Mira does not read: name it with the catalog’s season and number, such as S02E05',
+      no_episode_number:
+        'Its name gives no episode number: name it with the catalog’s season and number, such as S02E05',
+      not_found: 'The metadata addons know no title of this name',
+      no_search: 'No addon of the server describes and searches titles of this kind',
+      ambiguous: 'Several titles have this name: add the year to it, or link it',
+      other_year: 'Titles of this name are of other years',
+      search_failed: 'The metadata addons could not be searched',
+      no_title: 'Its tags and name give no title',
+      no_album: 'Its tags and folders give no album',
+    } as Record<string, string>,
+    searchFailedBy: (addon: string, failure: string) =>
+      failure === '' ? `The search of ${addon} failed` : `The search failed: ${addon} ${failure}`,
+    searchFailures: {
+      unreachable: 'could not be reached',
+      timeout: 'did not answer in time',
+      private_network: 'is on a local network',
+      rate_limited: 'asked to slow down (too many requests)',
+      server_error: 'answered with a server error',
+      http_error: 'refused the request',
+      invalid_response: 'sent an answer Mira cannot read',
+    } as Record<string, string>,
+    noSearchTitle: (count: number, figure: string) =>
+      count === 1
+        ? 'No addon can search the title of 1 file'
+        : `No addon can search the titles of ${figure} files`,
+    noSearchHelp:
+      'Matching needs an addon of the server, under Content › Sources, that describes these titles and has a search catalog. Users’ own addons, under My sources, do not count. Once one is added, scan the folder.',
+    absoluteTitle: (count: number, figure: string) =>
+      count === 1
+        ? '1 file is matched by its absolute number'
+        : `${figure} files are matched by their absolute number`,
+    absoluteHelp:
+      'Named as Show - 41, they are versions of the 41st episode their show’s metadata addon lists, specials left out, at that episode’s season and number.',
+    searchFailedTitle: (count: number, figure: string) =>
+      count === 1
+        ? 'The title of 1 file could not be searched'
+        : `The titles of ${figure} files could not be searched`,
+    searchRetry: (at: string) =>
+      `Mira searches again on its own, next on ${at}, then less often while the search fails, and at each scan.`,
+    searchIdentifier: (shows: boolean): string =>
+      shows
+        ? 'To match a show without a search, add its IMDb identifier to its folder’s name, as in “Show (2010) [imdbid-tt0123456]”, then scan.'
+        : 'To match a movie without a search, add its IMDb identifier to its file’s name, or its own folder’s, as in “Movie (2010) [imdbid-tt0123456]”, then scan.',
+    searchHelp:
+      'Matching needs a server addon that describes these titles and has a search catalog. If its searches keep failing, check it under System › Health, or link the files by hand below.',
+    read: (title: string) => `Read as “${title}”`,
+    showFolder: (unit: string) => `Show folder: ${unit}`,
+    discTitle: (disc: string, title: number) => `${disc} · title ${title}`,
+    disc: {
+      bluray: (unit: string) => `Blu-ray disc: ${unit}`,
+      dvd: (unit: string) => `DVD: ${unit}`,
+      bluray_image: (unit: string) => `Blu-ray image: ${unit}`,
+      dvd_image: (unit: string) => `DVD image: ${unit}`,
+    },
+    minutes: (minutes: number) => `${minutes} min`,
+    episodeLabel: (title: string) => `Episode of ${title}`,
+    episodePlaceholder: 'S01E01',
+    giveEpisode: 'Save',
+    episodesGiven: (count: number) =>
+      count === 1 ? 'The title is numbered.' : `${count} titles are numbered.`,
+    suggestion: (disc: string, first: string, last: string) =>
+      first === last
+        ? `Suggested for ${disc}: ${first}`
+        : `Suggested for ${disc}: ${first} to ${last}`,
+    confirmSuggestion: 'Use these episodes',
+    imdbId: 'IMDb identifier',
+    imdbPlaceholder: 'tt0000000',
+    link: 'Link',
+    linkLabel: (path: string) => `IMDb identifier for ${path}`,
+    linked: (unit: string, id: string) => `${unit} is linked to ${id}.`,
+    findTitle: 'Find the title',
+    searchLabel: (path: string) => `Title search for ${path}`,
+    searchQuery: 'Title',
+    searchYear: 'Year',
+    search: 'Search',
+    searching: 'Searching the metadata addons…',
+    noTitles:
+      'The metadata addons found no title of this name with an IMDb identifier. Change the search, or type the identifier.',
+    titlesFound: (query: string) => `Titles found for “${query}”`,
+    titleKinds: { movie: 'Movie', show: 'Show' },
+    pickTitle: (name: string, details: string) => `Link to ${name}, ${details}`,
+    unlistedTitle: (count: number, figure: string) =>
+      count === 1 ? '1 episode is only in the files' : `${figure} episodes are only in the files`,
+    unlistedHelp:
+      'The metadata addon that describes their shows does not list them, as when it numbers seasons or specials otherwise. They are listed all the same, named after their files, and play. Their shows and numbers are under Episodes only in the files.',
+    unlistedListTitle: 'Episodes only in the files',
+    unlistedListHelp:
+      'A file becomes a version of a catalog episode only when its season and episode number are the catalog’s. These files are numbered otherwise, so each is an episode of its own, next to the catalog’s. Rename them to the catalog’s numbers, then scan. Or choose how the show’s files are numbered: they then become versions of the catalog’s episodes without renaming.',
+    unlistedSeason: (season: number) => (season === 0 ? 'Specials' : `Season ${season}`),
+    unlistedFiles: (episodes: string) => `In the files: ${episodes}`,
+    unlistedCatalog: (episodes: string) => `In the catalog: ${episodes}`,
+    unlistedCatalogNoSeason: (season: number, range: string) =>
+      `The catalog has ${season === 0 ? 'no specials' : `no season ${season}`}: ${range}`,
+    unlistedCatalogRange: (first: string, last: string) => `it lists ${first} to ${last}`,
+    unlistedCatalogEmpty: 'it lists no episodes',
+    unlistedNotDescribed: 'The catalog’s numbers show once an app opens the show again',
+    numberingTitle: 'How shows’ files are numbered',
+    numberingHelp:
+      'A file is a version of the catalog’s episode of its season and number. When a show’s files are numbered otherwise, choose how: Mira maps them to the catalog’s episodes without renaming them, and played marks, resume points and favorites move with them. A file the numbering cannot place stays an episode of its own, with why.',
+    numberingLabel: (name: string) => `How the files of ${name} are numbered`,
+    numberings: {
+      catalog: 'As the catalog',
+      per_season: 'Per season',
+      continuing: 'Continuing from season 1',
+      absolute: 'Absolute',
+      order: 'An episode order',
+    },
+    numberingHints: {
+      catalog: 'S02E05 is the catalog’s S02E05.',
+      per_season:
+        'Each season starts at 1: S02E01 is the first episode the catalog lists in season 2.',
+      continuing:
+        'The numbers run on across seasons: after 12 episodes in season 1, S02E13 is the catalog’s S02E01.',
+      absolute:
+        'Each number is the episode’s place among all the show’s episodes, specials left out: E41 is the 41st.',
+      order: 'The files follow one of the show’s TMDB episode groups, such as its DVD order.',
+    },
+    numberingGroupLabel: (name: string) => `The episode order the files of ${name} follow`,
+    numberingGroupPlaceholder: 'Choose an episode order',
+    numberingLookup: {
+      no_key: 'Add a TMDB key in Settings › Content first: the episode orders come from TMDB.',
+      unknown: 'TMDB does not know this show, or no metadata addon of the server describes it.',
+      failed: 'TMDB could not be reached to list the show’s episode orders. Try again in a moment.',
+      none: 'TMDB gives this show no episode order.',
+    },
+    numberingSaved: (name: string) => `The files of ${name} are numbered anew`,
+    numberingFileCount: (files: number) => (files === 1 ? '1 file' : `${files} files`),
+    numberingMapped: (mapped: number, files: number) =>
+      `${mapped} of ${files} files mapped to the catalog’s episodes`,
+    unmappedReasons: {
+      no_catalog: 'No metadata addon of the server describes the show',
+      outside_season: 'The catalog’s season has no episode at that place',
+      beyond_catalog: 'The catalog lists fewer episodes than that number',
+      not_in_order: 'The episode order has no episode at that place',
+      not_listed: 'The catalog does not list the episode order’s episode at that place',
+      no_order: 'TMDB cannot tell the episode order for now',
+    } as Record<string, string>,
+    unmappedListed: (listed: string) => `Listed as an episode of its own, ${listed}`,
+    linkNotDescribedShow:
+      'No metadata addon of the server describes this identifier as a show. Check that it is the show’s, not an episode’s.',
+    linkNotDescribedMovie:
+      'No metadata addon of the server describes this identifier as a movie. Check that it is the movie’s.',
+    linksTitle: 'Linked by hand',
+    unlink: 'Remove the link',
+    unlinkLabel: (unit: string) => `Remove the link of ${unit}`,
+    unlinked: (unit: string) =>
+      `The link of ${unit} was removed: it is matched by its name or NFO file again.`,
+    removeEpisodeLabel: (title: string) => `Remove the episode of ${title}`,
+    episodeRemoved: (title: string) =>
+      `The episode of ${title} was removed: its disc’s name numbers it, or it is suggested again.`,
+    looserTitle: 'Matched by a looser rule',
+    looserHelp:
+      'No title has the exact name and year of these files, so Mira matched the only title a looser rule leaves: one of the year before or after, or one named alike once numerals are read, such as 2 for II or Part 1 for Part One. Check them. Unlink a wrong one: it is then matched by its exact name and year only, and stays unmatched until you link it to its title.',
+    looserRules: {
+      year: 'A title of a year one apart',
+      numerals: 'Numerals read alike',
+      year_numerals: 'A title of a year one apart, numerals read alike',
+    } as Record<string, string>,
+    matchedTo: (title: string) => `Matched to “${title}”`,
+    fileCount: (count: number, figure: string) => (count === 1 ? '1 file' : `${figure} files`),
+    looserUnlinkLabel: (unit: string) => `Unlink ${unit} from its title`,
+    looserUnlinked: (unit: string) =>
+      `${unit} was unlinked: it is matched by its exact name and year only.`,
+  },
+  mySources: {
+    lede: 'Add your own Stremio, Eclipse and IPTV sources and choose which of their catalogs appear as libraries in your Jellyfin apps.',
+    useShared: 'Use the server’s sources',
+    useSharedHelp:
+      'On: you get the server’s sources and libraries, followed by your own. Off: you only get your own sources and libraries.',
+    preferenceSaved: 'Preference saved.',
+    parentalControl:
+      'Parental control applies to your account: your Jellyfin apps show the server’s sources and libraries only, as they give the ratings it relies on. Your own sources and smart lists are kept but not used.',
+    personalAddonsOff:
+      'An administrator turned your own sources off: your Jellyfin apps show the server’s sources and libraries only. Your own sources and smart lists are kept but not used.',
+    listTitle: 'Your sources',
+  },
+  usedBy: {
+    title: 'Used by',
+    help: 'Who gets this source in their Jellyfin apps: its libraries, its titles, versions, subtitles and channels. Everyone includes the users created later; with Only these groups and users, a new user gets nothing from it until their group or they are ticked.',
+    everyone: 'Everyone',
+    listed: 'Only these groups and users',
+    groups: 'Groups',
+    users: 'Users',
+    members: (count: number) => (count === 1 ? '1 member' : `${count} members`),
+    noGroups: 'No group yet.',
+    nobody: 'No one uses this source until you tick a group or a user.',
+    selfLeftOut: 'You still manage this source here, but your own apps will not use it.',
+    ownAddons:
+      'A user who may add their own sources can still add the same addon for themselves: turn off Can add their own addons on their page or their group’s to prevent it.',
+    save: 'Save',
+    cancel: 'Cancel',
+    saved: (name: string) => `${name}: who uses it was saved.`,
+    chip: (names: string) => `Used by ${names}`,
+    chipNone: 'Used by no one',
+  },
+  music: {
+    content: { music: 'Music', audiobook: 'Audiobooks', podcast: 'Podcasts' } as Record<
+      string,
+      string
+    >,
+    settingsTitle: 'Addon settings',
+    settingsHelp:
+      'Declared by the addon and sent with every request Mira makes to it. They may hold your account details: only you, or the administrators for the server’s addons, can see them.',
+    noSettings: 'This addon has no settings.',
+    defaultValue: (value: string) => `Default: ${value}`,
+    defaultEmpty: 'Default: empty',
+    on: 'On',
+    off: 'Off',
+    range: (min: string, max: string) => `From ${min} to ${max}.`,
+    atLeast: (min: string) => `At least ${min}.`,
+    atMost: (max: string) => `At most ${max}.`,
+    stepOf: (step: string) => `In steps of ${step}.`,
+    maxLength: (count: number) => `${count} characters at most.`,
+    tooLong: (count: number) => `Use ${count} characters at most.`,
+    belowMin: (min: string) => `Enter ${min} or more.`,
+    aboveMax: (max: string) => `Enter ${max} or less.`,
+    offStep: (step: string) => `Use a multiple of ${step}.`,
+    resetDefaults: 'Use the defaults',
+    saved: 'Settings saved. The addon receives them from its next request.',
+  },
+}
+
+export default sources

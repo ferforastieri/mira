@@ -1,0 +1,241 @@
+/** Notification targets: Settings › Notifications and My account › Notifications. */
+const notifications = {
+  notifications: {
+    title: 'Notifications',
+    loading: 'Loading the targets…',
+    empty: 'No target yet.',
+    emptyHint: {
+      server:
+        'Add a target, such as an email address, a Telegram chat or an ntfy topic, to be told of new episodes, recordings and Health problems.',
+      own: 'Add a target, such as an email address, a Telegram chat or an ntfy topic, to be told when a new episode of a series you follow is out, or when your recordings end.',
+    },
+    serverTargets: 'Server targets',
+    serverTargetsHelp:
+      'They receive the events of every user: one message per new episode, whoever follows its series, every recording and every playback. Each user can add their own targets under My account › Notifications.',
+    add: 'Add a target',
+    addTitle: 'Add a target',
+    editTitle: (name: string) => `Edit ${name}`,
+    kind: 'Kind',
+    kinds: {
+      webhook: 'Webhook',
+      discord: 'Discord',
+      ntfy: 'ntfy',
+      email: 'Email',
+      telegram: 'Telegram',
+      gotify: 'Gotify',
+      pushover: 'Pushover',
+    },
+    kindHelp: {
+      webhook:
+        'Mira posts each event to this address as JSON, described in the documentation for app developers.',
+      discord: 'Mira posts each event to a Discord channel, as a message with a link.',
+      ntfy: 'Mira publishes each event to an ntfy topic, which the ntfy app shows on your phone.',
+      email: 'Mira emails each event to this address, in plain text and HTML.',
+      telegram: 'Mira posts each event to a Telegram chat through your bot, with a link.',
+      gotify: 'Mira posts each event to an application of your Gotify server.',
+      pushover:
+        'Mira sends each event to your Pushover devices, through one of your applications.',
+    },
+    emailUnavailable: {
+      server:
+        'Email needs an SMTP server: save one, with a sender address, under Email above, then add the target.',
+      own: 'Email needs an SMTP server, which an administrator sets under Settings › Notifications.',
+    },
+    name: 'Name',
+    nameHelp: 'Shown here only, 1 to 64 characters.',
+    webhookAddress: 'Webhook address',
+    discordAddress: 'Discord webhook address',
+    discordSwitched:
+      'This is a Discord webhook: the target is a Discord target, which sends Discord’s own message.',
+    discordAsWebhook:
+      'This is a Discord webhook: Mira sends it Discord’s own message, as to a Discord target.',
+    addressHelp: {
+      webhook: 'It is kept encrypted and never shown again: only its host is.',
+      discord:
+        'In Discord: the channel’s settings, Integrations, Webhooks, Copy Webhook URL. It is kept encrypted and never shown again.',
+    },
+    savedAddress: (host: string) => `Saved, at ${host}.`,
+    ntfyServer: 'ntfy server',
+    ntfyServerHelp: 'Leave empty for https://ntfy.sh.',
+    topic: 'Topic',
+    topicHelp:
+      'The topic you subscribe to in the ntfy app. Anyone who knows a topic on a public server can read it: choose one that is hard to guess.',
+    token: 'Access token',
+    tokenHelp: 'For a topic that needs signing in. It is kept encrypted and never shown again.',
+    emailAddress: 'Email address',
+    emailAddressHelp: 'Where the messages go.',
+    chat: 'Chat',
+    chatHelp:
+      'The chat’s number, such as -1001234567890, or a public channel’s name, such as @news_example. Add the bot to the chat first.',
+    botToken: 'Bot token',
+    botTokenHelp:
+      'BotFather gives it when the bot is created. It is kept encrypted and never shown again.',
+    gotifyServer: 'Gotify server',
+    gotifyServerHelp: 'Its address, such as https://gotify.example.org.',
+    appToken: 'Application token',
+    appTokenHelp: {
+      gotify:
+        'In Gotify: Apps, Create Application, then copy its token. It is kept encrypted and never shown again.',
+      pushover:
+        'The API token of an application created on Pushover. It is kept encrypted and never shown again.',
+    },
+    userKey: 'User key',
+    userKeyHelp:
+      'Shown on Pushover’s dashboard once signed in, or a group key. It is kept encrypted and never shown again.',
+    events: 'Events',
+    eventsHelp: {
+      server: 'What it is told of, for every user.',
+      own: 'What it is told of, about you.',
+    },
+    eventNames: {
+      server_crashed: 'Server crashed',
+      playback_failed: 'Playback failed',
+      new_episode: 'New episodes',
+      recording_finished: 'Recording finished',
+      recording_failed: 'Recording failed',
+      health_problem: 'Health problem found',
+      health_solved: 'Health problem solved',
+      user_joined: 'User joined',
+      new_version: 'New version',
+      playback_started: 'Playback started',
+      playback_paused: 'Playback paused',
+      playback_resumed: 'Playback resumed',
+      playback_stopped: 'Playback stopped',
+      weekly_summary: 'Weekly summary',
+      monthly_summary: 'Month in review',
+      yearly_summary: 'Year in review',
+      connection_stopped: 'Connection stopped',
+      account_blocked: 'Account blocked',
+      new_device: 'Sign-in on a new device',
+      share_played: 'Shared link played',
+      programme_reminder: 'Programme starting',
+      title_available: 'Watchlist title available',
+    },
+    eventHelp: {
+      server_crashed:
+        'Mira stopped on an error and started again: told as it starts again, with the beginning of the error’s trace, which System › Health shows too.',
+      playback_failed:
+        'A play could not start or broke: no version plays on the app, a limit refused it, or its stream failed. Once an hour per user and title, with the app and the reason.',
+      new_episode:
+        'An episode of a series played or marked favorite is out: once per episode, never for those already out.',
+      recording_finished: 'A Live TV recording ended, whole or with part of it missing.',
+      recording_failed: 'A Live TV recording recorded nothing.',
+      health_problem: 'System › Health found a problem, in two checks in a row.',
+      health_solved: 'A problem System › Health found is gone.',
+      user_joined: 'Someone created their account through an invite link.',
+      new_version:
+        'A new version of Mira is out, as the daily check found it: once per version, with its release notes.',
+      playback_started:
+        'A video or a song starts playing in a Jellyfin app, with who plays it, on which device, and whether it is converted.',
+      playback_paused: 'A playback is paused. Positions as it plays are never sent.',
+      playback_resumed: 'A paused playback plays again.',
+      playback_stopped: 'A playback stops, or its app stopped reporting it for five minutes.',
+      weekly_summary:
+        'Once a week, at the day and hour the server sets: the hours watched, the titles and the new episodes of the week. The server’s and administrators’ targets get the server’s week, with the users who joined, the files added to local folders and the problems found; others get their own. Nothing is sent for a week with nothing to tell.',
+      monthly_summary:
+        'On the 1st of each month, at the hour of the weekly summary: the weekly summary’s content over the month that ended. Nothing is sent for a month with nothing to tell.',
+      yearly_summary:
+        'On January 1st, at the hour of the weekly summary: the hours watched, the ten movies and ten series played longest and the month with the most hours of the year that ended. The server’s and administrators’ targets get the server’s year, with the users who joined and the files added to local folders; others get their own. Nothing is sent for a year with nothing to tell.',
+      connection_stopped:
+        'An app connection or a tracking service refused what Mira kept, and stopped: once per stop, with what to do to connect it again.',
+      account_blocked:
+        'Wrong passwords blocked an account for a while: once per block, with until when and the address and app of the last attempt. The server’s and administrators’ targets hear of every account, the others of their own.',
+      new_device:
+        'Your account signed in from a Jellyfin app or the web client on a device it never used, with the app, the device and the address. An account’s first device is not told.',
+      share_played:
+        'Someone without an account started a movie or an episode through a share link: at most once an hour per link, with the title and who shared it. The server’s targets hear of every link, the others of their own.',
+      programme_reminder:
+        'A Live TV programme you set a reminder for in the web player starts soon, as long before as Remind me before says, with a link to its channel.',
+      title_available:
+        'Versions were found for a title of your Watchlist playlist that the earlier checks found none for: once per title. A version found has not been tried yet.',
+    },
+    enabled: 'Send messages to this target',
+    create: 'Add',
+    creating: 'Adding…',
+    save: 'Save',
+    saving: 'Saving…',
+    created: (name: string) => `${name} added.`,
+    saved: (name: string) => `${name} saved.`,
+    test: 'Send a test',
+    testing: 'Sending…',
+    testDelivered: (name: string) => `${name} received the test message.`,
+    testFailed: (name: string) => `${name} did not accept the test message.`,
+    testAnswer: (answer: string) => `It answered: ${answer}`,
+    edit: 'Edit',
+    delete: 'Delete',
+    deleteTitle: (name: string) => `Delete ${name}?`,
+    deleteBody: 'Messages stop going to it, and those waiting for it are dropped.',
+    deleted: (name: string) => `${name} deleted.`,
+    status: {
+      working: 'Working',
+      waiting: 'Nothing sent yet',
+      off: 'Off',
+      refused: 'Refused',
+      rejected: 'Message refused',
+      unreachable: 'Not reached',
+      unreadable: 'Enter it again',
+    },
+    /** The code a target answered with: an HTTP status, or an SMTP server's code for email. */
+    answer: (code: string, email: boolean) => (email ? `SMTP ${code}` : `HTTP ${code}`),
+    problem: {
+      refused: (answer: string) =>
+        `The target refused Mira (${answer}): check its address, token or key.`,
+      refusedEmail: (answer: string) =>
+        `The SMTP server refused Mira (${answer}): check its user and password, the sender address and this address.`,
+      rejected: (answer: string) => `The target refused the last message (${answer}).`,
+      unreachable:
+        'Recent messages could not be delivered: the target did not answer, or answered with errors. Each message is tried again for an hour.',
+      unreadable:
+        'Its address, token or key cannot be decrypted with MIRA_SECRET_KEY: nothing is sent to it until it is entered again.',
+    },
+    perMinute: 'Messages a minute, at most',
+    perMinuteHelp: 'Further messages wait their turn, in order. Empty for no limit; 1 to 60.',
+    groupMinutes: 'Group plays and new episodes, in minutes',
+    groupMinutesHelp:
+      'Playbacks, shared links played and new episodes wait this long, then go as one message. Everything else still goes at once. Empty to send each at once; 1 to 1440.',
+    capped: (n: number) => `At most ${n} a minute`,
+    grouped: (n: number) => `Grouped every ${n} min`,
+    deliveries: {
+      open: 'Recent deliveries',
+      title: (name: string) => `Recent deliveries of ${name}`,
+      help: 'The last 100 messages, newest first, kept 30 days.',
+      loading: 'Loading the deliveries…',
+      empty: 'No message sent yet.',
+      when: 'When',
+      event: 'Message',
+      outcome: 'Outcome',
+      test: 'Test message',
+      grouped: (n: number) => `${n} events in one message`,
+      attempts: (n: number) => `${n} attempts`,
+      outcomes: {
+        delivered: 'Delivered',
+        refused: 'Refused',
+        rejected: 'Message refused',
+        failed: 'Not delivered',
+        dropped: 'Dropped',
+        unreadable: 'Cannot be decrypted',
+      },
+    },
+    preview: {
+      title: 'Preview',
+      help: 'See a summary as an email target would receive it now, of the server or of a user. Nothing is sent.',
+      summary: 'Summary',
+      summaries: {
+        weekly_summary: 'Weekly summary',
+        monthly_summary: 'Month in review',
+        yearly_summary: 'Year in review',
+      },
+      of: 'Of',
+      server: 'The server',
+      show: 'Preview',
+      loading: 'Making the preview…',
+      empty: 'Nothing to tell for this period: this summary would not be sent.',
+      frame: 'The summary’s email',
+    },
+    lastSent: 'Last message ',
+    nothingSent: 'No message sent yet',
+    noEvents: 'No event chosen',
+  },
+}
+
+export default notifications

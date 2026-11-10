@@ -1,0 +1,575 @@
+package library
+
+import (
+	"context"
+	"slices"
+	"strings"
+	"time"
+
+	"github.com/jackc/pgx/v5"
+
+	"github.com/ferforastieri/mira/internal/accounts"
+	"github.com/ferforastieri/mira/internal/localization"
+	"github.com/ferforastieri/mira/internal/stremio"
+)
+
+// A title's rating is the certification the server's addons give in its
+// complete description for the server's rating country (see
+// certification). Users' own addons are not asked: a user could install
+// one that rates titles as they please. Catalog pages rarely carry
+// ratings, so listings for a user whose parental control hides titles must
+// look them up: once known, from any user's visit, a rating is kept with
+// the item, with the country it was picked for, and listings read it from
+// there. A title's genres, which the genres a user blocks hide, are
+// learned the same way, from the same descriptions.
+const (
+	// ratingWait bounds how long one request waits for the ratings of the
+	// titles it lists. Titles still unknown then are hidden from the
+	// restricted user for that answer, while their lookup goes on.
+	ratingWait = 3 * time.Second
+	// ratingLookupTime bounds a lookup that goes on in the background.
+	ratingLookupTime = 30 * time.Second
+	// ratingFetches bounds the descriptions looked up at once, across
+	// requests.
+	ratingFetches = 8
+	// maxRatingLookups bounds the lookups one request starts.
+	maxRatingLookups = 100
+	// hiddenReach bounds how far a restricted listing reads a catalog, as
+	// a multiple of what an unrestricted one reads: a catalog whose titles
+	// are mostly hidden ends there rather than being read whole.
+	hiddenReach = 4
+	// The ratings kept are asked again once they are this old, while
+	// listings go on using them: a title rated after it was first seen is
+	// often a new release, so a title without a rating is asked again
+	// sooner.
+	unratedTTL = metaTTL
+	ratedTTL   = 7 * 24 * time.Hour
+)
+
+// certification is the rating a title's description gives for country,
+// the server's rating country, the one titles show and are judged by:
+//  1. its rating for that country among the addon's ratings by country,
+//     when Mira can score it;
+//  2. else its local certification, when it is one of that country's
+//     ratings: the addon gives no country with it;
+//  3. else its certification, the US one for most addons;
+//  4. else its local certification when Mira can score it.
+//
+// A local certification that is a text with its rating ahead ("PG-13 -
+// Teens 13 or older") counts by that rating alone, which is the one shown;
+// one Mira cannot score that way is left out.
+func certification(meta stremio.Meta, country string) string {
+	if meta.Extras == nil {
+		return ""
+	}
+	if country == "" {
+		country = localization.DefaultRatingCountry
+	}
+	if rating := strings.TrimSpace(meta.Extras.Certifications[country]); rating != "" {
+		if _, ok := localization.RatingScore(rating, country); ok {
+			return rating
+		}
+	}
+	local := leadingRating(meta.Extras.CertificationLocal)
+	if _, ok := localization.CountryScore(local, country); ok && local != "" {
+		return local
+	}
+	if rating := strings.TrimSpace(meta.Extras.Certification); rating != "" {
+		return rating
+	}
+	if _, ok := localization.RatingScore(local, country); ok {
+		return local
+	}
+	return ""
+}
+
+// leadingRating is the rating a certification starts with when it is
+// followed by its meaning ("PG-13 - Teens 13 or older" gives "PG-13"), else
+// the certification itself.
+func leadingRating(certification string) string {
+	certification = strings.TrimSpace(certification)
+	if rating, _, ok := strings.Cut(certification, " - "); ok {
+		return strings.TrimSpace(rating)
+	}
+	return certification
+}
+
+// unratedKind names the kind of an item as parental control does (see
+// accounts.UnratedKinds): seasons and episodes follow their series, and
+// home videos, the videos of titles neither movies nor series and the
+// folders of such videos are Other, as Jellyfin's videos are. Other
+// items, other folders and people, are never hidden.
+func unratedKind(kind Kind) (string, bool) {
+	switch kind {
+	case KindMovie:
+		return "Movie", true
+	case KindSeries, KindSeason, KindEpisode:
+		return "Series", true
+	case KindVideo, KindFolder:
+		return "Other", true
+	}
+	return "", false
+}
+
+// judges reports whether the user's parental control or blocked genres
+// may hide an item of kind depending on its rating or genres; the others
+// need neither.
+func (v view) judges(kind Kind) bool {
+	name, ok := unratedKind(kind)
+	return ok && (v.parental.Judges(name) || v.blocksGenres())
+}
+
+// restricted reports whether the user's parental control or blocked
+// genres hide titles (see accounts.User.Restricted), home videos, which
+// are Other, included.
+func (v view) restricted() bool {
+	return v.parental.Restricted() || v.parental.Judges("Other") || v.blocksGenres()
+}
+
+func (v view) blocksGenres() bool {
+	return len(v.genres) > 0
+}
+
+// blocked reports whether one of genres is one the user blocks, compared
+// without regard to case.
+func (v view) blocked(genres []string) bool {
+	return slices.ContainsFunc(genres, func(genre string) bool {
+		genre = strings.TrimSpace(genre)
+		return slices.ContainsFunc(v.genres, func(b string) bool { return strings.EqualFold(genre, b) })
+	})
+}
+
+// traits are what hides a title from a restricted user: its rating and
+// its genres, each with whether Mira knows it.
+type traits struct {
+	rating      string
+	genres      []string
+	ratingKnown bool
+	genresKnown bool
+}
+
+// describedTraits are the traits a complete description gives, its rating
+// that of country, the server's rating country (see certification).
+func describedTraits(meta stremio.Meta, country string) traits {
+	return traits{rating: certification(meta, country), genres: meta.Genres, ratingKnown: true, genresKnown: true}
+}
+
+// verdict decides whether the user may reach an item of kind with traits
+// t. A title is hidden as soon as a trait known hides it, and allowed once
+// every trait that matters is known; until then, decided is false: it may
+// be one the user's restrictions hide.
+func (v view) verdict(kind Kind, t traits) (allowed, decided bool) {
+	if !v.judges(kind) {
+		return true, true
+	}
+	name, _ := unratedKind(kind)
+	byRating := v.parental.Judges(name)
+	switch {
+	case t.genresKnown && v.blocked(t.genres):
+		return false, true
+	case byRating && t.ratingKnown && !v.parental.Allows(name, t.rating, v.country):
+		return false, true
+	case byRating && !t.ratingKnown, v.blocksGenres() && !t.genresKnown:
+		return false, false
+	}
+	return true, true
+}
+
+// allows reports whether the user may reach an item of kind with traits t;
+// a title whose verdict is not decided is hidden.
+func (v view) allows(kind Kind, t traits) bool {
+	allowed, decided := v.verdict(kind, t)
+	return allowed && decided
+}
+
+// sharedAddon reports whether the addon identified by id is one of the
+// server's that the user reaches.
+func (v view) sharedAddon(id *accounts.ID) bool {
+	if id == nil {
+		return false
+	}
+	entry, ok := v.addon(*id)
+	return ok && entry.shared
+}
+
+// rates reports whether one of the server's addons the user reaches can
+// describe a title, which gives its rating and genres: one without a
+// language, else one given a language (see standIn).
+func (v view) rates(r record) bool {
+	if r.Meta == nil {
+		return false
+	}
+	for _, entry := range v.addons {
+		if entry.shared && serves(entry, "meta", r.Meta.Type, r.Meta.ID) && v.factual(entry, r.Meta.Type, r.Meta.ID, true) {
+			return true
+		}
+	}
+	return false
+}
+
+// knownTraits returns what Mira knows of a title's rating and genres:
+// kept from a complete description, from one still cached, or carried by
+// its listing, from the server's addons. A listing's genres count only
+// when they include one the user blocks, as a description may give more
+// genres. A title none of the server's addons describes has no rating,
+// and the genres of its listing. stale is set when the traits kept are old
+// enough to be asked again, or were picked for another rating country:
+// they are used meanwhile, scored under the server's.
+func (s *Service) knownTraits(ctx context.Context, v view, r record) (t traits, stale bool) {
+	// A home video or a plain video has no rating nor genres: it is what
+	// its folder tells, and nothing to look up.
+	if _, plain := r.plainVideo(); plain || r.homeVideo() {
+		return traits{ratingKnown: true, genresKnown: true}, false
+	}
+	if r.Rating != nil && (r.Genres != nil || !v.blocksGenres()) {
+		kept := traits{rating: *r.Rating, ratingKnown: true, genresKnown: r.Genres != nil}
+		if r.Genres != nil {
+			kept.genres = *r.Genres
+		}
+		if r.RatedAt != nil && s.now().Sub(*r.RatedAt) < ratingTTL(*r.Rating) && r.ratedFor() == v.ratingCountry() {
+			return kept, false
+		}
+		if full, _, ok := s.describedMeta(ctx, v, r, true, inMemory); ok {
+			return describedTraits(full, v.country), false
+		}
+		return kept, true
+	}
+	if full, _, ok := s.describedMeta(ctx, v, r, true, inMemory); ok {
+		return describedTraits(full, v.country), false
+	}
+	describable := v.rates(r)
+	if v.sharedAddon(r.Addon) && r.Meta != nil {
+		if rating := certification(*r.Meta, v.country); rating != "" {
+			t.rating, t.ratingKnown = rating, true
+		}
+		if !describable || v.blocked(r.Meta.Genres) {
+			t.genres, t.genresKnown = r.Meta.Genres, true
+		}
+	}
+	if !describable {
+		t.ratingKnown, t.genresKnown = true, true
+	}
+	return t, false
+}
+
+func ratingTTL(rating string) time.Duration {
+	if rating == "" {
+		return unratedTTL
+	}
+	return ratedTTL
+}
+
+// ratedFor is the rating country r's rating was picked for, the US for the
+// ratings kept before Mira had one.
+func (r record) ratedFor() string {
+	if r.RatedFor == "" {
+		return localization.DefaultRatingCountry
+	}
+	return r.RatedFor
+}
+
+// ratingCountry is the server's rating country the view judges by, the US
+// for a view made without one.
+func (v view) ratingCountry() string {
+	if v.country == "" {
+		return localization.DefaultRatingCountry
+	}
+	return v.country
+}
+
+// learnTraits keeps the rating and genres a description by one of the
+// server's addons gives, none included, so that listings know them
+// without asking again, the rating picked for country, the server's
+// rating country. at is when the addon gave the description: a
+// description kept past its refresh age dates the traits as old as it
+// is, so that they are asked again (see meta).
+func (s *Service) learnTraits(ctx context.Context, r record, meta stremio.Meta, at time.Time, country string) {
+	rating, genres := certification(meta, country), []string(meta.Genres)
+	if genres == nil {
+		genres = []string{}
+	}
+	if country == "" {
+		country = localization.DefaultRatingCountry
+	}
+	// Traits confirmed recently are not written again.
+	if r.Rating != nil && *r.Rating == rating && r.Genres != nil && slices.Equal(*r.Genres, genres) &&
+		r.RatedAt != nil && at.Sub(*r.RatedAt) < unratedTTL && r.ratedFor() == country {
+		return
+	}
+	r.Rating, r.Genres, r.RatedAt, r.RatedFor = &rating, &genres, &at, country
+	if err := s.save(ctx, []record{r}); err != nil && ctx.Err() == nil {
+		s.logger.Warn("The rating and genres of a title could not be kept", "item", r.ID, "error", err)
+	}
+}
+
+// visible keeps the records of the items the user's parental control and
+// blocked genres let them reach, and the request's rating filter keeps (see
+// ratingfilter.go), in order. Seasons and episodes are judged by their
+// series, and the videos of a folder by their folder. The ratings and
+// genres of titles not known yet are
+// looked up, until the request's deadline; those still unknown then are
+// left out. held reports that some were left out only because their lookup
+// did not answer in time or could not start, the request's lookups being
+// spent.
+func (s *Service) visible(ctx context.Context, v view, records []record) (kept []record, held bool) {
+	if !v.narrows() || len(records) == 0 {
+		return records, false
+	}
+	titles := make([]record, len(records))
+	for i, r := range records {
+		titles[i] = r
+		var holder accounts.ID
+		switch {
+		case (r.Kind == KindSeason || r.Kind == KindEpisode) && v.screens(r.Kind):
+			holder = r.seriesItemID()
+		case r.folderVideo() && v.screens(r.Kind):
+			holder = r.folderItemID()
+		}
+		if holder != (accounts.ID{}) {
+			if title, err := s.load(ctx, holder); err == nil {
+				titles[i] = title
+			}
+		}
+	}
+	s.storedTraits(ctx, titles)
+	allowed := make([]bool, len(records))
+	var unknown, stale []int
+	for i, r := range titles {
+		if !v.screens(r.Kind) {
+			allowed[i] = true
+			continue
+		}
+		t, old := s.knownTraits(ctx, v, r)
+		official := s.officialRating(records[i], t.rating)
+		t = s.overriddenTraits(r.ID, t)
+		if ok, decided := v.listVerdict(r.Kind, t, official); decided {
+			allowed[i] = ok
+			if old {
+				stale = append(stale, i)
+			}
+		} else {
+			unknown = append(unknown, i)
+		}
+	}
+	found, pending := s.lookUpTraits(ctx, v, titles, unknown)
+	for i, t := range found {
+		if t != nil {
+			at := unknown[i]
+			ok, decided := v.listVerdict(titles[at].Kind, s.overriddenTraits(titles[at].ID, *t), s.officialRating(records[at], t.rating))
+			allowed[at] = ok && decided
+		}
+		held = held || pending[i]
+	}
+	// Traits kept long ago are asked again for the next listings; this one
+	// uses them.
+	s.lookUpTraits(context.WithoutCancel(ctx), v.withoutWait(), titles, stale)
+	kept = records[:0:0]
+	for i, r := range records {
+		if allowed[i] {
+			kept = append(kept, r)
+		}
+	}
+	return kept, held
+}
+
+// withoutWait returns the view with its deadline passed, for lookups no
+// one waits for.
+func (v view) withoutWait() view {
+	v.deadline = time.Time{}
+	return v
+}
+
+// visibleMetas keeps the entries of a catalog page the user's parental
+// control and blocked genres let them see, without the titles they hid
+// and the movies waiting for their digital release (see releases.go).
+// Entries that are not titles, collections among them, are kept. held
+// reports titles left out only because their rating or genres, or their
+// release, are not known yet (see visible).
+func (s *Service) visibleMetas(ctx context.Context, v view, src source, metas []stremio.Meta) ([]stremio.Meta, bool) {
+	metas = v.unhiddenMetas(src, metas)
+	metas, waiting := s.releasedMetas(ctx, v, src, metas)
+	if !v.narrows() || len(metas) == 0 {
+		return metas, waiting
+	}
+	var titles []record
+	judged := make(map[accounts.ID]int, len(metas))
+	for i, meta := range metas {
+		// The listing saves its records with their folder afterwards.
+		if _, r, err := s.titleItem(src.addon, src.catalog, meta, accounts.ID{}, v.country); err == nil {
+			r.Parent = nil
+			titles = append(titles, r)
+			judged[r.ID] = i
+		}
+	}
+	allowed := make([]bool, len(metas))
+	for i := range metas {
+		allowed[i] = true
+	}
+	for _, r := range titles {
+		allowed[judged[r.ID]] = false
+	}
+	visible, held := s.visible(ctx, v, titles)
+	for _, r := range visible {
+		allowed[judged[r.ID]] = true
+	}
+	kept := metas[:0:0]
+	for i, meta := range metas {
+		if allowed[i] {
+			kept = append(kept, meta)
+		}
+	}
+	return kept, held || waiting
+}
+
+// storedTraits fills in the ratings and genres kept for records made from
+// a listing, which carry none of their own.
+func (s *Service) storedTraits(ctx context.Context, records []record) {
+	ids := make([]accounts.ID, 0, len(records))
+	for _, r := range records {
+		if r.Rating == nil {
+			ids = append(ids, r.ID)
+		}
+	}
+	if len(ids) == 0 {
+		return
+	}
+	rows, err := s.db.Query(ctx, `SELECT id, data->>'rating', (data->>'ratedAt')::timestamptz, coalesce(data->>'ratedFor', ''), data->'genres'
+		FROM items WHERE id = ANY($1) AND data ? 'rating'`, ids)
+	if err != nil {
+		s.logger.Debug("Stored ratings could not be read", "error", err)
+		return
+	}
+	defer rows.Close()
+	type kept struct {
+		rating  string
+		at      *time.Time
+		country string
+		genres  *[]string
+	}
+	stored := map[accounts.ID]kept{}
+	for rows.Next() {
+		var id accounts.ID
+		var k kept
+		if rows.Scan(&id, &k.rating, &k.at, &k.country, &k.genres) == nil {
+			stored[id] = k
+		}
+	}
+	for i := range records {
+		if k, ok := stored[records[i].ID]; ok && records[i].Rating == nil {
+			records[i].Rating, records[i].RatedAt, records[i].RatedFor, records[i].Genres = &k.rating, k.at, k.country, k.genres
+		}
+	}
+}
+
+// lookUpTraits looks up the ratings and genres of the titles at indexes
+// among the server's addons, a few at a time, and returns those known by
+// the request's deadline, nil for the others. pending marks the titles
+// whose lookup did not answer in time, or did not start because the
+// request started its share. Lookups outlive the request, so that a later
+// one knows them.
+func (s *Service) lookUpTraits(ctx context.Context, v view, titles []record, indexes []int) (found []*traits, pending []bool) {
+	found, pending = make([]*traits, len(indexes)), make([]bool, len(indexes))
+	if len(indexes) == 0 {
+		return found, pending
+	}
+	type result struct {
+		at     int
+		traits *traits
+	}
+	done := make(chan result, len(indexes))
+	started := 0
+	for at, i := range indexes {
+		title := titles[i]
+		if title.Meta == nil {
+			continue
+		}
+		pending[at] = true
+		if v.lookups.Add(1) > maxRatingLookups {
+			continue
+		}
+		started++
+		go func() {
+			r := result{at: at}
+			defer func() { done <- r }()
+			lookup, cancel := context.WithTimeout(context.WithoutCancel(ctx), ratingLookupTime)
+			defer cancel()
+			select {
+			case s.ratingLookups <- struct{}{}:
+				defer func() { <-s.ratingLookups }()
+			case <-lookup.Done():
+				return
+			}
+			// describe keeps the rating and genres it finds.
+			if meta, ok := s.describe(lookup, v, title, true); ok {
+				r.traits = new(describedTraits(meta, v.country))
+			}
+		}()
+	}
+	if started == 0 || v.deadline.IsZero() {
+		return found, pending
+	}
+	wait := time.NewTimer(time.Until(v.deadline))
+	defer wait.Stop()
+	for range started {
+		select {
+		case r := <-done:
+			found[r.at], pending[r.at] = r.traits, false
+		case <-wait.C:
+			return found, pending
+		case <-ctx.Done():
+			return found, pending
+		}
+	}
+	return found, pending
+}
+
+// refreshBatch bounds the titles one RefreshRatings asks about.
+const refreshBatch = 500
+
+// RefreshRatings asks the server's addons again for the ratings and genres
+// kept for titles once they are old enough to be asked again, or were
+// picked for another rating country than the server's, those first, then
+// the oldest, at most refreshBatch of them, one at a time within the
+// lookups listings share, and returns how many were asked. Listings do the
+// same for the titles they list; this does it ahead, when an administrator
+// starts it.
+func (s *Service) RefreshRatings(ctx context.Context) (int, error) {
+	v, err := s.view(ctx, accounts.User{})
+	if err != nil {
+		return 0, err
+	}
+	rows, err := s.db.Query(ctx, `SELECT id FROM items
+		WHERE data ? 'rating' AND data ? 'ratedAt' AND (coalesce(data->>'ratedFor', 'US') <> $4 OR (data->>'ratedAt')::timestamptz <
+			CASE WHEN data->>'rating' = '' THEN $1::timestamptz ELSE $2::timestamptz END)
+		ORDER BY coalesce(data->>'ratedFor', 'US') = $4, (data->>'ratedAt')::timestamptz LIMIT $3`,
+		s.now().Add(-unratedTTL), s.now().Add(-ratedTTL), refreshBatch, v.ratingCountry())
+	if err != nil {
+		return 0, err
+	}
+	ids, err := pgx.CollectRows(rows, pgx.RowTo[accounts.ID])
+	if err != nil {
+		return 0, err
+	}
+	records, err := s.loadAll(ctx, ids)
+	if err != nil {
+		return 0, err
+	}
+	asked := 0
+	for _, r := range records {
+		if !v.rates(r) {
+			continue
+		}
+		select {
+		case s.ratingLookups <- struct{}{}:
+		case <-ctx.Done():
+			return asked, ctx.Err()
+		}
+		lookup, cancel := context.WithTimeout(ctx, ratingLookupTime)
+		// describe keeps the rating and genres it finds.
+		s.describe(lookup, v, r, true)
+		cancel()
+		<-s.ratingLookups
+		asked++
+	}
+	return asked, ctx.Err()
+}

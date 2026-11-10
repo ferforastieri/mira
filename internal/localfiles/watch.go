@@ -1,0 +1,569 @@
+package localfiles
+
+import (
+	"context"
+	"errors"
+	"io/fs"
+	"log/slog"
+	"os"
+	"path/filepath"
+	"strings"
+	"sync"
+	"time"
+
+	"github.com/fsnotify/fsnotify"
+
+	"github.com/ferforastieri/mira/internal/accounts"
+	"github.com/ferforastieri/mira/internal/addons"
+)
+
+// How folders are watched: a folder is scanned again watchQuiet after its
+// files stop changing; the folders to watch are looked for every
+// watchCheck, and a folder that could not be watched is tried again
+// watchRetry later.
+const (
+	watchQuiet = 5 * time.Second
+	watchCheck = 30 * time.Second
+	watchRetry = ScanCheck
+)
+
+// Why a folder to watch is not, its Unwatched: on Linux, the system's
+// limit of watches is reached (ENOSPC, fs.inotify.max_user_watches), or its
+// limit of watchers or of open files (EMFILE, fs.inotify.max_user_instances);
+// on macOS, which watches each folder and file through a file of its own,
+// its limit of open files (EMFILE, kern.maxfilesperproc); or another
+// failure, the only one on Windows, which has no such limits (see
+// unwatchedReason).
+const (
+	unwatchedWatchLimit     = "watch_limit"
+	unwatchedInstanceLimit  = "instance_limit"
+	unwatchedOpenFilesLimit = "open_files_limit"
+	unwatchedFailed         = "failed"
+)
+
+// fileWatcher watches folders for changes: fsnotify's watcher, which tests
+// replace. fsnotify watches through inotify on Linux, kqueue on macOS and
+// ReadDirectoryChangesW on Windows.
+type fileWatcher interface {
+	Add(path string) error
+	Remove(path string) error
+	Events() <-chan fsnotify.Event
+	Errors() <-chan error
+	Close() error
+}
+
+// notifyWatcher is a fileWatcher of fsnotify.
+type notifyWatcher struct{ w *fsnotify.Watcher }
+
+func openNotifyWatcher() (fileWatcher, error) {
+	w, err := fsnotify.NewWatcher()
+	if err != nil {
+		return nil, err
+	}
+	return notifyWatcher{w}, nil
+}
+
+func (n notifyWatcher) Add(path string) error         { return n.w.Add(path) }
+func (n notifyWatcher) Remove(path string) error      { return n.w.Remove(path) }
+func (n notifyWatcher) Events() <-chan fsnotify.Event { return n.w.Events }
+func (n notifyWatcher) Errors() <-chan error          { return n.w.Errors }
+func (n notifyWatcher) Close() error                  { return n.w.Close() }
+
+// watchFolder is a folder to watch: its addon, its path in the container
+// or a share's address, and its kind, KindMusic for a music folder, else
+// empty: a watch reads the folders of movies and shows alike. every is
+// how often a share is listed again, 0 for shareEvery (see sharewatch.go).
+type watchFolder struct {
+	id    accounts.ID
+	root  string
+	kind  string
+	every time.Duration
+}
+
+// watchable are the folders to watch among the server's addons: the
+// enabled local folders, in the container or network shares, none when
+// the setting is off. polls are how often, in minutes, the shares whose
+// kind has a setting of it are listed again, by folder: those listed only
+// at their scans, 0, are not watched.
+func watchable(settings accounts.Settings, installed []addons.Addon, polls map[accounts.ID]int) []watchFolder {
+	if !settings.WatchLocalFolders {
+		return nil
+	}
+	var folders []watchFolder
+	for _, addon := range installed {
+		if addon.Local() && addon.Enabled {
+			folder := watchFolder{id: addon.ID, root: addon.ManifestURL}
+			if addon.HasMusic() {
+				folder.kind = KindMusic
+			}
+			if minutes, ok := polls[addon.ID]; ok {
+				if minutes == 0 {
+					continue
+				}
+				folder.every = time.Duration(minutes) * time.Minute
+			}
+			folders = append(folders, folder)
+		}
+	}
+	return folders
+}
+
+// watching is how the watch of a folder goes: its path, and the same with
+// its symbolic links resolved, as events name it; its kind (see
+// watchFolder); whether it is watched; whether it went missing, so that it
+// is scanned when it is back; and when it last could not be watched.
+type watching struct {
+	root     string
+	real     string
+	kind     string
+	on       bool
+	lost     bool
+	failedAt time.Time
+}
+
+// watcher watches the folders folders lists, each folder of their trees
+// but those a scan leaves out, and scans a folder quiet after its video
+// files, side files or folders stop changing. It looks for the folders to
+// watch every check, and when kicked; a folder it could not watch is tried
+// again after retry, and keeps its schedule meanwhile. It polls the
+// network shares among them instead, read through shares (see poll).
+type watcher struct {
+	// ctx ends the watch.
+	ctx     context.Context
+	logger  *slog.Logger
+	folders func(ctx context.Context) ([]watchFolder, error)
+	scan    func(ctx context.Context, id accounts.ID)
+	open    func() (fileWatcher, error)
+	shares  shareSource
+	// spawn runs a scan in the background: Service.wg.Go.
+	spawn func(func())
+
+	quiet, check, retry time.Duration
+	// rewatch has the folders created in a tree watched again as its scan
+	// begins: rewatchCreated, which tests set.
+	rewatch bool
+	// every, notifiedEvery, rearm, gap and lists pace the polls and the
+	// watches of the shares (see shareEvery).
+	every, notifiedEvery, rearm, gap time.Duration
+	lists                            int
+
+	kicks chan struct{}
+	due   chan accounts.ID
+	done  chan accounts.ID
+	// polled are the shares a poll found changed, notified those whose
+	// server told of a change.
+	polled   chan sharePolled
+	notified chan accounts.ID
+
+	mu sync.Mutex
+	// unwatched are why the folders to watch that could not be are not,
+	// by folder; shareWatches how the shares are watched.
+	unwatched    map[accounts.ID]string
+	shareWatches map[accounts.ID]shareWatchState
+
+	// What follows belongs to the loop. files is nil while nothing is
+	// watched; dirs are the folders watched, by path, with their folder;
+	// created the folders created in a folder's tree since its last scan
+	// began, when they are watched again (see rewatch); changed the last
+	// change of the folders waiting for their scan; scanning the folders a
+	// scan of the watch is under way for, again those that changed
+	// meanwhile; polls the shares polled.
+	files    fileWatcher
+	watched  map[accounts.ID]*watching
+	dirs     map[string]accounts.ID
+	created  map[accounts.ID][]string
+	changed  map[accounts.ID]time.Time
+	scanning map[accounts.ID]bool
+	again    map[accounts.ID]bool
+	polls    map[accounts.ID]*polling
+}
+
+func newWatcher(ctx context.Context, logger *slog.Logger, folders func(context.Context) ([]watchFolder, error), scan func(context.Context, accounts.ID),
+	open func() (fileWatcher, error), shares shareSource, spawn func(func())) *watcher {
+	return &watcher{ctx: ctx, logger: logger, folders: folders, scan: scan, open: open, shares: shares, spawn: spawn,
+		quiet: watchQuiet, check: watchCheck, retry: watchRetry, rewatch: rewatchCreated, every: shareEvery, notifiedEvery: shareNotifiedEvery,
+		rearm: shareRearm, gap: shareGap, lists: shareLists,
+		kicks: make(chan struct{}, 1), due: make(chan accounts.ID), done: make(chan accounts.ID), polled: make(chan sharePolled),
+		notified: make(chan accounts.ID), unwatched: map[accounts.ID]string{}, shareWatches: map[accounts.ID]shareWatchState{},
+		watched: map[accounts.ID]*watching{}, dirs: map[string]accounts.ID{}, created: map[accounts.ID][]string{},
+		changed: map[accounts.ID]time.Time{}, scanning: map[accounts.ID]bool{}, again: map[accounts.ID]bool{}, polls: map[accounts.ID]*polling{}}
+}
+
+// run watches the folders until the watch ends.
+func (w *watcher) run() {
+	w.reconcile()
+	w.loop()
+}
+
+// loop handles the events, the scans due and the checks until the watch
+// ends, then stops watching.
+func (w *watcher) loop() {
+	defer w.close()
+	ticker := time.NewTicker(w.check)
+	defer ticker.Stop()
+	for {
+		var events <-chan fsnotify.Event
+		var failures <-chan error
+		if w.files != nil {
+			events, failures = w.files.Events(), w.files.Errors()
+		}
+		select {
+		case <-w.ctx.Done():
+			return
+		case <-ticker.C:
+			w.reconcile()
+		case <-w.kicks:
+			w.reconcile()
+		case event, ok := <-events:
+			if !ok {
+				w.close()
+				continue
+			}
+			w.event(event)
+		case id := <-w.notified:
+			if w.polls[id] != nil {
+				w.change(id)
+			}
+		case err, ok := <-failures:
+			if !ok {
+				w.close()
+				continue
+			}
+			w.failure(err)
+		case id := <-w.due:
+			w.settle(id)
+		case poll := <-w.polled:
+			w.polledShare(poll)
+		case id := <-w.done:
+			delete(w.scanning, id)
+			if w.again[id] {
+				delete(w.again, id)
+				w.startScan(id)
+			}
+		}
+	}
+}
+
+// kick looks for the folders to watch at once, such as after one was
+// added or moved.
+func (w *watcher) kick() {
+	if w == nil {
+		return
+	}
+	select {
+	case w.kicks <- struct{}{}:
+	default:
+	}
+}
+
+// reason tells why a folder to watch is not watched, empty when it is or
+// need not be.
+func (w *watcher) reason(id accounts.ID) string {
+	if w == nil {
+		return ""
+	}
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	return w.unwatched[id]
+}
+
+func (w *watcher) setReason(id accounts.ID, reason string) {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	if reason == "" {
+		delete(w.unwatched, id)
+	} else {
+		w.unwatched[id] = reason
+	}
+}
+
+// reconcile watches the folders to watch not watched yet, those back after
+// they went missing and those to try again, and stops watching the others;
+// with none in the container to watch, no watcher runs. The shares to
+// watch are polled, and those no longer to watch are not.
+func (w *watcher) reconcile() {
+	list, err := w.folders(w.ctx)
+	if err != nil {
+		if w.ctx.Err() == nil {
+			w.logger.Warn("The local folders to watch could not be read", "error", err)
+		}
+		return
+	}
+	want := map[accounts.ID]watchFolder{}
+	shares := map[accounts.ID]watchFolder{}
+	for _, folder := range list {
+		if shareKind(folder.root) != "" {
+			shares[folder.id] = folder
+		} else {
+			want[folder.id] = folder
+		}
+	}
+	w.pollShares(shares)
+	for id, state := range w.watched {
+		if folder, ok := want[id]; !ok || folder.root != state.root || folder.kind != state.kind {
+			w.unwatch(id)
+			delete(w.watched, id)
+			delete(w.changed, id)
+			delete(w.created, id)
+			w.setReason(id, "")
+		}
+	}
+	if len(want) == 0 {
+		w.close()
+		return
+	}
+	for id, folder := range want {
+		if w.watched[id] == nil {
+			w.watched[id] = &watching{root: folder.root, kind: folder.kind}
+		}
+	}
+	now := time.Now()
+	for id, folder := range want {
+		root := folder.root
+		state := w.watched[id]
+		if state.on || !state.failedAt.IsZero() && now.Sub(state.failedAt) < w.retry {
+			continue
+		}
+		// A folder missing is reported by its scan; it is watched when it
+		// is back.
+		if readable(root) != "" {
+			state.lost = true
+			w.setReason(id, "")
+			continue
+		}
+		real, err := filepath.EvalSymlinks(root)
+		if err != nil {
+			state.lost = true
+			continue
+		}
+		if w.files == nil {
+			if w.files, err = w.open(); err != nil {
+				w.files = nil
+				for id := range want {
+					w.fail(id, err)
+				}
+				return
+			}
+		}
+		state.real = real
+		if !w.addTree(id, real) {
+			continue
+		}
+		state.on, state.failedAt = true, time.Time{}
+		w.setReason(id, "")
+		if state.lost {
+			state.lost = false
+			w.change(id)
+		}
+	}
+}
+
+// addTree watches a folder and the folders under it a scan reads; a
+// failure leaves the whole folder unwatched, and reports false.
+func (w *watcher) addTree(id accounts.ID, top string) bool {
+	kind := w.watched[id].kind
+	err := filepath.WalkDir(top, func(path string, d fs.DirEntry, err error) error {
+		// A folder gone meanwhile, or that cannot be listed, is skipped,
+		// as a scan skips it.
+		if err != nil || !d.IsDir() {
+			return nil
+		}
+		if path != top && skippedIn(kind, d.Name()) {
+			return fs.SkipDir
+		}
+		if err := w.files.Add(path); err != nil {
+			if errors.Is(err, fs.ErrNotExist) {
+				return fs.SkipDir
+			}
+			return err
+		}
+		w.dirs[path] = id
+		return nil
+	})
+	if err != nil {
+		w.fail(id, err)
+		return false
+	}
+	return true
+}
+
+// fail leaves a folder unwatched after err, until it is tried again: it
+// keeps its schedule.
+func (w *watcher) fail(id accounts.ID, err error) {
+	w.unwatch(id)
+	state := w.watched[id]
+	state.on, state.failedAt = false, time.Now()
+	reason := unwatchedReason(err)
+	w.setReason(id, reason)
+	w.logger.Warn("A local folder cannot be watched for changes; it is scanned on its schedule", "path", state.root, "reason", reason,
+		"error", err)
+}
+
+// unwatch stops watching the folders of a folder's tree.
+func (w *watcher) unwatch(id accounts.ID) {
+	for path, owner := range w.dirs {
+		if owner == id {
+			w.forget(path)
+		}
+	}
+}
+
+// drop stops watching a folder gone and those under it.
+func (w *watcher) drop(dir string) {
+	prefix := dir + string(filepath.Separator)
+	for path := range w.dirs {
+		if path == dir || strings.HasPrefix(path, prefix) {
+			w.forget(path)
+		}
+	}
+}
+
+func (w *watcher) forget(path string) {
+	delete(w.dirs, path)
+	if w.files != nil {
+		// A folder gone is no longer watched already.
+		_ = w.files.Remove(path)
+	}
+}
+
+// close stops watching every folder; they are watched again at the next
+// check when there are some to watch.
+func (w *watcher) close() {
+	if w.files != nil {
+		_ = w.files.Close()
+		w.files = nil
+	}
+	clear(w.dirs)
+	for _, state := range w.watched {
+		state.on = false
+	}
+}
+
+// event handles a change: a folder added is watched, a folder watched gone
+// is no longer, and a change of a folder, or of a file its folder's scan
+// lists (see walked), schedules the scan of its folder.
+func (w *watcher) event(event fsnotify.Event) {
+	name := filepath.Clean(event.Name)
+	if id, ok := w.dirs[name]; ok {
+		if !event.Has(fsnotify.Remove) && !event.Has(fsnotify.Rename) {
+			return
+		}
+		w.drop(name)
+		if state := w.watched[id]; state != nil && name == state.real {
+			state.on, state.lost = false, true
+		}
+		w.change(id)
+		return
+	}
+	id, ok := w.dirs[filepath.Dir(name)]
+	if !ok {
+		return
+	}
+	base := filepath.Base(name)
+	kind := w.watched[id].kind
+	if event.Has(fsnotify.Create) {
+		if info, err := os.Lstat(name); err == nil && info.IsDir() {
+			if !skippedIn(kind, base) && w.addTree(id, name) {
+				if w.rewatch {
+					w.created[id] = append(w.created[id], name)
+				}
+				w.change(id)
+			}
+			return
+		}
+	}
+	if file, side := walked(kind, filepath.ToSlash(name)); (file || side) && event.Op&(fsnotify.Create|fsnotify.Write|fsnotify.Remove|fsnotify.Rename) != 0 {
+		w.change(id)
+	}
+}
+
+// failure handles a watcher's error: events lost, the folders watched are
+// all scanned again.
+func (w *watcher) failure(err error) {
+	if !errors.Is(err, fsnotify.ErrEventOverflow) {
+		w.logger.Warn("Watching the local folders failed", "error", err)
+		return
+	}
+	for id, state := range w.watched {
+		if state.on {
+			w.change(id)
+		}
+	}
+}
+
+// change schedules the scan of a folder quiet after its last change.
+func (w *watcher) change(id accounts.ID) {
+	if _, waiting := w.changed[id]; !waiting {
+		w.arm(id, w.quiet)
+	}
+	w.changed[id] = time.Now()
+}
+
+// polledShare has a share a poll found changed scanned again quiet later.
+// A poll finds a share changed until a scan lists it again: a share
+// waiting for its scan, or being scanned, is not made to wait longer; nor
+// is one a scan kept other prints of since the poll read those it
+// compared, as the next round compares with them. One no longer watched
+// waits for none.
+func (w *watcher) polledShare(poll sharePolled) {
+	if _, waiting := w.changed[poll.id]; w.polls[poll.id] == nil || waiting || w.scanning[poll.id] ||
+		w.shares.shareSeen(poll.id).kept != poll.kept {
+		return
+	}
+	w.change(poll.id)
+}
+
+func (w *watcher) arm(id accounts.ID, after time.Duration) {
+	time.AfterFunc(after, func() {
+		select {
+		case w.due <- id:
+		case <-w.ctx.Done():
+		}
+	})
+}
+
+// settle scans a folder whose files stopped changing, or waits for them
+// to.
+func (w *watcher) settle(id accounts.ID) {
+	last, ok := w.changed[id]
+	if !ok {
+		return
+	}
+	if wait := w.quiet - time.Since(last); wait > 0 {
+		w.arm(id, wait)
+		return
+	}
+	delete(w.changed, id)
+	w.startScan(id)
+}
+
+// startScan scans a folder in the background, or once the scan under way
+// ends. The folders created in its tree are watched again first (see
+// rewatchCreated): the scan then lists what was written before.
+func (w *watcher) startScan(id accounts.ID) {
+	if w.scanning[id] {
+		w.again[id] = true
+		return
+	}
+	w.rewatchCreatedIn(id)
+	w.scanning[id] = true
+	w.spawn(func() {
+		w.scan(w.ctx, id)
+		select {
+		case w.done <- id:
+		case <-w.ctx.Done():
+		}
+	})
+}
+
+// rewatchCreatedIn watches again the folders created in a folder's tree
+// since its last scan began, those still watched.
+func (w *watcher) rewatchCreatedIn(id accounts.ID) {
+	created := w.created[id]
+	delete(w.created, id)
+	for _, dir := range created {
+		if owner, ok := w.dirs[dir]; ok && owner == id && !w.addTree(id, dir) {
+			return
+		}
+	}
+}

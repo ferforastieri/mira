@@ -1,0 +1,246 @@
+# The web and Go stages run natively on the builder and cross-compile; only
+# the final stage installs packages for the target platform, under emulation
+# when it differs.
+FROM --platform=$BUILDPLATFORM node:24.21.0-alpine@sha256:ebfe2f90462722a7a4de65e91990e97fe0d401c70e0e762c5b53302f905ec1c1 AS web
+WORKDIR /build/web
+COPY web/package.json web/package-lock.json ./
+RUN npm ci --no-audit --no-fund
+COPY web/ ./
+RUN npm run build
+
+FROM --platform=$BUILDPLATFORM golang:1.27.1-alpine@sha256:8a5910f31396cd4d89662f56c68b3ae31d374308270a1c3bd96672ee5ed43414 AS build
+WORKDIR /build
+COPY go.mod go.sum ./
+# The SMB library is a copy in the repository (go.mod replaces it):
+# downloading the modules reads its go.mod.
+COPY third_party/go-smb2/ ./third_party/go-smb2/
+RUN go mod download
+COPY cmd/ ./cmd/
+COPY internal/ ./internal/
+COPY web/assets_embed.go ./web/assets_embed.go
+COPY --from=web /build/web/dist/ ./web/dist/
+ARG VERSION=dev
+ARG TARGETOS
+ARG TARGETARCH
+# The final stage runs nothing, so as to need no emulation on arm64: the
+# data directory is copied.
+RUN CGO_ENABLED=0 GOOS=${TARGETOS} GOARCH=${TARGETARCH} go build -tags production -trimpath -ldflags "-s -w -X main.version=${VERSION}" -o /mira ./cmd/mira \
+	&& mkdir /data
+
+# jellyfin-web 12.4, the web client of the Jellyfin version Mira speaks.
+# Its two pins are here, to change together when the client is updated
+# (and the version in third_party/jellyfin-web/NOTICE with them):
+# - its built files, taken unmodified from the official Jellyfin image,
+#   pinned by the digest of its multi-platform index: the very files
+#   Jellyfin 12.4 serves, with no Node.js build to reproduce. They are the
+#   same on every platform, so the builder's are taken;
+# - its source code (GPL-2.0), which the release workflow attaches to every
+#   Mira release; no image build reads it.
+FROM --platform=$BUILDPLATFORM jellyfin/jellyfin:12.4@sha256:fea863d0cd9ec445985d9c75fc6ed64e38a1d2766cf0c250a33d553f4fc1b771 AS jellyfin-web
+
+# The downloads from GitHub: curl retries its passing failures, which ADD
+# does not, then each file is checked against its pinned SHA-256, from a
+# file rather than a pipe.
+FROM --platform=$BUILDPLATFORM debian:trixie-slim@sha256:a99cfc517144bc59b1978475ec53b46ecabec7e43635402ee5b77cc54cd1b20a AS download
+# hadolint ignore=DL3008
+RUN apt-get update \
+	&& apt-get install -y --no-install-recommends ca-certificates curl \
+	&& rm -rf /var/lib/apt/lists/*
+
+FROM download AS jellyfin-web-source-download
+RUN curl -fsSL --retry 5 --retry-all-errors --retry-delay 10 -o /jellyfin-web-12.4-source.tar.gz \
+	https://github.com/jellyfin/jellyfin-web/archive/refs/tags/v12.4.tar.gz \
+	&& echo "2978d0fbe3bc24d3bef637473c55e2628262fa725600e55788a45d9a42a53d44  /jellyfin-web-12.4-source.tar.gz" > /jellyfin-web.sha256 \
+	&& sha256sum -c /jellyfin-web.sha256
+
+# Mode 600, as ADD gave the file.
+FROM scratch AS jellyfin-web-source
+COPY --from=jellyfin-web-source-download --chmod=600 /jellyfin-web-12.4-source.tar.gz /
+
+# FFmpeg 9.0 built against glibc by BtbN, which can load GPU drivers at run
+# time (NVIDIA through the NVIDIA container runtime, VAAPI through libva):
+# the last build of a month, kept for two years. The shared build keeps
+# ffmpeg and ffprobe from carrying a copy of every library each.
+FROM download AS ffmpeg-amd64
+RUN curl -fsSL --retry 5 --retry-all-errors --retry-delay 10 -o /ffmpeg.tar.xz \
+	https://github.com/FFmpeg-Builds/FFmpeg-Builds/releases/download/autobuild-2026-09-30-13-08/ffmpeg-n9.0.2-17-g2a571b6068-linux64-gpl-shared-9.0.tar.xz \
+	&& echo "01a9764d0b5364b66cfeb4617557c64321b0e232e172ec73f0a701c5f7694326  /ffmpeg.tar.xz" > /ffmpeg.sha256 \
+	&& sha256sum -c /ffmpeg.sha256 \
+	&& rm /ffmpeg.sha256
+
+FROM download AS ffmpeg-arm64
+RUN curl -fsSL --retry 5 --retry-all-errors --retry-delay 10 -o /ffmpeg.tar.xz \
+	https://github.com/FFmpeg-Builds/FFmpeg-Builds/releases/download/autobuild-2026-09-30-13-08/ffmpeg-n9.0.2-17-g2a571b6068-linuxarm64-gpl-shared-9.0.tar.xz \
+	&& echo "706ccdbc8b0537646345532713a9b6750c0a6258cc001ec1c0379754f0ae730a  /ffmpeg.tar.xz" > /ffmpeg.sha256 \
+	&& sha256sum -c /ffmpeg.sha256 \
+	&& rm /ffmpeg.sha256
+
+# A stage of this file, chosen by platform: no tag to give.
+# hadolint ignore=DL3006
+FROM ffmpeg-${TARGETARCH} AS ffmpeg-unpack
+# hadolint ignore=DL3008
+RUN apt-get update \
+	&& apt-get install -y --no-install-recommends xz-utils \
+	&& mkdir /ffmpeg \
+	&& tar -xJf /ffmpeg.tar.xz -C /ffmpeg --strip-components=1
+
+# ffmpeg and ffprobe find their libraries in ../lib. CI tests with this stage.
+FROM scratch AS ffmpeg
+COPY --from=ffmpeg-unpack /ffmpeg/bin/ffmpeg /ffmpeg/bin/ffprobe /bin/
+COPY --from=ffmpeg-unpack /ffmpeg/lib/ /lib/
+
+# Debian's slim image has no certificate authorities, which Mira needs
+# to reach addons and their streams over HTTPS. The bundle is the same on
+# every platform, so it is made natively.
+FROM --platform=$BUILDPLATFORM debian:trixie-slim@sha256:a99cfc517144bc59b1978475ec53b46ecabec7e43635402ee5b77cc54cd1b20a AS certificates
+# hadolint ignore=DL3008
+RUN apt-get update \
+	&& apt-get install -y --no-install-recommends ca-certificates
+
+# DejaVu, the fallback fonts apps load to render subtitles whose own fonts
+# are missing, for Latin, Greek and Cyrillic. Fonts are the same on every
+# platform, so they are installed natively.
+FROM --platform=$BUILDPLATFORM debian:trixie-slim@sha256:a99cfc517144bc59b1978475ec53b46ecabec7e43635402ee5b77cc54cd1b20a AS fonts
+# hadolint ignore=DL3008
+RUN apt-get update \
+	&& apt-get install -y --no-install-recommends fonts-dejavu-core
+
+# What Mira Desktop's packages take from the image, for
+# scripts/packaging/files.sh: jellyfin-web, unmodified, with its license
+# and notice, and the fallback fonts as the image lays them out under
+# /usr/share/fonts, with their copyright notice. No image build reads it.
+FROM scratch AS desktop-files
+COPY --from=jellyfin-web /jellyfin/jellyfin-web/ /jellyfin-web/
+COPY third_party/jellyfin-web/LICENSE third_party/jellyfin-web/NOTICE /licenses/jellyfin-web/
+COPY --from=fonts /usr/share/fonts/truetype/dejavu/ /fonts/truetype/dejavu/
+COPY --from=fonts /usr/share/doc/fonts-dejavu-core/copyright /licenses/fonts-dejavu/
+
+# pg_dump of PostgreSQL 18, which backs the database up, and pg_restore,
+# which restores a backup from the admin app: Debian's are 17's, which
+# refuse an 18 server and its backups. They are taken, with their libpq and
+# the libraries libpq loads that the final stage lacks (both load the same
+# ones), from the official image compose.yaml runs, pinned by the digest of
+# its multi-platform index (the two digests change together): the target
+# platform's files, copied, nothing run. Both images are the same Debian.
+FROM postgres:18.6@sha256:5a5a84b19854a9ffaa54082c166ff4ec27473a361e496e5ea167f298f2da9722 AS postgres
+
+# The libraries go in the folder of the target platform, which a native
+# stage names: copies follow links, so each is copied by the name it is
+# loaded by. Their copyright notices go with them.
+FROM --platform=$BUILDPLATFORM debian:trixie-slim@sha256:a99cfc517144bc59b1978475ec53b46ecabec7e43635402ee5b77cc54cd1b20a AS pg-dump
+ARG TARGETARCH
+COPY --from=postgres /usr/lib/postgresql/18/bin/pg_dump /usr/lib/postgresql/18/bin/pg_restore /pg-dump/usr/local/bin/
+COPY --from=postgres /usr/lib/*-linux-gnu/libpq.so.5 /usr/lib/*-linux-gnu/libldap.so.2 /usr/lib/*-linux-gnu/liblber.so.2 \
+	/usr/lib/*-linux-gnu/libsasl2.so.2 /usr/lib/*-linux-gnu/libgssapi_krb5.so.2 /usr/lib/*-linux-gnu/libkrb5.so.3 \
+	/usr/lib/*-linux-gnu/libk5crypto.so.3 /usr/lib/*-linux-gnu/libkrb5support.so.0 /usr/lib/*-linux-gnu/libkeyutils.so.1 \
+	/usr/lib/*-linux-gnu/libcom_err.so.2 /libraries/
+COPY --from=postgres /usr/share/doc/ /doc/
+RUN case "$TARGETARCH" in amd64) triplet=x86_64-linux-gnu ;; arm64) triplet=aarch64-linux-gnu ;; *) exit 1 ;; esac \
+	&& mkdir -p "/pg-dump/usr/lib/$triplet" /pg-dump/usr/share/doc \
+	&& mv /libraries/* "/pg-dump/usr/lib/$triplet/" \
+	&& for package in postgresql-client-18 libpq5 libldap2 libsasl2-2 libgssapi-krb5-2 libkrb5-3 libk5crypto3 libkrb5support0 libkeyutils1 libcom-err2; do \
+		mkdir "/pg-dump/usr/share/doc/$package" && cp "/doc/$package/copyright" "/pg-dump/usr/share/doc/$package/"; \
+	done
+
+# pg_dump and pg_restore alone, with the libraries the stage above copies,
+# which they find through LD_LIBRARY_PATH on a system with glibc 2.39 or
+# later. CI tests the backups with this stage.
+FROM scratch AS postgresql-client
+COPY --from=pg-dump /pg-dump/usr/ /usr/
+
+# Tesseract 5.5, which reads picture subtitles into text, with the data of
+# English, French, German, Spanish, Italian, Portuguese and Dutch: Debian's
+# packages of the target platform, with those of the libraries they load
+# that the final stage lacks, downloaded and unpacked natively, nothing run
+# for the target platform. Of the package of the programs, only tesseract is
+# kept: the training tools need Cairo, Pango and ICU, which it does not
+# load. The packages the slim image has are left out, as are manuals and
+# documentation but for the copyright notices.
+FROM --platform=$BUILDPLATFORM debian:trixie-slim@sha256:a99cfc517144bc59b1978475ec53b46ecabec7e43635402ee5b77cc54cd1b20a AS tesseract
+ARG TARGETARCH
+WORKDIR /debs
+# hadolint ignore=DL3008
+RUN if [ "$TARGETARCH" != "$(dpkg --print-architecture)" ]; then dpkg --add-architecture "$TARGETARCH"; fi \
+	&& apt-get update \
+	&& dpkg-query -W -f "\${Package}\n" > /installed \
+	&& mkdir -p /debs/partial /tesseract \
+	&& apt-get install -y --download-only --no-install-recommends -o Dir::Cache::Archives=/debs/ \
+		"libtesseract5:$TARGETARCH" tesseract-ocr-osd tesseract-ocr-eng tesseract-ocr-fra tesseract-ocr-deu \
+		tesseract-ocr-spa tesseract-ocr-ita tesseract-ocr-por tesseract-ocr-nld \
+	&& apt-get download "tesseract-ocr:$TARGETARCH" \
+	&& for deb in /debs/*.deb; do \
+		case "$(dpkg-deb -f "$deb" Architecture)" in "$TARGETARCH" | all) ;; *) continue ;; esac; \
+		if ! grep -qxF "$(dpkg-deb -f "$deb" Package)" /installed; then dpkg-deb -x "$deb" /tesseract; fi; \
+	done \
+	&& find /tesseract/usr/bin ! -name tesseract ! -type d -delete \
+	&& rm -rf /tesseract/usr/share/man /tesseract/usr/share/lintian /tesseract/usr/share/bug \
+	&& find /tesseract/usr/share/doc -mindepth 2 ! -name copyright ! -type d -delete \
+	&& find /tesseract/usr/share/doc -mindepth 1 -type d -empty -delete \
+	&& test -x /tesseract/usr/bin/tesseract
+
+# The same Debian on both platforms. amd64 adds libva and the VA drivers of
+# AMD and Intel GPUs, Intel's from non-free, and what NVIDIA's Vulkan driver
+# loads besides itself (the Vulkan loader, EGL, X11's extension library),
+# for tone mapping HDR on NVIDIA GPUs through libplacebo; arm64 boards have
+# none of these GPUs, and so their image runs nothing under emulation.
+# NVIDIA's own libraries come from the NVIDIA container runtime.
+FROM debian:trixie-slim@sha256:a99cfc517144bc59b1978475ec53b46ecabec7e43635402ee5b77cc54cd1b20a AS runtime-arm64
+
+FROM debian:trixie-slim@sha256:a99cfc517144bc59b1978475ec53b46ecabec7e43635402ee5b77cc54cd1b20a AS runtime-amd64
+# Packages are left unpinned so that each build gets Debian's security fixes.
+# hadolint ignore=DL3008
+RUN sed -i 's/^Components: main$/Components: main non-free/' /etc/apt/sources.list.d/debian.sources \
+	&& apt-get update \
+	&& apt-get install -y --no-install-recommends libva2 libva-drm2 mesa-va-drivers intel-media-va-driver-non-free \
+		libvulkan1 libegl1 libxext6 \
+	&& rm -rf /var/lib/apt/lists/*
+
+# A stage of this file, chosen by platform: no tag to give.
+# hadolint ignore=DL3006
+FROM runtime-${TARGETARCH}
+COPY --from=ffmpeg /bin/ffmpeg /bin/ffprobe /usr/local/bin/
+COPY --from=ffmpeg /lib/ /usr/local/lib/
+COPY --from=certificates /etc/ssl/certs/ca-certificates.crt /etc/ssl/certs/ca-certificates.crt
+COPY --from=fonts /usr/share/fonts/truetype/dejavu/ /usr/share/fonts/truetype/dejavu/
+COPY --from=pg-dump /pg-dump/ /
+COPY --from=tesseract /tesseract/ /
+# jellyfin-web, a separate GPL-2.0 program, unmodified, in the folder
+# MIRA_WEB_DIR names by default; its license, and a notice saying where
+# its source is, in the usual documentation folder.
+COPY --from=jellyfin-web /jellyfin/jellyfin-web/ /usr/share/mira/jellyfin-web/
+COPY third_party/jellyfin-web/LICENSE third_party/jellyfin-web/NOTICE /usr/share/doc/jellyfin-web/
+# hls.js, embedded in Mira for the page of share links (Apache-2.0): its
+# license and a notice.
+COPY third_party/hls.js/LICENSE third_party/hls.js/NOTICE /usr/share/doc/hls.js/
+# LumaaGlaass, the default web player theme, embedded in Mira (MIT): its
+# license and a notice.
+COPY third_party/lumaaglaass/LICENSE third_party/lumaaglaass/NOTICE /usr/share/doc/lumaaglaass/
+# Figtree, the font of the admin app and of the page of share links,
+# embedded in Mira (OFL-1.1): its license and a notice.
+COPY third_party/figtree/LICENSE third_party/figtree/NOTICE /usr/share/doc/figtree/
+COPY --from=build /mira /mira
+# Mira's files: the parts of the files being read, which it empties
+# when it starts, and by default the Live TV recordings and the database
+# backups. A volume, so that it stays writable in a read-only container,
+# owned by the user Mira runs as, which a new named volume copies.
+COPY --from=build --chown=65532:65532 /data /data
+VOLUME /data
+# NVIDIA's runtime exposes the GPUs and the video and Vulkan libraries to
+# containers that ask for it; other runtimes ignore these. Mesa would keep
+# a shader cache in a home directory the read-only image does not have.
+# Tesseract reads its own data, and the .traineddata files of other
+# languages from the folder tessdata of the volume.
+ENV MIRA_LISTEN=:8096 MIRA_DATA_DIR=/data NVIDIA_VISIBLE_DEVICES=all NVIDIA_DRIVER_CAPABILITIES=compute,video,utility,graphics \
+	MESA_SHADER_CACHE_DISABLE=true \
+	MIRA_TESSERACT=/usr/bin/tesseract TESSDATA_PREFIX=/usr/share/tesseract-ocr/5/tessdata MIRA_TESSDATA_DIR=/data/tessdata
+EXPOSE 8096
+USER 65532:65532
+# Whether Mira answers /healthz, which it does while its process serves,
+# even with PostgreSQL away (System › Health tells that): the binary asks,
+# the image having no HTTP client. Every 2 seconds while it starts, as
+# proxies such as Traefik leave out starting containers; Docker before 25
+# ignores --start-interval and checks every 30 seconds from the start.
+HEALTHCHECK --interval=30s --timeout=5s --retries=3 --start-period=2m --start-interval=2s \
+	CMD ["/mira", "healthcheck"]
+ENTRYPOINT ["/mira"]
+CMD ["serve"]

@@ -1,0 +1,778 @@
+package playback
+
+import (
+	"encoding/json"
+	"os"
+	"path"
+	"reflect"
+	"slices"
+	"strings"
+	"testing"
+
+	"github.com/ferforastieri/mira/internal/hls"
+)
+
+const playbackFixtures = "../jellyfin/testdata/jellyfin-12.2/playback/"
+
+// recordedDecision is an entry of decisions.json: Jellyfin 12.2's answer
+// for one clip, one DeviceProfile and one request.
+type recordedDecision struct {
+	Media   string
+	Profile string
+	Options struct {
+		MaxStreamingBitrate int64
+		AudioStreamIndex    *int
+		SubtitleStreamIndex *int
+		EnableDirectPlay    *bool
+		EnableDirectStream  *bool
+	}
+	Result struct {
+		SupportsDirectPlay         bool
+		SupportsDirectStream       bool
+		SupportsTranscoding        bool
+		TranscodeReasons           []string
+		TranscodingSubProtocol     string
+		TranscodingContainer       *string
+		Container                  string
+		Bitrate                    int64
+		DefaultAudioStreamIndex    *int
+		DefaultSubtitleStreamIndex *int
+	}
+	MediaStreams []MediaStream
+}
+
+func readDeviceProfile(t *testing.T, name string) *DeviceProfile {
+	t.Helper()
+	data, err := os.ReadFile(playbackFixtures + "profiles/" + name + ".json")
+	if err != nil {
+		t.Fatal(err)
+	}
+	var profile DeviceProfile
+	if err := json.Unmarshal(data, &profile); err != nil {
+		t.Fatalf("decode %s: %v", name, err)
+	}
+	return &profile
+}
+
+func TestDeviceProfilesDecode(t *testing.T) {
+	t.Parallel()
+	profile := readDeviceProfile(t, "jellyfin-web-chrome")
+	video := profile.TranscodingProfiles[9]
+	if video.Container != "mp4" || video.Protocol != "hls" || video.MinSegments != "2" || !video.BreakOnNonKeyFrames {
+		t.Errorf("jellyfin-web's video transcoding profile = %+v", video)
+	}
+	if got := readDeviceProfile(t, "swiftfin").TranscodingProfiles[0].MinSegments; got != "2" {
+		t.Errorf("Swiftfin's numeric MinSegments = %q", got)
+	}
+}
+
+func TestDecisionsMatchJellyfin(t *testing.T) {
+	t.Parallel()
+	data, err := os.ReadFile(playbackFixtures + "decisions.json")
+	if err != nil {
+		t.Fatal(err)
+	}
+	var entries []recordedDecision
+	if err := json.Unmarshal(data, &entries); err != nil {
+		t.Fatal(err)
+	}
+	profiles := map[string]*DeviceProfile{}
+	for _, entry := range entries {
+		if profiles[entry.Profile] == nil {
+			profiles[entry.Profile] = readDeviceProfile(t, entry.Profile)
+		}
+	}
+	// The source container is recorded where a profile without direct-play
+	// profiles leaves it untouched (Findroid's).
+	containers := map[string]string{}
+	for _, entry := range entries {
+		if len(profiles[entry.Profile].DirectPlayProfiles) == 0 {
+			containers[entry.Media] = entry.Result.Container
+		}
+	}
+
+	for i, entry := range entries {
+		t.Run(entry.Media+"/"+entry.Profile, func(t *testing.T) {
+			t.Parallel()
+			container, ok := containers[entry.Media]
+			if !ok {
+				t.Fatalf("entry %d: no recorded container for %s", i, entry.Media)
+			}
+			options := Options{
+				MaxStreamingBitrate: entry.Options.MaxStreamingBitrate,
+				AudioStreamIndex:    entry.Options.AudioStreamIndex,
+				SubtitleStreamIndex: entry.Options.SubtitleStreamIndex,
+				EnableDirectPlay:    entry.Options.EnableDirectPlay == nil || *entry.Options.EnableDirectPlay,
+				EnableDirectStream:  entry.Options.EnableDirectStream == nil || *entry.Options.EnableDirectStream,
+			}
+			// Without a requested subtitle, Jellyfin applied its own default
+			// (SubtitleMode Default); Mira picks its default outside the
+			// decision, so the recorded choice is passed in.
+			if options.SubtitleStreamIndex == nil {
+				options.SubtitleStreamIndex = entry.Result.DefaultSubtitleStreamIndex
+			}
+			got := Decide(profiles[entry.Profile], MediaSource{Container: container, Bitrate: entry.Result.Bitrate, Streams: entry.MediaStreams}, options)
+
+			want := entry.Result
+			if want.SupportsDirectPlay != want.SupportsDirectStream {
+				t.Fatalf("entry %d: SupportsDirectPlay %v differs from SupportsDirectStream %v", i, want.SupportsDirectPlay, want.SupportsDirectStream)
+			}
+			if got.DirectPlay != want.SupportsDirectPlay {
+				t.Errorf("entry %d: DirectPlay = %v, want %v", i, got.DirectPlay, want.SupportsDirectPlay)
+			}
+			if !slices.Equal(got.Reasons, want.TranscodeReasons) {
+				t.Errorf("entry %d: Reasons = %v, want %v", i, got.Reasons, want.TranscodeReasons)
+			}
+			if got.Container != want.Container {
+				t.Errorf("entry %d: Container = %q, want %q", i, got.Container, want.Container)
+			}
+			if index := orNone(want.DefaultAudioStreamIndex); got.AudioStreamIndex != index {
+				t.Errorf("entry %d: AudioStreamIndex = %d, want %d", i, got.AudioStreamIndex, index)
+			}
+			if index := orNone(want.DefaultSubtitleStreamIndex); got.SubtitleStreamIndex != index {
+				t.Errorf("entry %d: SubtitleStreamIndex = %d, want %d", i, got.SubtitleStreamIndex, index)
+			}
+			if (got.Transcoding != nil) != want.SupportsTranscoding {
+				t.Errorf("entry %d: Transcoding = %+v, want SupportsTranscoding %v", i, got.Transcoding, want.SupportsTranscoding)
+			}
+			protocol, transcodingContainer := "http", ""
+			if !got.DirectPlay && got.Transcoding != nil {
+				protocol, transcodingContainer = got.Transcoding.Protocol, got.Transcoding.Container
+			}
+			if protocol != want.TranscodingSubProtocol || transcodingContainer != orEmpty(want.TranscodingContainer) {
+				t.Errorf("entry %d: transcoding %s/%q, want %s/%q", i, protocol, transcodingContainer, want.TranscodingSubProtocol, orEmpty(want.TranscodingContainer))
+			}
+			for _, stream := range entry.MediaStreams {
+				if stream.Type != "Subtitle" {
+					continue
+				}
+				delivery := got.Subtitles[stream.Index]
+				if delivery.Method != stream.DeliveryMethod {
+					t.Errorf("entry %d: subtitle %d delivered by %q, want %q", i, stream.Index, delivery.Method, stream.DeliveryMethod)
+				}
+				if stream.DeliveryMethod != "External" {
+					continue
+				}
+				file, _, _ := strings.Cut(path.Base(stream.DeliveryUrl), "?")
+				if want := strings.TrimPrefix(path.Ext(file), "."); delivery.Format != want {
+					t.Errorf("entry %d: subtitle %d format %q, want %q (%s)", i, stream.Index, delivery.Format, want, stream.DeliveryUrl)
+				}
+			}
+		})
+	}
+}
+
+func orNone(index *int) int {
+	if index == nil {
+		return -1
+	}
+	return *index
+}
+
+func orEmpty(s *string) string {
+	if s == nil {
+		return ""
+	}
+	return *s
+}
+
+func TestDecideConditions(t *testing.T) {
+	t.Parallel()
+	source := MediaSource{
+		Container: "mkv",
+		Bitrate:   1_000_000,
+		Streams: []MediaStream{
+			{Type: "Video", Index: 0, Codec: "hevc", Profile: "Main 10", Level: new(150.0), VideoRangeType: "HDR10", Width: new(3840), Height: new(2160)},
+			{Type: "Audio", Index: 1, Codec: "aac", IsDefault: true, Channels: new(6)},
+		},
+	}
+	video := func(conditions, apply []ProfileCondition) []CodecProfile {
+		return []CodecProfile{{Type: "Video", Codec: "hevc", Conditions: conditions, ApplyConditions: apply}}
+	}
+	condition := func(kind, property, value string, required bool) ProfileCondition {
+		return ProfileCondition{Condition: kind, Property: property, Value: value, IsRequired: required}
+	}
+	tests := []struct {
+		name    string
+		profile []CodecProfile
+		reasons []string
+	}{
+		{"required unknown property fails", video([]ProfileCondition{condition("EqualsAny", "VideoCodecTag", "hvc1|dvh1", true)}, nil), []string{"VideoCodecTagNotSupported"}},
+		{"optional unknown property passes", video([]ProfileCondition{condition("EqualsAny", "VideoCodecTag", "hvc1|dvh1", false)}, nil), nil},
+		{"required unknown bit depth fails", video([]ProfileCondition{condition("LessThanEqual", "VideoBitDepth", "10", true)}, nil), []string{"VideoBitDepthNotSupported"}},
+		{"EqualsAny ignores case", video([]ProfileCondition{condition("EqualsAny", "VideoProfile", "main|main 10", false)}, nil), nil},
+		{"EqualsAny without the value fails", video([]ProfileCondition{condition("EqualsAny", "VideoProfile", "main|rext", false)}, nil), []string{"VideoProfileNotSupported"}},
+		{"EqualsAny on numbers", video([]ProfileCondition{condition("EqualsAny", "Width", "1920|3840", false)}, nil), nil},
+		{"NotEquals takes a list", video([]ProfileCondition{condition("NotEquals", "VideoRangeType", "DOVI|HDR10", false)}, nil), []string{"VideoRangeTypeNotSupported"}},
+		{
+			"unmet ApplyConditions skip the profile",
+			video([]ProfileCondition{condition("LessThanEqual", "VideoLevel", "120", false)}, []ProfileCondition{condition("Equals", "VideoProfile", "main", false)}),
+			nil,
+		},
+		{
+			"met ApplyConditions apply the profile",
+			video([]ProfileCondition{condition("LessThanEqual", "VideoLevel", "120", false), condition("LessThanEqual", "Height", "1080", false)}, []ProfileCondition{condition("Equals", "VideoProfile", "main 10", false)}),
+			[]string{"VideoLevelNotSupported", "VideoResolutionNotSupported"},
+		},
+		{
+			"VideoAudio conditions see the audio",
+			[]CodecProfile{{Type: "VideoAudio", Codec: "aac", Conditions: []ProfileCondition{condition("LessThanEqual", "AudioChannels", "2", false)}}},
+			[]string{"AudioChannelsNotSupported"},
+		},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			t.Parallel()
+			profile := &DeviceProfile{
+				DirectPlayProfiles:  []DirectPlayProfile{{Type: "Video", Container: "mkv", VideoCodec: "hevc", AudioCodec: "aac"}},
+				TranscodingProfiles: []TranscodingProfile{{Type: "Video", Container: "ts", Protocol: "hls", VideoCodec: "hevc", AudioCodec: "aac"}},
+				CodecProfiles:       test.profile,
+			}
+			got := Decide(profile, source, Options{EnableDirectPlay: true, EnableDirectStream: true})
+			if got.DirectPlay != (test.reasons == nil) || !slices.Equal(got.Reasons, test.reasons) {
+				t.Errorf("DirectPlay %v, Reasons %v; want reasons %v", got.DirectPlay, got.Reasons, test.reasons)
+			}
+		})
+	}
+}
+
+func TestRemuxesCopyTheVideoAndConvertWhatAudioTheAppCannotTake(t *testing.T) {
+	t.Parallel()
+	// A Matroska remux: HEVC with Dolby Vision over HDR10, a French
+	// E-AC-3 track flagged default, then English AAC in 5.1.
+	source := MediaSource{
+		Container: "mkv",
+		Bitrate:   60_000_000,
+		Streams: []MediaStream{
+			{Type: "Video", Index: 0, Codec: "hevc", Profile: "Main 10", Level: new(153.0), VideoRangeType: "DOVIWithHDR10",
+				Width: new(3840), Height: new(2160), AverageFrameRate: new(23.976)},
+			{Type: "Audio", Index: 1, Codec: "eac3", IsDefault: true, Channels: new(6)},
+			{Type: "Audio", Index: 2, Codec: "aac", Channels: new(6)},
+		},
+	}
+	sdr := source
+	sdr.Streams = slices.Clone(source.Streams)
+	sdr.Streams[0].VideoRangeType = "SDR"
+	stereo := &AudioConversion{Codec: "aac", Channels: 2, Bitrate: 384_000}
+	tests := []struct {
+		name    string
+		profile string
+		source  MediaSource
+		options Options
+		remux   bool
+		audio   *AudioConversion
+		reasons []string
+	}{
+		// Its native player takes HEVC in MP4 tagged hvc1 only, which a
+		// remux writes, and E-AC-3.
+		{"Swiftfin's native player", "swiftfin-native", source, Options{}, true, nil, []string{"ContainerNotSupported", "VideoCodecTagNotSupported"}},
+		// An app may ask for the audio to be converted all the same.
+		{"audio copy refused", "swiftfin-native", source, Options{ConvertAudio: true}, true, &AudioConversion{Codec: "aac", Channels: 6, Bitrate: 640_000},
+			[]string{"ContainerNotSupported", "VideoCodecTagNotSupported"}},
+		// Chrome refuses Dolby Vision, which a remux keeps.
+		{"Dolby Vision in Chrome", "jellyfin-web-chrome", source, Options{AudioStreamIndex: new(2)}, false, nil,
+			[]string{"SecondaryAudioNotSupported", "VideoRangeTypeNotSupported"}},
+		// Chrome takes AAC in stereo, and no E-AC-3: both are converted
+		// to stereo AAC.
+		{"5.1 AAC in Chrome", "jellyfin-web-chrome", sdr, Options{AudioStreamIndex: new(2)}, true, stereo, []string{"SecondaryAudioNotSupported"}},
+		{"E-AC-3 in Chrome", "jellyfin-web-chrome", sdr, Options{}, true, stereo, []string{"AudioCodecNotSupported"}},
+		// A remux cannot lower the bitrate.
+		{"over the bitrate limit", "swiftfin-native", source, Options{MaxStreamingBitrate: 20_000_000}, false, nil,
+			[]string{"ContainerBitrateExceedsLimit"}},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			t.Parallel()
+			options := test.options
+			options.EnableDirectPlay, options.EnableDirectStream = true, true
+			got := Decide(readDeviceProfile(t, test.profile), test.source, options)
+			if got.DirectPlay || got.HLS != test.remux || !reflect.DeepEqual(got.Audio, test.audio) || !slices.Equal(got.Reasons, test.reasons) {
+				t.Errorf("DirectPlay %v, Remux %v, Audio %+v, Reasons %v; want remux %v, audio %+v, reasons %v",
+					got.DirectPlay, got.HLS, got.Audio, got.Reasons, test.remux, test.audio, test.reasons)
+			}
+		})
+	}
+	// With more channels allowed, Chrome takes the AAC track as it is.
+	chrome := readDeviceProfile(t, "jellyfin-web-chrome")
+	for i := range chrome.TranscodingProfiles {
+		chrome.TranscodingProfiles[i].MaxAudioChannels = "6"
+	}
+	if english := Decide(chrome, sdr, Options{AudioStreamIndex: new(2), EnableDirectPlay: true, EnableDirectStream: true}); !english.HLS || english.Audio != nil {
+		t.Errorf("5.1 AAC with 6 channels allowed: remux %v, audio %+v", english.HLS, english.Audio)
+	}
+}
+
+// The Jellyfin iOS app's native player with Prefer fMP4 in HLS off ranks
+// a progressive MP4 that keeps E-AC-3 above its MPEG-TS HLS profile.
+// Mira streams http profiles only when progressive is allowed, so
+// without it the play goes over HLS, as H.264 and AAC 5.1, instead of not
+// at all. With fMP4 on, the HEVC is copied.
+func TestExpoNativePlayerStreamsMatroskaWithEAC3OverHLS(t *testing.T) {
+	t.Parallel()
+	source := MediaSource{
+		Container: "mkv",
+		Bitrate:   1_767_650,
+		Streams: []MediaStream{
+			{Type: "Video", Index: 0, Codec: "hevc", Profile: "Main", Level: new(120.0), VideoRangeType: "SDR",
+				Width: new(1920), Height: new(1080), AverageFrameRate: new(23.976)},
+			{Type: "Audio", Index: 1, Codec: "eac3", IsDefault: true, Channels: new(6)},
+		},
+	}
+	aac51 := &AudioConversion{Codec: "aac", Channels: 6, Bitrate: 640_000}
+	can := Capabilities{Encoders: []string{"libx264", "libx265"}}
+	for _, test := range []struct {
+		name, profile       string
+		progressive         bool
+		hls, progressiveOut bool
+		container, video    string
+		audio               *AudioConversion
+	}{
+		{"fMP4 off", "jellyfin-expo-native", false, true, false, "ts", "h264", aac51},
+		{"fMP4 off, progressive allowed", "jellyfin-expo-native", true, false, true, "mp4", "h264", nil},
+		{"fMP4 on", "jellyfin-expo-native-fmp4", false, true, false, "mp4", "", aac51},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			t.Parallel()
+			options := Options{EnableDirectPlay: true, EnableDirectStream: true, Progressive: test.progressive, Can: can}
+			got := Decide(readDeviceProfile(t, test.profile), source, options)
+			video := ""
+			if got.Video != nil {
+				video = got.Video.Codec
+			}
+			if got.DirectPlay || got.HLS != test.hls || got.Progressive != test.progressiveOut || got.Transcoding == nil ||
+				got.Transcoding.Container != test.container || video != test.video || !reflect.DeepEqual(got.Audio, test.audio) {
+				t.Errorf("HLS %v, Progressive %v, Transcoding %+v, Video %+v, Audio %+v", got.HLS, got.Progressive, got.Transcoding, got.Video, got.Audio)
+			}
+		})
+	}
+}
+
+// Jellyfin 12.4 keeps the audio a video streams over HLS with to the
+// codecs its segments carry (StreamBuilder.BuildStreamVideoItem):
+// jellyfin-web's Chrome profile names MP2, which Chrome refuses in
+// fragmented MP4 and in MPEG-TS, so Jellyfin converts it, whether the
+// video is converted or copied. As one file, the profile's list applies
+// as it is.
+func TestStreamedAudioKeepsToWhatItsSegmentsCarry(t *testing.T) {
+	t.Parallel()
+	source := func(container, video, audio string) MediaSource {
+		return MediaSource{Container: container, Bitrate: 4_200_000, Streams: []MediaStream{
+			{Type: "Video", Index: 0, Codec: video, Profile: "Main", VideoRange: "SDR", VideoRangeType: "SDR", BitDepth: new(8),
+				Width: new(720), Height: new(576), AverageFrameRate: new(25.0)},
+			{Type: "Audio", Index: 1, Codec: audio, Channels: new(2), SampleRate: new(48000), BitRate: new(int64(192_000))},
+		}}
+	}
+	chrome := readDeviceProfile(t, "jellyfin-web-chrome")
+	// Its MPEG-TS profile alone, which takes H.264 only.
+	segmentsTS := readDeviceProfile(t, "jellyfin-web-chrome")
+	segmentsTS.TranscodingProfiles = slices.DeleteFunc(segmentsTS.TranscodingProfiles,
+		func(p TranscodingProfile) bool { return p.Type == "Video" && p.Container != "ts" })
+	oneFile := readDeviceProfile(t, "jellyfin-web-chrome")
+	for i := range oneFile.TranscodingProfiles {
+		if p := &oneFile.TranscodingProfiles[i]; p.Type == "Video" {
+			p.Container, p.Protocol, p.VideoCodec, p.AudioCodec = "ts", "http", "h264", "aac,mp2"
+		}
+	}
+	stereo := &AudioConversion{Codec: "aac", Channels: 2, Bitrate: 384_000}
+	for _, test := range []struct {
+		name      string
+		profile   *DeviceProfile
+		source    MediaSource
+		container string
+		converted bool
+		audio     *AudioConversion
+		reasons   []string
+	}{
+		{"MPEG-2 and MP2 in fragmented MP4", chrome, source("mkv", "mpeg2video", "mp2"), "mp4", true, stereo,
+			[]string{"VideoCodecNotSupported", "AudioCodecNotSupported"}},
+		{"MPEG-2 and MP2 in MPEG-TS", segmentsTS, source("mkv", "mpeg2video", "mp2"), "ts", true, stereo,
+			[]string{"VideoCodecNotSupported", "AudioCodecNotSupported"}},
+		// A recording of a channel: the video is copied.
+		{"H.264 and MP2 from MPEG-TS", chrome, source("ts", "h264", "mp2"), "mp4", false, stereo,
+			[]string{"ContainerNotSupported", "AudioCodecNotSupported"}},
+		{"MPEG-2 and AAC", chrome, source("mkv", "mpeg2video", "aac"), "mp4", true, nil, []string{"VideoCodecNotSupported"}},
+		{"MPEG-2 and MP2 as one file", oneFile, source("mkv", "mpeg2video", "mp2"), "ts", true, nil, []string{"VideoCodecNotSupported"}},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			t.Parallel()
+			options := Options{AudioStreamIndex: new(1), SubtitleStreamIndex: new(-1), EnableDirectPlay: true, EnableDirectStream: true,
+				Progressive: true, Can: Capabilities{Encoders: []string{"libx264"}}}
+			got := Decide(test.profile, test.source, options)
+			if !got.Streamed() || got.Transcoding.Container != test.container || (got.Video != nil) != test.converted {
+				t.Fatalf("streamed %v in %+v, video %+v", got.Streamed(), got.Transcoding, got.Video)
+			}
+			if !reflect.DeepEqual(got.Audio, test.audio) || !slices.Equal(got.Reasons, test.reasons) {
+				t.Errorf("audio %+v, reasons %v; want %+v, %v", got.Audio, got.Reasons, test.audio, test.reasons)
+			}
+		})
+	}
+}
+
+func TestAudioIsConvertedToTheFirstCodecFFmpegEncodes(t *testing.T) {
+	t.Parallel()
+	for _, test := range []struct {
+		codecs, maxChannels string
+		channels            int
+		want                *AudioConversion
+	}{
+		{"aac,mp2,opus,flac", "2", 8, &AudioConversion{Codec: "aac", Channels: 2, Bitrate: 384_000}},
+		{"mp3,eac3,aac", "", 8, &AudioConversion{Codec: "eac3", Channels: 6, Bitrate: 640_000}},
+		{"FLAC", "8", 8, &AudioConversion{Codec: "flac", Channels: 8}},
+		{"aac", "", 1, &AudioConversion{Codec: "aac", Channels: 1, Bitrate: 128_000}},
+		{"aac", "", 0, &AudioConversion{Codec: "aac", Channels: 2, Bitrate: 384_000}},
+		{"mp2,opus", "2", 6, nil},
+	} {
+		if got := ConvertAudio(test.codecs, test.maxChannels, AudioSource{Channels: test.channels}, 0, Tuning{}); !reflect.DeepEqual(got, test.want) {
+			t.Errorf("ConvertAudio(%q, %q, %d) = %+v, want %+v", test.codecs, test.maxChannels, test.channels, got, test.want)
+		}
+	}
+}
+
+// A source whose bitrate is not known, as a live HLS stream's, counts
+// against the limit as the usual bitrate of its height: a 1080p stream
+// as 10 Mb/s, played as it is within 20 Mb/s and converted within
+// 3 Mb/s, as one whose bitrate is known.
+func TestASourceWithoutBitrateCountsAsTheUsualBitrateOfItsHeight(t *testing.T) {
+	t.Parallel()
+	source := MediaSource{Container: "hls", Streams: []MediaStream{
+		{Type: "Video", Index: 0, Codec: "h264", Profile: "High", Level: new(40.0), VideoRange: "SDR", VideoRangeType: "SDR", BitDepth: new(8),
+			Width: new(1920), Height: new(1080), AverageFrameRate: new(25.0)},
+		{Type: "Audio", Index: 1, Codec: "aac", IsDefault: true, Channels: new(2)},
+	}}
+	chrome := readDeviceProfile(t, "jellyfin-web-chrome")
+	chrome.DirectPlayProfiles = append(chrome.DirectPlayProfiles, DirectPlayProfile{Container: "hls", Type: "Video", VideoCodec: "h264", AudioCodec: "aac"})
+	options := Options{EnableDirectPlay: true, EnableDirectStream: true, Can: Capabilities{Encoders: []string{"libx264"}}}
+	options.MaxStreamingBitrate = 20_000_000
+	if within := Decide(chrome, source, options); !within.DirectPlay {
+		t.Errorf("within 20 Mb/s: %+v", within)
+	}
+	options.MaxStreamingBitrate = 3_000_000
+	below := Decide(chrome, source, options)
+	if below.DirectPlay || !below.HLS || below.Video == nil || !slices.Contains(below.Reasons, "ContainerBitrateExceedsLimit") {
+		t.Errorf("within 3 Mb/s: %+v", below)
+	}
+}
+
+func TestVideoTheAppCannotTakeIsConverted(t *testing.T) {
+	t.Parallel()
+	// A 4K Dolby Vision remux over HDR10, with E-AC-3 flagged default.
+	source := MediaSource{
+		Container: "mkv",
+		Bitrate:   60_000_000,
+		Streams: []MediaStream{
+			{Type: "Video", Index: 0, Codec: "hevc", Profile: "Main 10", Level: new(153.0), VideoRange: "HDR", VideoRangeType: "DOVIWithHDR10",
+				Width: new(3840), Height: new(2160), AverageFrameRate: new(23.976), BitRate: new(int64(55_000_000))},
+			{Type: "Audio", Index: 1, Codec: "eac3", IsDefault: true, Channels: new(6), BitRate: new(int64(640_000))},
+		},
+	}
+	software := Capabilities{Encoders: []string{"libx264", "libx265"}, ToneMapping: true}
+	// The 720p keep the share of the source's 55 Mb/s their picture is, as
+	// H.264 does HEVC's: 55 / 9 × 1.05 / 0.6.
+	sdr720 := &VideoConversion{Codec: "h264", Encoder: "libx264", Width: 1280, Height: 720, Bitrate: 10_694_445, ToneMap: true}
+	stereo := &AudioConversion{Codec: "aac", Channels: 2, Bitrate: 384_000}
+	tests := []struct {
+		name    string
+		profile string
+		source  MediaSource
+		options Options
+		hls     bool
+		video   *VideoConversion
+		audio   *AudioConversion
+	}{
+		// Chrome refuses Dolby Vision and E-AC-3: both are converted, the
+		// video to SDR H.264, at 720p as it is tone mapped in software.
+		{"Dolby Vision in Chrome", "jellyfin-web-chrome", source, Options{Can: software}, true, sdr720, stereo},
+		// Without the filters converting HDR to SDR, nothing is offered.
+		{"no tone mapping", "jellyfin-web-chrome", source, Options{Can: Capabilities{Encoders: []string{"libx264"}}}, false, nil, nil},
+		{"no encoder", "jellyfin-web-chrome", source, Options{}, false, nil, nil},
+		// Over a limit, the video takes what the audio leaves: 720p at
+		// 3.36 Mb/s within 4 Mb/s.
+		{"over the bitrate limit", "swiftfin-native", source, Options{MaxStreamingBitrate: 4_000_000, Can: software}, true,
+			&VideoConversion{Codec: "h264", Encoder: "libx264", Width: 1280, Height: 720, Bitrate: 3_360_000, Peak: 3_360_000, ToneMap: true}, nil},
+		// An app may refuse the copy of video it could take.
+		{"video copy refused", "swiftfin-native", source, Options{ConvertVideo: true, Can: software}, true, sdr720, nil},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			t.Parallel()
+			options := test.options
+			options.EnableDirectPlay, options.EnableDirectStream = true, true
+			got := Decide(readDeviceProfile(t, test.profile), test.source, options)
+			if got.DirectPlay || got.HLS != test.hls || !reflect.DeepEqual(sizeless(got.Video), test.video) || !reflect.DeepEqual(got.Audio, test.audio) {
+				t.Errorf("HLS %v, Video %+v, Audio %+v; want %v, %+v, %+v", got.HLS, got.Video, got.Audio, test.hls, test.video, test.audio)
+			}
+		})
+	}
+	// Dolby Vision with no base layer other players read cannot be
+	// converted without the colors going wrong.
+	profile5 := source
+	profile5.Streams = slices.Clone(source.Streams)
+	profile5.Streams[0].VideoRangeType = "DOVI"
+	if got := Decide(readDeviceProfile(t, "jellyfin-web-chrome"), profile5, Options{EnableDirectPlay: true, Can: software}); got.HLS {
+		t.Errorf("Dolby Vision profile 5 converted: %+v", got.Video)
+	}
+}
+
+// Under a bitrate limit, the video takes what the audio sent leaves: a
+// lossless track converted to stereo AAC leaves all but 384 kb/s, so a
+// 1080p source keeps 1080p within 10 Mb/s; a track copied, within the
+// audio's share of the limit, leaves what its own bitrate does.
+func TestConvertedVideoTakesWhatTheAudioSentLeaves(t *testing.T) {
+	t.Parallel()
+	source := func(codec string, channels int, bitrate int64) MediaSource {
+		return MediaSource{Container: "mkv", Bitrate: 24_200_000, Streams: []MediaStream{
+			{Type: "Video", Index: 0, Codec: "hevc", Profile: "Main 10", VideoRange: "SDR", VideoRangeType: "SDR",
+				Width: new(1920), Height: new(1080), AverageFrameRate: new(23.976), BitRate: new(int64(20_000_000))},
+			{Type: "Audio", Index: 1, Codec: codec, IsDefault: true, Channels: new(channels), BitRate: new(bitrate)},
+		}}
+	}
+	software := Capabilities{Encoders: []string{"libx264", "libx265"}, ToneMapping: true}
+	options := Options{MaxStreamingBitrate: 10_000_000, EnableDirectPlay: true, EnableDirectStream: true, Can: software}
+	for _, test := range []struct {
+		name    string
+		source  MediaSource
+		height  int
+		bitrate int64
+		audio   *AudioConversion
+	}{
+		// Chrome takes no TrueHD: it is converted to AAC in stereo.
+		{"TrueHD converted", source("truehd", 6, 4_200_000), 1080, 9_616_000, &AudioConversion{Codec: "aac", Channels: 2, Bitrate: 384_000}},
+		// Chrome takes FLAC in stereo over HLS: within 1.536 Mb/s, the
+		// share of 10 Mb/s, it is copied.
+		{"FLAC copied", source("flac", 2, 1_500_000), 1080, 8_500_000, nil},
+		// Above it, it is converted as TrueHD is.
+		{"FLAC converted", source("flac", 2, 4_200_000), 1080, 9_616_000, &AudioConversion{Codec: "aac", Channels: 2, Bitrate: 384_000}},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			t.Parallel()
+			got := Decide(readDeviceProfile(t, "jellyfin-web-chrome"), test.source, options)
+			if !got.HLS || got.Video == nil || got.Video.Height != test.height || got.Video.Bitrate != test.bitrate {
+				t.Fatalf("HLS %v, video %+v; want %dp at %d", got.HLS, got.Video, test.height, test.bitrate)
+			}
+			if (got.Audio == nil) != (test.audio == nil) || got.Audio != nil &&
+				(got.Audio.Codec != test.audio.Codec || got.Audio.Channels != test.audio.Channels || got.Audio.Bitrate != test.audio.Bitrate) {
+				t.Errorf("audio %+v, want %+v", got.Audio, test.audio)
+			}
+		})
+	}
+}
+
+func TestVideoIsConvertedToWhatTheLimitAllows(t *testing.T) {
+	t.Parallel()
+	can := Capabilities{Encoders: []string{"libx264", "libx265"}, ToneMapping: true}
+	video := func(width, height int, bitrate int64, interlaced bool) MediaStream {
+		stream := MediaStream{Codec: "mpeg2video", VideoRange: "SDR", Width: new(width), Height: new(height), IsInterlaced: interlaced, BitDepth: new(8)}
+		if bitrate > 0 {
+			stream.BitRate = new(bitrate)
+		}
+		return stream
+	}
+	for _, test := range []struct {
+		name   string
+		codecs string
+		limit  int64
+		video  MediaStream
+		want   *VideoConversion
+	}{
+		{"no limit", "h264", 0, video(3840, 2160, 0, false), &VideoConversion{Codec: "h264", Encoder: "libx264", Width: 1920, Height: 1080, Bitrate: 10_000_000}},
+		{"never larger than the source", "h264", 0, video(1280, 720, 0, false), &VideoConversion{Codec: "h264", Encoder: "libx264", Width: 1280, Height: 720, Bitrate: 10_000_000}},
+		{"the source's bitrate", "h264", 0, video(1920, 1080, 4_000_000, false), &VideoConversion{Codec: "h264", Encoder: "libx264", Width: 1920, Height: 1080, Bitrate: 4_000_000}},
+		{"a low limit", "h264", 1_000_000, video(1920, 1080, 0, false), &VideoConversion{Codec: "h264", Encoder: "libx264", Width: 852, Height: 480, Bitrate: 1_000_000,
+			Peak: 1_000_000}},
+		// The least bitrate is above the limit, which the video cannot stay within.
+		{"a very low limit", "h264", 100_000, video(1920, 800, 0, true), &VideoConversion{Codec: "h264", Encoder: "libx264", Width: 640, Height: 266, Bitrate: 300_000,
+			Peak: 300_000, Deinterlace: true}},
+		// A 2.40:1 picture fits 1080p's 16:9 frame by its width.
+		{"a wide picture", "h264", 0, video(3832, 1600, 0, false), &VideoConversion{Codec: "h264", Encoder: "libx264", Width: 1920, Height: 800, Bitrate: 10_000_000}},
+		{"HDR tone mapped at 720p at most", "h264", 0, MediaStream{Codec: "hevc", VideoRange: "HDR", VideoRangeType: "HDR10", Width: new(3840), Height: new(2160)},
+			&VideoConversion{Codec: "h264", Encoder: "libx264", Width: 1280, Height: 720, Bitrate: 5_000_000, ToneMap: true}},
+		{"HEVC only", "hevc,mpeg4", 0, video(1920, 1080, 0, false), &VideoConversion{Codec: "hevc", Encoder: "libx265", Width: 1920, Height: 1080, Bitrate: 10_000_000}},
+		{"H.264 first, whatever the order", "av1,hevc,h264,vp9", 0, video(1920, 1080, 0, false), &VideoConversion{Codec: "h264", Encoder: "libx264", Width: 1920, Height: 1080, Bitrate: 10_000_000}},
+		{"no codec Mira encodes", "av1,vp9", 0, video(1920, 1080, 0, false), nil},
+	} {
+		if got := sizeless(ConvertVideo(test.codecs, Limits{Bitrate: test.limit, Video: test.limit}, test.video, can)); !reflect.DeepEqual(got, test.want) {
+			t.Errorf("%s: %+v, want %+v", test.name, got, test.want)
+		}
+	}
+	h264 := VideoConversion{Codec: "h264"}
+	hevc := VideoConversion{Codec: "hevc"}
+	for _, c := range []struct{ got, want string }{
+		{h264.codecString(h264.codecLevel(23.976)), "avc1.640029"}, {h264.codecString(h264.codecLevel(59.94)), "avc1.64002A"},
+		{hevc.codecString(hevc.codecLevel(59.94)), "hvc1.1.6.L123.B0"},
+	} {
+		if c.got != c.want {
+			t.Errorf("codec string %s, want %s", c.got, c.want)
+		}
+	}
+	// The level declared holds the frame and its rate: an NVIDIA GPU
+	// refuses to encode at a lower one.
+	for _, c := range []struct {
+		conversion          VideoConversion
+		rate                float64
+		level, codecsString string
+	}{
+		{VideoConversion{Codec: "h264", Width: 1920, Height: 1080}, 23.976, "4.1", "avc1.640029"},
+		{VideoConversion{Codec: "h264", Width: 1920, Height: 1080}, 50, "4.2", "avc1.64002A"},
+		{VideoConversion{Codec: "h264", Width: 1920, Height: 1080}, 120, "5.1", "avc1.640033"},
+		{VideoConversion{Codec: "h264", Width: 2586, Height: 1080}, 23.976, "5", "avc1.640032"},
+		{VideoConversion{Codec: "hevc", Width: 1920, Height: 1080}, 59.94, "4.1", "hvc1.1.6.L123.B0"},
+		{VideoConversion{Codec: "hevc", Width: 1920, Height: 1080}, 120, "5", "hvc1.1.6.L150.B0"},
+		// 4K, which only a GPU converts to.
+		{VideoConversion{Codec: "h264", Width: 3840, Height: 2160}, 23.976, "5.1", "avc1.640033"},
+		{VideoConversion{Codec: "h264", Width: 3832, Height: 1600}, 23.976, "5.1", "avc1.640033"},
+		{VideoConversion{Codec: "h264", Width: 3840, Height: 2160}, 59.94, "5.2", "avc1.640034"},
+		{VideoConversion{Codec: "h264", Width: 3840, Height: 2160}, 120, "6.1", "avc1.64003D"},
+		{VideoConversion{Codec: "hevc", Width: 3840, Height: 2160}, 23.976, "5", "hvc1.1.6.L150.B0"},
+		{VideoConversion{Codec: "hevc", Width: 3840, Height: 2160}, 59.94, "5.1", "hvc1.1.6.L153.B0"},
+	} {
+		l := c.conversion.codecLevel(c.rate)
+		if level, codecs := l.name(), c.conversion.codecString(l); level != c.level || codecs != c.codecsString {
+			t.Errorf("%dx%d %s at %v: level %s, %s; want %s, %s", c.conversion.Width, c.conversion.Height, c.conversion.Codec, c.rate, level, codecs, c.level, c.codecsString)
+		}
+	}
+}
+
+func TestVideoIsConvertedOnTheGPUThatEncodesTheCodec(t *testing.T) {
+	t.Parallel()
+	// This GPU encodes H.264 only.
+	gpu := &hls.Hardware{Method: "cuda", Encoders: []string{"h264_nvenc"}}
+	can := Capabilities{Encoders: []string{"libx264", "libx265"}, ToneMapping: true, Hardware: gpu}
+	video := MediaStream{Codec: "mpeg2video", VideoRange: "SDR", Width: new(1920), Height: new(1080)}
+	for codecs, want := range map[string]*VideoConversion{
+		"h264,hevc": {Codec: "h264", Encoder: "h264_nvenc", Width: 1920, Height: 1080, Bitrate: 10_000_000, Hardware: gpu},
+		// HEVC the app needs is encoded in software rather than H.264 on
+		// the GPU.
+		"hevc": {Codec: "hevc", Encoder: "libx265", Width: 1920, Height: 1080, Bitrate: 10_000_000},
+	} {
+		if got := sizeless(ConvertVideo(codecs, Limits{}, video, can)); !reflect.DeepEqual(got, want) {
+			t.Errorf("%s: %+v, want %+v", codecs, got, want)
+		}
+	}
+}
+
+// A GPU converts up to 4K, in the source's shape, at the bitrate of the
+// height the limit allows; the processor stops at 1080p.
+func TestTheGPUConvertsUpTo4K(t *testing.T) {
+	t.Parallel()
+	gpu := &hls.Hardware{Method: "cuda", Encoders: []string{"h264_nvenc"}}
+	can := Capabilities{Encoders: []string{"libx264", "libx265"}, ToneMapping: true, Hardware: gpu}
+	video := func(width, height int) MediaStream {
+		return MediaStream{Codec: "hevc", VideoRange: "SDR", Width: new(width), Height: new(height)}
+	}
+	on := func(width, height int, bitrate int64) *VideoConversion {
+		return &VideoConversion{Codec: "h264", Encoder: "h264_nvenc", Width: width, Height: height, Bitrate: bitrate, Hardware: gpu}
+	}
+	for _, test := range []struct {
+		name      string
+		codecs    string
+		limit     int64
+		maxHeight int
+		video     MediaStream
+		want      *VideoConversion
+	}{
+		{"4K", "h264", 0, 0, video(3840, 2160), on(3840, 2160, 40_000_000)},
+		{"a wide 4K episode", "h264", 0, 0, video(3832, 1600), on(3832, 1600, 40_000_000)},
+		{"a limit that allows 1440p", "h264", 20_000_000, 0, video(3840, 2160), peaking(on(2560, 1440, 20_000_000), 20_000_000)},
+		{"the quality cap", "h264", 0, 1080, video(3832, 1600), on(1920, 800, 10_000_000)},
+		{"HEVC, encoded in software", "hevc", 0, 0, video(3840, 2160),
+			&VideoConversion{Codec: "hevc", Encoder: "libx265", Width: 1920, Height: 1080, Bitrate: 10_000_000}},
+	} {
+		if got := sizeless(ConvertVideo(test.codecs, Limits{Bitrate: test.limit, Video: test.limit, Server: test.maxHeight}, test.video, can)); !reflect.DeepEqual(got, test.want) {
+			t.Errorf("%s: %+v, want %+v", test.name, got, test.want)
+		}
+	}
+}
+
+func TestHDRIsToneMappedOnTheGPUWithoutTheProcessorsLimits(t *testing.T) {
+	t.Parallel()
+	nvidia := &hls.Hardware{Method: "cuda", Encoders: []string{"h264_nvenc"}, ToneMapping: true}
+	vaapi := &hls.Hardware{Method: "vaapi", Device: "/dev/dri/renderD128", Encoders: []string{"h264_vaapi"}}
+	hdr10 := MediaStream{Codec: "hevc", VideoRange: "HDR", VideoRangeType: "HDR10", Width: new(3840), Height: new(2160)}
+	profile5 := MediaStream{Codec: "hevc", VideoRange: "HDR", VideoRangeType: "DOVI", Width: new(3840), Height: new(2160)}
+	for _, test := range []struct {
+		name   string
+		codecs string
+		gpu    *hls.Hardware
+		video  MediaStream
+		want   *VideoConversion
+	}{
+		{"HDR10 on a GPU that tone maps", "h264", nvidia, hdr10,
+			&VideoConversion{Codec: "h264", Encoder: "h264_nvenc", Width: 3840, Height: 2160, Bitrate: 40_000_000, ToneMap: true, Hardware: nvidia}},
+		{"Dolby Vision profile 5 on a GPU that tone maps", "h264", nvidia, profile5,
+			&VideoConversion{Codec: "h264", Encoder: "h264_nvenc", Width: 3840, Height: 2160, Bitrate: 40_000_000, ToneMap: true, Hardware: nvidia}},
+		// HEVC only: encoded in software, so tone mapped on the processor.
+		{"HDR10 encoded in software", "hevc", nvidia, hdr10,
+			&VideoConversion{Codec: "hevc", Encoder: "libx265", Width: 1280, Height: 720, Bitrate: 5_000_000, ToneMap: true}},
+		{"Dolby Vision profile 5 encoded in software", "hevc", nvidia, profile5, nil},
+		{"HDR10 on a GPU that does not tone map", "h264", vaapi, hdr10,
+			&VideoConversion{Codec: "h264", Encoder: "h264_vaapi", Width: 1280, Height: 720, Bitrate: 5_000_000, ToneMap: true, Hardware: vaapi}},
+		{"Dolby Vision profile 5 on a GPU that does not tone map", "h264", vaapi, profile5, nil},
+	} {
+		can := Capabilities{Encoders: []string{"libx264", "libx265"}, ToneMapping: true, Hardware: test.gpu}
+		if got := sizeless(ConvertVideo(test.codecs, Limits{}, test.video, can)); !reflect.DeepEqual(got, test.want) {
+			t.Errorf("%s: %+v, want %+v", test.name, got, test.want)
+		}
+	}
+}
+
+// The Jellyfin app for Android asks again with direct play turned off
+// after two playback errors within 30 seconds (#542). Jellyfin 12.4 still
+// runs the direct-play check then (StreamBuilder.GetVideoDirectPlayProfile,
+// L1392-L1426): a file that would have played as it is gets
+// DirectPlayError beside the reasons its conversion has, and one that
+// would not gets the reasons the check found. The reasons below are those
+// Jellyfin 12.4's StreamBuilder gives for the same sources and profiles,
+// with direct play off as its MediaInfoHelper turns it off (L227-L230).
+// Mira's own refusals, a disc's or a DASH channel's, skip the check as
+// before.
+func TestDirectPlayTurnedOffByTheApp(t *testing.T) {
+	t.Parallel()
+	// #542's episode: HEVC Main 10 in SDR, 960 lines, and E-AC-3 in 5.1,
+	// which the integrated player takes as it is and Chrome does not.
+	hevc := MediaSource{Container: "mkv", Bitrate: 2_306_513, Streams: []MediaStream{
+		{Type: "Video", Index: 0, Codec: "hevc", Profile: "Main 10", Level: new(120.0), BitDepth: new(10), VideoRange: "SDR", VideoRangeType: "SDR",
+			Width: new(1920), Height: new(960), AverageFrameRate: new(23.976), BitRate: new(int64(1_666_513))},
+		{Type: "Audio", Index: 1, Codec: "eac3", IsDefault: true, Channels: new(6), SampleRate: new(48000), BitRate: new(int64(640_000))},
+	}}
+	// An AVI file, whose container neither app takes.
+	avi := MediaSource{Container: "avi", Bitrate: 2_000_000, Streams: []MediaStream{
+		{Type: "Video", Index: 0, Codec: "h264", Profile: "High", Level: new(40.0), BitDepth: new(8), VideoRange: "SDR", VideoRangeType: "SDR",
+			Width: new(1280), Height: new(720), AverageFrameRate: new(25.0), BitRate: new(int64(1_800_000))},
+		{Type: "Audio", Index: 1, Codec: "aac", IsDefault: true, Channels: new(2), SampleRate: new(48000), BitRate: new(int64(192_000))},
+	}}
+	software := Capabilities{Encoders: []string{"libx264", "libx265"}}
+	byApp := Options{DirectPlayOff: true, Can: software}
+	byMira := Options{Can: software}
+	tests := []struct {
+		name, profile string
+		source        MediaSource
+		options       Options
+		reasons       []string
+		convertVideo  bool
+		off           bool
+	}{
+		{"would have played", "jellyfin-android-integrated", hevc, byApp, []string{"VideoCodecNotSupported", "DirectPlayError"}, true, true},
+		{"audio the app does not take", "jellyfin-web-chrome", hevc, byApp, []string{"AudioCodecNotSupported"}, false, false},
+		{"a container the app does not take", "jellyfin-web-chrome", avi, byApp, []string{"ContainerNotSupported"}, false, false},
+		{"a container the integrated player does not take", "jellyfin-android-integrated", avi, byApp, []string{"ContainerNotSupported"}, false, false},
+		{"a disc or a DASH channel", "jellyfin-android-integrated", hevc, byMira, []string{"VideoCodecNotSupported"}, true, false},
+		{"a disc or a DASH channel, nothing else refused", "jellyfin-web-chrome", avi, byMira, []string{"DirectPlayError"}, false, false},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			t.Parallel()
+			got := Decide(readDeviceProfile(t, test.profile), test.source, test.options)
+			if got.DirectPlay || !got.HLS || !slices.Equal(got.Reasons, test.reasons) || (got.Video != nil) != test.convertVideo ||
+				got.DirectPlayOff != test.off {
+				t.Errorf("DirectPlay %v, HLS %v, Reasons %v, Video %+v, DirectPlayOff %v; want reasons %v, video converted %v, off %v",
+					got.DirectPlay, got.HLS, got.Reasons, got.Video, got.DirectPlayOff, test.reasons, test.convertVideo, test.off)
+			}
+		})
+	}
+	// The integrated player's MPEG-TS profile takes H.264 and E-AC-3: the
+	// video is converted and the audio copied, as on Jellyfin.
+	got := Decide(readDeviceProfile(t, "jellyfin-android-integrated"), hevc, byApp)
+	if got.Transcoding == nil || got.Transcoding.Container != "ts" || got.Video == nil || got.Video.Codec != "h264" || got.Audio != nil {
+		t.Errorf("Transcoding %+v, Video %+v, Audio %+v", got.Transcoding, got.Video, got.Audio)
+	}
+}

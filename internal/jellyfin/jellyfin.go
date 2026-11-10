@@ -1,0 +1,415 @@
+// Package jellyfin serves the Jellyfin 12.4 HTTP API to Jellyfin apps.
+package jellyfin
+
+import (
+	"encoding/json"
+	"log/slog"
+	"net/http"
+	"time"
+
+	"github.com/ferforastieri/mira/internal/accounts"
+	"github.com/ferforastieri/mira/internal/activity"
+	"github.com/ferforastieri/mira/internal/audiosegments"
+	"github.com/ferforastieri/mira/internal/backup"
+	"github.com/ferforastieri/mira/internal/bandwidth"
+	"github.com/ferforastieri/mira/internal/boxset"
+	"github.com/ferforastieri/mira/internal/cache"
+	"github.com/ferforastieri/mira/internal/collections"
+	"github.com/ferforastieri/mira/internal/commercials"
+	"github.com/ferforastieri/mira/internal/homerows"
+	"github.com/ferforastieri/mira/internal/iptv"
+	"github.com/ferforastieri/mira/internal/library"
+	"github.com/ferforastieri/mira/internal/logs"
+	"github.com/ferforastieri/mira/internal/loudness"
+	"github.com/ferforastieri/mira/internal/lyrics"
+	"github.com/ferforastieri/mira/internal/mediasegments"
+	"github.com/ferforastieri/mira/internal/playback"
+	"github.com/ferforastieri/mira/internal/playlists"
+	"github.com/ferforastieri/mira/internal/plays"
+	"github.com/ferforastieri/mira/internal/preferences"
+	"github.com/ferforastieri/mira/internal/quickconnect"
+	"github.com/ferforastieri/mira/internal/recordings"
+	"github.com/ferforastieri/mira/internal/reminders"
+	"github.com/ferforastieri/mira/internal/remuxdb"
+	"github.com/ferforastieri/mira/internal/stremio"
+	"github.com/ferforastieri/mira/internal/tasks"
+	"github.com/ferforastieri/mira/internal/taste"
+	"github.com/ferforastieri/mira/internal/throttle"
+	"github.com/ferforastieri/mira/internal/thumbnails"
+	"github.com/ferforastieri/mira/internal/tmdb"
+	"github.com/ferforastieri/mira/internal/trackers"
+	"github.com/ferforastieri/mira/internal/updates"
+	"github.com/ferforastieri/mira/internal/userdata"
+	"github.com/ferforastieri/mira/internal/webtheme"
+)
+
+const (
+	// Version is the Jellyfin server version Mira reproduces.
+	Version = "12.4.0"
+	// productName identifies a Jellyfin-compatible server to apps; it is a
+	// protocol value, not a claim to be Jellyfin.
+	productName = "Jellyfin Server"
+)
+
+// Options are the dependencies of the Jellyfin API.
+type Options struct {
+	ServerID     string
+	Accounts     *accounts.Store
+	QuickConnect *quickconnect.Store
+	// SignIns throttles failed password sign-ins per client address.
+	SignIns *throttle.Failures
+	// AccountBlocked is told of the wrong password that blocked an
+	// account, with the app and address it came from, and NewDevice of a
+	// sign-in from a device the account never used; nil tells nothing.
+	AccountBlocked func(accounts.User, accounts.DeviceInfo)
+	NewDevice      func(accounts.User, accounts.Device)
+	// WebSocketPort is the port apps reach the server on.
+	WebSocketPort int
+	// Library browses the catalogs of users' addons.
+	Library *library.Service
+	// IPTV keeps the server's HDHomeRun tuners, shown as Jellyfin's tuner
+	// hosts; nil shows none.
+	IPTV *iptv.Service
+	// Stremio downloads artwork and subtitles referenced by addons.
+	Stremio *stremio.Client
+	// Playback analyzes, decides on and serves the versions of titles.
+	Playback *playback.Service
+	// Preferences stores the display preferences of Jellyfin apps and the
+	// configuration of each user.
+	Preferences *preferences.Store
+	// UserData stores what each user did with each item.
+	UserData *userdata.Store
+	// Segments finds the parts of titles apps offer to skip; nil finds
+	// none.
+	Segments *mediasegments.Service
+	// AudioSegments finds the intros and the credits of local episodes in
+	// their audio, where neither their chapters nor the databases give
+	// them; nil finds none.
+	AudioSegments *audiosegments.Service
+	// RemuxDB describes the versions not analyzed yet; nil describes none.
+	RemuxDB *remuxdb.Service
+	// Lyrics finds songs' lyrics on LRCLIB; nil finds none.
+	Lyrics *lyrics.Service
+	// TMDB searches TMDB's images for Edit images while the settings hold
+	// the server's TMDB key; nil searches the addons' images only.
+	TMDB *tmdb.Client
+	// Loudness gives the gains of music addons' songs and measures them
+	// after their first play; nil gives and measures none.
+	Loudness *loudness.Service
+	// Playlists stores the playlists users make.
+	Playlists *playlists.Store
+	// Collections stores the collections users make.
+	Collections *collections.Store
+	// HomeRows keeps the rows the web player adds to its home page (see
+	// customrows.go); nil keeps none.
+	HomeRows *homerows.Store
+	// Taste keeps the users' taste profiles, which rank Top picks for you
+	// and reorder similar titles, suggestions and movie recommendations
+	// (see taste.go); nil keeps none.
+	Taste  *taste.Service
+	Logger *slog.Logger
+	// Activity records what happens for the activity log; nil records
+	// nothing.
+	Activity *activity.Store
+	// Tasks are the server's periodic jobs, shown as Jellyfin's scheduled
+	// tasks; nil shows none.
+	Tasks *tasks.Registry
+	// Updates tells whether a new version of Mira is out, as
+	// HasUpdateAvailable; nil tells none.
+	Updates *updates.Checker
+	// Logs keeps the recent log lines administrators read; nil keeps none.
+	Logs *logs.Ring
+	// CacheDir is Mira's cache folder, which keeps the relayed images
+	// in its images folder, and SegmentsDir the folder of the segments of
+	// conversions and repackagings: with the current folder of
+	// Recordings, the folders storage information describes.
+	CacheDir    string
+	SegmentsDir string
+	// FontsDir holds the fonts apps load to render subtitles whose own
+	// fonts are missing, which also write the names of generated images;
+	// empty or missing, it offers none.
+	FontsDir string
+	// Thumbnails makes and keeps the scrubbing thumbnails and chapter
+	// images of the versions played; nil makes none.
+	Thumbnails *thumbnails.Service
+	// Recordings schedules and keeps Live TV recordings; nil, or one
+	// without a folder, records nothing.
+	Recordings *recordings.Service
+	// Commercials gives the commercial breaks found in recordings; nil
+	// gives none.
+	Commercials *commercials.Service
+	// Backups backs the database up into the folder the settings give, and
+	// restores a backup; nil, or one while backups are off, lists none.
+	Backups *backup.Service
+	// Trackers sends what users watch to the tracking services they
+	// connected; nil sends nothing.
+	Trackers *trackers.Service
+	// Plays follows the playbacks apps report, for the statistics and the
+	// notifications; nil follows none.
+	Plays *plays.Tracker
+	// SharePlayed is told of a guest's playback through a share link, at
+	// most once an hour per link; nil tells nothing.
+	SharePlayed func(accounts.ShareLink)
+	// PlayFailed is told of a play that failed: no version played on the
+	// app, a limit refused it, or its stream broke; nil tells nothing.
+	PlayFailed func(plays.Failure)
+	// Reminders keeps the users' programme reminders; nil keeps none.
+	Reminders *reminders.Service
+	// Sent counts the bytes of media sent to apps, by the playback they
+	// serve (see metered); nil counts them for the metrics only.
+	Sent *bandwidth.Meters
+	// BoxSets knows the TMDB collections of movies, whose artwork Silo's
+	// apps load through Mira (see boxsetimages.go); nil knows none.
+	BoxSets *boxset.Store
+}
+
+// Handler serves the Jellyfin API.
+type Handler struct {
+	Options
+	routes http.Handler
+	images imageCache
+	// fonts write the names of generated images, from FontsDir (see
+	// fontsFor).
+	fonts    fontsFor
+	sessions *playback.Sessions
+	// subtitleFiles remembers the subtitle files described for each item,
+	// with the user they were described for, for players that fetch them
+	// without credentials (see keptSubtitles).
+	subtitleFiles *cache.Cache[accounts.ID, listedSubtitles]
+	subtitleCache *cache.Cache[accounts.ID, subtitleText]
+	// runtimes remembers, for the reports of a playback, the runtime of
+	// the version they name (see playedRuntime).
+	runtimes *cache.Cache[string, time.Duration]
+	// configurations remembers each user's configuration, which item
+	// listings read for every title.
+	configurations *cache.Cache[accounts.ID, UserConfiguration]
+	// trackChoices remembers the tracks each user chose on titles (see
+	// trackmemory.go).
+	trackChoices *trackChoices
+	// sockets are the WebSockets apps keep open.
+	sockets *sockets
+	// syncPlay holds the groups apps watch together in.
+	syncPlay *syncPlay
+	// preparations bounds the preparations of playback made ahead of it.
+	preparations *preparations
+	// listings lists the versions of home rows' titles ahead of a play.
+	listings *listings
+	// watched are the title pages that follow their versions as addons
+	// answer (see versionsChanged).
+	watched *watchedPages
+	// searches bounds how often users have titles' addons asked again
+	// (see searchVersions).
+	searches versionSearches
+	// starts are the plays whose torrents' starts the web client tells
+	// (see startprogress.go).
+	starts starts
+	// customCss hashes the Custom theme's CSS, for the address the web
+	// client loads it from (see brandingCss).
+	customCss webtheme.Hasher
+	// now tells the time users' allowed hours and the home rows' schedules
+	// are checked against.
+	now func() time.Time
+	// newKeys remembers the API keys made from Jellyfin apps until a
+	// listing shows them.
+	newKeys newKeys
+	// viewing remembers the item each device last reported showing.
+	viewing *cache.Cache[accounts.ID, accounts.ID]
+	// reasons remembers why each play session streamed over HLS, Jellyfin's
+	// TranscodeReasons, for the admin dashboard.
+	reasons *cache.Cache[string, []string]
+	// sizes remembers what set the size of the video each play session
+	// converts, for the admin dashboard.
+	sizes *cache.Cache[string, playback.ConversionSize]
+	// qualities remembers the heights of the qualities the master playlist
+	// of each play session offers, when it offers several, for the admin
+	// dashboard.
+	qualities *cache.Cache[string, []int]
+	// transcodings remembers what each play session was last sent, for
+	// /Sessions between its encodings (see transcodingInfo).
+	transcodings *cache.Cache[string, TranscodingInfo]
+	// plays remembers each device's last PlaybackInfo profile and bitrate,
+	// which item details name versions for (see detailsNamer).
+	plays *cache.Cache[accounts.ID, devicePlay]
+	// scripted are the devices whose web player runs Mira's script, as
+	// they read the user's sound (see boostRelay).
+	scripted *cache.Cache[accounts.ID, struct{}]
+	// guests are the playbacks of guests through share links (see
+	// share.go).
+	guests *guestPlays
+	// downloads are the converted downloads under way (see
+	// converteddownloads.go).
+	downloads *downloadPlays
+	// dlna are the playbacks of DLNA devices (see dlna.go).
+	dlna *dlnaPlays
+	// torrents are the torrents devices last played (see torrentswitch.go).
+	torrents *torrentPlays
+	// chosen is the version each device's last PlaybackInfo chose.
+	chosen *chosenVersions
+	// titles are the play sessions devices reported for the title they
+	// play (see leftplayback.go).
+	titles *titleSessions
+	// decisions are the last plays of each title, what each tried and
+	// chose, for the admin app's Versions page (see playdecisions.go).
+	decisions *playDecisions
+	// draws are the orders listings of libraries' titles at random drew,
+	// kept for drawLife (see randomLibraryListing).
+	draws *cache.Cache[drawKey, draw]
+}
+
+// New returns the Jellyfin API handler.
+func New(options Options) *Handler {
+	h := &Handler{
+		Options:        options,
+		subtitleFiles:  cache.New[accounts.ID, listedSubtitles](5000, 12*time.Hour).Sized(16<<20, cache.JSONSize),
+		subtitleCache:  cache.New[accounts.ID, subtitleText](200, time.Hour).Sized(32<<20, subtitleText.size),
+		runtimes:       cache.New[string, time.Duration](2000, 12*time.Hour),
+		configurations: cache.New[accounts.ID, UserConfiguration](1000, 12*time.Hour),
+		trackChoices:   newTrackChoices(),
+		sockets:        newSockets(),
+		preparations:   newPreparations(options.Logger),
+		watched:        newWatchedPages(),
+		now:            time.Now,
+		viewing:        cache.New[accounts.ID, accounts.ID](5000, 12*time.Hour),
+		reasons:        cache.New[string, []string](2000, 12*time.Hour),
+		sizes:          cache.New[string, playback.ConversionSize](2000, 12*time.Hour),
+		qualities:      cache.New[string, []int](2000, 12*time.Hour),
+		transcodings:   cache.New[string, TranscodingInfo](2000, 12*time.Hour),
+		plays:          cache.New[accounts.ID, devicePlay](1000, 30*24*time.Hour),
+		scripted:       cache.New[accounts.ID, struct{}](1000, 30*24*time.Hour),
+		guests:         newGuestPlays(),
+		downloads:      newDownloadPlays(),
+		dlna:           newDLNAPlays(),
+		torrents:       newTorrentPlays(),
+		chosen:         newChosenVersions(),
+		titles:         newTitleSessions(),
+		decisions:      newPlayDecisions(),
+	}
+	// Sessions read the handler's clock, which tests set.
+	h.sessions = playback.NewSessions(func() time.Time { return h.now() })
+	// So do the draws of listings at random, which hold the titles drawn.
+	h.draws = cache.NewLasting[drawKey, draw](1000, func() time.Duration { return drawLife }, func() time.Time { return h.now() }).
+		Sized(64<<20, func(d draw) int { return cache.JSONSize(d.items) })
+	h.syncPlay = newSyncPlay(h.canPlay, h.writeSyncPlay, options.Logger)
+	h.listings = newListings(h.listVersions)
+	if options.Library != nil {
+		options.Library.OnVersionsChanged(h.versionsChanged)
+		options.Library.OnFirstPagesRead(h.warmPosters)
+	}
+	if options.Playback != nil {
+		options.Playback.OnAnalyzed(func(version library.Version) { h.tracksChanged(version.Item) })
+	}
+	options.RemuxDB.OnDescribed(func(versions []library.Version) {
+		for _, version := range versions {
+			h.tracksChanged(version.Item)
+		}
+	})
+	options.Accounts.OnSignOut(h.signedOut)
+	if options.Thumbnails != nil {
+		options.Thumbnails.WatchPlaybacks(h.thumbnailPlaybacks)
+	}
+	rt := &router{unmatched: newUnmatchedRequests(options.Logger)}
+	anonymous := func(method, pattern string, handler http.HandlerFunc) { rt.handle(method, pattern, handler) }
+	signedIn := func(method, pattern string, handler http.HandlerFunc) {
+		rt.handle(method, pattern, h.authenticated(handler))
+	}
+	// Like Jellyfin, these answer a user outside their allowed hours too.
+	signedInAnyHour := func(method, pattern string, handler http.HandlerFunc) {
+		rt.handle(method, pattern, h.authenticatedAnyHour(handler))
+	}
+
+	anonymous(http.MethodGet, "/System/Info/Public", h.publicSystemInfo)
+	signedInAnyHour(http.MethodGet, "/System/Info", h.systemInfo)
+	signedIn(http.MethodGet, "/System/Configuration/{key}", h.namedConfiguration)
+	anonymous(http.MethodGet, "/System/Ping", h.ping)
+	anonymous(http.MethodPost, "/System/Ping", h.ping)
+
+	anonymous(http.MethodGet, "/Branding/Configuration", h.brandingConfiguration)
+	anonymous(http.MethodGet, "/Branding/Css", h.brandingCSS)
+	anonymous(http.MethodGet, "/Branding/Css.css", h.brandingCSS)
+	signedIn(http.MethodGet, "/Mira/WebTheme", h.webTheme)
+
+	anonymous(http.MethodGet, "/Users/Public", h.publicUsers)
+	anonymous(http.MethodPost, "/Users/AuthenticateByName", h.authenticateByName)
+	anonymous(http.MethodPost, "/Users/AuthenticateWithQuickConnect", h.authenticateWithQuickConnect)
+	signedIn(http.MethodGet, "/Users/Me", h.currentUser)
+	signedIn(http.MethodGet, "/Users", h.users)
+	signedInAnyHour(http.MethodGet, "/Users/{userId}", h.user)
+	signedIn(http.MethodPost, "/Users/Password", h.changePassword)
+	signedIn(http.MethodPost, "/Users/{userId}/Password", h.changePassword)
+	signedIn(http.MethodPost, "/Users/{userId}/Policy", h.updatePolicy)
+
+	anonymous(http.MethodGet, "/QuickConnect/Enabled", h.quickConnectEnabled)
+	anonymous(http.MethodPost, "/QuickConnect/Initiate", h.quickConnectInitiate)
+	anonymous(http.MethodGet, "/QuickConnect/Connect", h.quickConnectConnect)
+	signedIn(http.MethodPost, "/QuickConnect/Authorize", h.quickConnectAuthorize)
+
+	signedIn(http.MethodPost, "/Sessions/Logout", h.logout)
+	signedIn(http.MethodPost, "/Sessions/Capabilities", h.capabilities)
+	signedIn(http.MethodPost, "/Sessions/Capabilities/Full", h.fullCapabilities)
+
+	h.browseRoutes(rt)
+	h.musicRoutes(rt)
+	h.audioRoutes(rt)
+	h.personRoutes(rt)
+	h.auxiliaryRoutes(rt)
+	h.extrasRoutes(rt)
+	h.liveTvRoutes(rt)
+	h.playbackRoutes(rt)
+	h.userDataRoutes(rt)
+	h.remoteSubtitleRoutes(rt)
+	h.remoteRoutes(rt)
+	h.configurationRoutes(rt)
+	h.localizationRoutes(rt)
+	signedIn(http.MethodGet, "/MediaSegments/{itemId}", h.mediaSegments)
+	signedIn(http.MethodGet, "/Mira/MediaSegments/{itemId}", h.segmentOrigins)
+	h.playlistRoutes(rt)
+	h.syncPlayRoutes(rt)
+	h.collectionRoutes(rt)
+	h.administrationRoutes(rt)
+	h.userImageRoutes(rt)
+	h.appRoutes(rt)
+	h.subtitleUploadRoutes(rt)
+	h.absentRoutes(rt)
+	h.backupRoutes(rt)
+	h.metadataRoutes(rt)
+	h.rootRoutes(rt)
+	h.boxSetImageRoutes(rt)
+	signedIn(http.MethodGet, "/Videos/{itemId}/Trickplay/{width}/{file}", h.trickplayFile)
+	signedIn(http.MethodGet, "/Mira/Items/{itemId}/Share", h.mayShare)
+	h.soundRoutes(signedIn)
+
+	h.routes = cors(rt)
+	return h
+}
+
+func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
+	if isSocket(r) {
+		h.socket(w, r)
+		return
+	}
+	h.routes.ServeHTTP(w, r)
+}
+
+func writeJSON(w http.ResponseWriter, status int, body any) {
+	w.Header().Set("Content-Type", "application/json; charset=utf-8")
+	w.WriteHeader(status)
+	_ = json.NewEncoder(w).Encode(body)
+}
+
+// processingError answers like Jellyfin's exception middleware.
+func processingError(w http.ResponseWriter, status int) {
+	w.Header().Set("Content-Type", "text/plain")
+	w.WriteHeader(status)
+	_, _ = w.Write([]byte("Error processing request."))
+}
+
+func (h *Handler) internalError(w http.ResponseWriter, r *http.Request, err error) {
+	// An app that stops waiting cancels its request: nothing failed, and
+	// nobody reads the answer.
+	if r.Context().Err() != nil {
+		h.Logger.Debug("An app abandoned a Jellyfin API request", "method", r.Method, "path", r.URL.Path)
+		return
+	}
+	h.Logger.Error("Jellyfin API request failed", "method", r.Method, "path", r.URL.Path, "error", err)
+	processingError(w, http.StatusInternalServerError)
+}

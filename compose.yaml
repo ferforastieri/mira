@@ -1,0 +1,63 @@
+name: mira
+
+# Set POSTGRES_PASSWORD in .env (see .env.example). Everything else is set
+# in the admin app, under Settings.
+
+services:
+  postgres:
+    image: postgres:18.6@sha256:5a5a84b19854a9ffaa54082c166ff4ec27473a361e496e5ea167f298f2da9722
+    environment:
+      POSTGRES_USER: mira
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?Set POSTGRES_PASSWORD in .env}
+    # Light settings: about 60 MiB under load rather than 230, as fast for
+    # Mira, whose pool keeps within max_connections (see "A light
+    # PostgreSQL" in docs/installation.md).
+    command: >-
+      postgres
+      -c shared_buffers=32MB
+      -c max_connections=20
+      -c max_locks_per_transaction=512
+      -c max_worker_processes=2
+      -c max_parallel_workers=0
+      -c autovacuum_max_workers=1
+      -c max_wal_size=256MB
+      -c jit=off
+    # PostgreSQL 18 keeps its versioned data directory below this path.
+    volumes:
+      - postgres_data:/var/lib/postgresql
+    stop_grace_period: 1m
+    restart: unless-stopped
+
+  mira:
+    image: ghcr.io/ferforastieri/mira:latest
+    environment:
+      MIRA_DATABASE_URL: postgresql://mira:${POSTGRES_PASSWORD:?Set POSTGRES_PASSWORD in .env}@postgres:5432/mira
+      # Encrypts the keys and tokens Mira stores, optional but advised:
+      # set it in .env, and keep it, or they have to be entered again.
+      MIRA_SECRET_KEY: ${MIRA_SECRET_KEY:-}
+    # The cache, and by default the recordings and backups.
+    volumes:
+      - mira_data:/data
+      # Folders of your own videos, read-only, then added under Sources as
+      # local folders (see docs/local-folders.md); user 65532 must read them.
+      # - /srv/media/movies:/media/movies:ro
+      # - /srv/media/shows:/media/shows:ro
+    # Reachable on the LAN: TVs and phones connect to it directly.
+    ports:
+      - "8096:8096"
+      # Local network discovery. Docker Desktop forwards the broadcasts
+      # Jellyfin apps send here; Docker Engine on Linux does not: use
+      # compose.host.yaml there (see docs/installation.md).
+      - "7359:7359/udp"
+    depends_on:
+      - postgres
+    read_only: true
+    security_opt:
+      - no-new-privileges:true
+    cap_drop:
+      - ALL
+    restart: unless-stopped
+
+volumes:
+  postgres_data:
+  mira_data:

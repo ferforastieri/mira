@@ -1,0 +1,499 @@
+package stremio
+
+import (
+	"bytes"
+	"context"
+	"encoding/json"
+	"errors"
+	"fmt"
+	"io"
+	"maps"
+	"net"
+	"net/http"
+	"net/netip"
+	"net/url"
+	"regexp"
+	"strconv"
+	"strings"
+	"syscall"
+	"time"
+	"unicode"
+	"unicode/utf8"
+
+	"github.com/ferforastieri/mira/internal/logs"
+)
+
+const (
+	// requestTimeout bounds a request for a manifest, a catalog page, a
+	// description, subtitles or artwork, and StreamTimeout a request for
+	// streams: an addon gathering other addons' streams answers once the
+	// slowest of them answered or its own limit for them ran out, often
+	// 15 seconds itself.
+	requestTimeout = 15 * time.Second
+	StreamTimeout  = 30 * time.Second
+	// Large configurations list hundreds of catalogs with their options.
+	maxResponseBytes = 8 << 20
+	maxRedirects     = 5
+)
+
+var (
+	// ErrUnreachable reports an addon that could not be reached or answered
+	// with an HTTP error.
+	ErrUnreachable = errors.New("addon unreachable")
+	// ErrPrivateNetwork reports a request to a local network address from a
+	// client that may only reach public addresses.
+	ErrPrivateNetwork = errors.New("addresses on local networks are not allowed")
+	// ErrInvalidResponse reports a resource response that is not valid JSON
+	// of the expected form.
+	ErrInvalidResponse = errors.New("invalid addon response")
+	// ErrNotFound reports a resource the addon does not have.
+	ErrNotFound = errors.New("not found by the addon")
+)
+
+// Client fetches addon resources. Requests made on behalf of untrusted users
+// are confined to public internet addresses, checked when connecting so that
+// DNS answers and redirects cannot point them at the local network.
+type Client struct {
+	userAgent string
+	trusted   *http.Client
+	confined  *http.Client
+	health    healthRecords
+	// timeout and streamTimeout are requestTimeout and StreamTimeout but
+	// in tests (see SetTimeouts).
+	timeout, streamTimeout time.Duration
+}
+
+// NewClient returns a client identifying itself with the Mira version.
+func NewClient(version string) *Client {
+	return &Client{
+		userAgent:     "Mira/" + version,
+		trusted:       newHTTPClient(false),
+		confined:      newHTTPClient(true),
+		health:        healthRecords{byAddon: map[string]*Health{}},
+		timeout:       requestTimeout,
+		streamTimeout: StreamTimeout,
+	}
+}
+
+// SetTimeouts replaces, before the client is used, how long a request is
+// given, and a request for streams. Tests shorten them; the server keeps
+// requestTimeout and StreamTimeout.
+func (c *Client) SetTimeouts(request, streams time.Duration) {
+	c.timeout, c.streamTimeout = request, streams
+}
+
+// idleConnsPerHost is how many idle connections are kept to each host:
+// listings ask an addon for up to 16 catalogs or 8 pages at once, and
+// home screens a burst of posters from one artwork server, which would
+// otherwise open new connections, with TLS handshakes, at each wave.
+const idleConnsPerHost = 32
+
+// HTTPClient returns an HTTP client following the rules of addon requests:
+// confined, it reaches public addresses only, checked when connecting so
+// that DNS answers and redirects cannot point it at the local network.
+// Other features sending requests on behalf of users use it.
+func HTTPClient(confined bool) *http.Client {
+	return newHTTPClient(confined)
+}
+
+func newHTTPClient(confined bool) *http.Client {
+	dialer := &net.Dialer{Timeout: 10 * time.Second}
+	transport := http.DefaultTransport.(*http.Transport).Clone()
+	transport.MaxIdleConnsPerHost = idleConnsPerHost
+	if confined {
+		dialer.Control = func(_, address string, _ syscall.RawConn) error {
+			host, _, err := net.SplitHostPort(address)
+			if err != nil {
+				return err
+			}
+			ip, err := netip.ParseAddr(host)
+			if err != nil || !Public(ip) {
+				return ErrPrivateNetwork
+			}
+			return nil
+		}
+		// A proxy would be the address checked instead of the addon.
+		transport.Proxy = nil
+	}
+	transport.DialContext = dialer.DialContext
+	return &http.Client{
+		Transport: transport,
+		CheckRedirect: func(_ *http.Request, via []*http.Request) error {
+			if len(via) >= maxRedirects {
+				return errors.New("too many redirects")
+			}
+			return nil
+		},
+	}
+}
+
+// cgnat is the shared address space of carrier-grade NAT, not reachable
+// from the internet.
+var cgnat = netip.MustParsePrefix("100.64.0.0/10")
+
+// Public reports whether ip is an address on the internet, which confined
+// requests may reach: not loopback, link-local, private, nor in the shared
+// address space of carrier-grade NAT.
+func Public(ip netip.Addr) bool {
+	ip = ip.Unmap()
+	return ip.IsGlobalUnicast() && !ip.IsPrivate() && !cgnat.Contains(ip)
+}
+
+// CheckPublic reports ErrPrivateNetwork when host is, or resolves to, an
+// address on a local network, which confined requests may not reach. A
+// host that does not resolve is not refused: confined requests check the
+// address they connect to anyway.
+func CheckPublic(ctx context.Context, host string) error {
+	if ip, err := netip.ParseAddr(host); err == nil {
+		if !Public(ip) {
+			return ErrPrivateNetwork
+		}
+		return nil
+	}
+	ips, err := net.DefaultResolver.LookupNetIP(ctx, "ip", host)
+	if err != nil {
+		return nil
+	}
+	for _, ip := range ips {
+		if !Public(ip) {
+			return ErrPrivateNetwork
+		}
+	}
+	return nil
+}
+
+// do sends a request with the client allowed for it. Errors never contain
+// the URL, which usually carries credentials.
+func (c *Client) do(request *http.Request, confined bool) (*http.Response, error) {
+	client := c.trusted
+	if confined {
+		client = c.confined
+	}
+	response, err := client.Do(request)
+	if err != nil {
+		var urlErr *url.Error
+		if errors.As(err, &urlErr) {
+			err = urlErr.Err
+		}
+		if errors.Is(err, ErrPrivateNetwork) {
+			return nil, ErrPrivateNetwork
+		}
+		return nil, fmt.Errorf("%w: %w", ErrUnreachable, err)
+	}
+	return response, nil
+}
+
+// get downloads a resource of the addon manifestURL installs, within
+// timeout, and records how its answer went (see Health).
+func (c *Client) get(ctx context.Context, manifestURL, target string, confined bool, timeout time.Duration) ([]byte, error) {
+	ctx, cancel := context.WithTimeout(ctx, timeout)
+	defer cancel()
+	request, err := http.NewRequestWithContext(ctx, http.MethodGet, target, nil)
+	if err != nil {
+		return nil, fmt.Errorf("%w: invalid URL", ErrUnreachable)
+	}
+	request.Header.Set("Accept", "application/json")
+	request.Header.Set("User-Agent", c.userAgent)
+	started := time.Now()
+	response, err := c.do(request, confined)
+	if err != nil {
+		c.health.record(ctx, manifestURL, target, started, failureOf(ctx, err))
+		return nil, err
+	}
+	defer response.Body.Close()
+	if response.StatusCode != http.StatusOK {
+		// An addon asks to wait with a 429, or with a 503 that says how
+		// long (Retry-After), as IPTV providers do (see iptv.RateLimited).
+		wait, waits := parseRetryAfter(response.Header.Get("Retry-After"), time.Now())
+		waits = waits && (response.StatusCode == http.StatusTooManyRequests || response.StatusCode == http.StatusServiceUnavailable)
+		failure := failureOfStatus(response.StatusCode)
+		if waits {
+			failure = FailureRateLimited
+		}
+		c.health.record(ctx, manifestURL, target, started, failure)
+		answer := answered{status: httpStatus(response.StatusCode), wait: wait, waits: waits}
+		if answer.refused() {
+			answer.reason = refusalReason(response)
+		}
+		return nil, answer
+	}
+	body, err := io.ReadAll(io.LimitReader(response.Body, maxResponseBytes+1))
+	if err != nil {
+		c.health.record(ctx, manifestURL, target, started, failureOf(ctx, err))
+		return nil, fmt.Errorf("%w: %w", ErrUnreachable, err)
+	}
+	if len(body) > maxResponseBytes {
+		c.health.record(ctx, manifestURL, target, started, FailureInvalidResponse)
+		return nil, fmt.Errorf("%w: response larger than %d bytes", ErrInvalidResponse, maxResponseBytes)
+	}
+	c.health.record(ctx, manifestURL, target, started, "")
+	return body, nil
+}
+
+// httpStatus is the status of an answer that is not a success.
+type httpStatus int
+
+func (s httpStatus) Error() string { return fmt.Sprintf("HTTP %d", int(s)) }
+
+// answered is the error of an addon's answer that is not a success. It is
+// ErrUnreachable to its callers, as no resource came of it, with its status
+// for StatusOf and, when the addon asked to wait, the wait for RetryAfter.
+// Its text tells what the addon answered, as Health names it, rather than
+// calling an addon that answered unreachable, and the reason the addon gave
+// for a refusal.
+type answered struct {
+	status httpStatus
+	wait   retryAfter
+	waits  bool
+	reason string
+}
+
+// refused reports an answer refusing the request: an HTTP error of the
+// client's but "not found" and "too many requests".
+func (a answered) refused() bool {
+	status := int(a.status)
+	return status >= 400 && status < 500 && status != http.StatusNotFound && status != http.StatusTooManyRequests
+}
+
+func (a answered) Error() string {
+	status := int(a.status)
+	switch {
+	case a.waits:
+		return fmt.Sprintf("addon asked to wait: %v, %v", a.status, a.wait)
+	case status == http.StatusTooManyRequests:
+		return fmt.Sprintf("addon asked to slow down: %v", a.status)
+	case status >= 500:
+		return fmt.Sprintf("addon failed: %v", a.status)
+	case a.refused() && a.reason != "":
+		return fmt.Sprintf("addon refused the request: %v (%s)", a.status, a.reason)
+	case a.refused():
+		return fmt.Sprintf("addon refused the request: %v", a.status)
+	}
+	return fmt.Sprintf("addon answered %v", a.status)
+}
+
+const (
+	// maxReasonBytes bounds what is read of a refusal's body.
+	maxReasonBytes = 4 << 10
+	// maxReasonLength bounds the reason a refusal gives, in characters.
+	maxReasonLength = 120
+)
+
+var (
+	// reasonAddresses matches URLs of any scheme in a refusal's reason.
+	reasonAddresses = regexp.MustCompile(`(?i)\b[a-z][a-z0-9+.\-]*://\S+`)
+	// reasonWords matches runs of characters that tokens and keys are made
+	// of; those long enough and holding a digit are taken for one.
+	reasonWords = regexp.MustCompile(`[A-Za-z0-9_\-.~+/=]{16,}`)
+)
+
+// refusalReason is the reason the body of a refusal gives: the "error" or
+// "message" of a JSON answer, or a short text, on one line, cut to
+// maxReasonLength, with what looks like an address, a token or a key
+// redacted, as the reason may repeat the request. It is empty when the
+// body gives none.
+func refusalReason(response *http.Response) string {
+	body, err := io.ReadAll(io.LimitReader(response.Body, maxReasonBytes+1))
+	if err != nil || len(body) == 0 {
+		return ""
+	}
+	var reason string
+	var fields struct {
+		Error   json.RawMessage `json:"error"`
+		Message json.RawMessage `json:"message"`
+	}
+	if json.Valid(body) {
+		if json.Unmarshal(body, &fields) != nil {
+			return ""
+		}
+		// An error may be an object with its own message.
+		var nested struct {
+			Message string `json:"message"`
+		}
+		switch {
+		case json.Unmarshal(fields.Error, &reason) == nil && strings.TrimSpace(reason) != "":
+		case json.Unmarshal(fields.Error, &nested) == nil && strings.TrimSpace(nested.Message) != "":
+			reason = nested.Message
+		case json.Unmarshal(fields.Message, &reason) == nil:
+		}
+	} else {
+		// A page, or a body too long to be a reason, says nothing short.
+		media, _, _ := strings.Cut(response.Header.Get("Content-Type"), ";")
+		media = strings.ToLower(strings.TrimSpace(media))
+		if len(body) > maxReasonBytes || (media != "text/plain" && media != "") || !utf8.Valid(body) {
+			return ""
+		}
+		reason = string(body)
+	}
+	reason = strings.Join(strings.Fields(strings.Map(func(r rune) rune {
+		if unicode.IsControl(r) || !unicode.IsPrint(r) {
+			return ' '
+		}
+		return r
+	}, reason)), " ")
+	reason = reasonAddresses.ReplaceAllString(reason, "<redacted>")
+	reason = reasonWords.ReplaceAllStringFunc(reason, func(word string) string {
+		if strings.ContainsAny(word, "0123456789") {
+			return "<redacted>"
+		}
+		return word
+	})
+	reason = logs.Redact(reason)
+	if runes := []rune(reason); len(runes) > maxReasonLength {
+		reason = strings.TrimSpace(string(runes[:maxReasonLength-1])) + "…"
+	}
+	return reason
+}
+
+func (a answered) Unwrap() []error {
+	if a.waits {
+		return []error{ErrUnreachable, a.status, a.wait}
+	}
+	return []error{ErrUnreachable, a.status}
+}
+
+// StatusOf returns the HTTP status of an answer that was not a success,
+// 0 when err is not one.
+func StatusOf(err error) int {
+	status, _ := errors.AsType[httpStatus](err)
+	return int(status)
+}
+
+// retryAfter is how long an addon that answered 429, or 503 with
+// Retry-After, asked to wait before it is asked again.
+type retryAfter time.Duration
+
+func (r retryAfter) Error() string { return "retry after " + time.Duration(r).String() }
+
+// RetryAfter returns how long the addon whose answer err is asked to wait,
+// by the Retry-After of its 429 or 503, or as long as is left of a wait
+// it asked for earlier (see AskedToWait); false when it did not say.
+func RetryAfter(err error) (time.Duration, bool) {
+	wait, ok := errors.AsType[retryAfter](err)
+	return time.Duration(wait), ok
+}
+
+// ErrAskedToWait reports a request that was not sent: the addon asked to
+// wait, and the wait has not ended.
+var ErrAskedToWait = errors.New("not asked: the addon asked to wait")
+
+// AskedToWait is the error of a request not sent to an addon that asked
+// to wait, with left of the wait to go: ErrAskedToWait, and left for
+// RetryAfter.
+func AskedToWait(left time.Duration) error {
+	return fmt.Errorf("%w, %w", ErrAskedToWait, retryAfter(left))
+}
+
+// parseRetryAfter reads a Retry-After header, in seconds or as a date, as
+// of now: a date past is no wait.
+func parseRetryAfter(value string, now time.Time) (retryAfter, bool) {
+	value = strings.TrimSpace(value)
+	if value == "" {
+		return 0, false
+	}
+	if seconds, err := strconv.Atoi(value); err == nil {
+		return retryAfter(time.Duration(max(seconds, 0)) * time.Second), true
+	}
+	if date, err := http.ParseTime(value); err == nil {
+		return retryAfter(max(date.Sub(now), 0)), true
+	}
+	return 0, false
+}
+
+// Fetch downloads a resource of an addon of another protocol than
+// Stremio's, through the same rules: bounded, confined when asked, its URL
+// kept out of errors, its outcome counted in the health of the addon of
+// manifestURL. An answer 404 is ErrNotFound.
+func (c *Client) Fetch(ctx context.Context, manifestURL, target string, confined bool) ([]byte, error) {
+	body, err := c.get(ctx, manifestURL, target, confined, c.timeout)
+	if status, ok := errors.AsType[httpStatus](err); ok && status == http.StatusNotFound {
+		return nil, fmt.Errorf("%w: HTTP 404", ErrNotFound)
+	}
+	return body, err
+}
+
+// Open requests a file an addon points to, a stream or a subtitle, to relay
+// it: header is sent as given (byte ranges, the stream's own headers) and
+// the response is returned whatever its status, its body to be closed by
+// the caller.
+func (c *Client) Open(ctx context.Context, method, target string, header http.Header, confined bool) (*http.Response, error) {
+	request, err := http.NewRequestWithContext(ctx, method, target, nil)
+	if err != nil || (request.URL.Scheme != "https" && request.URL.Scheme != "http") {
+		return nil, fmt.Errorf("%w: invalid URL", ErrUnreachable)
+	}
+	maps.Copy(request.Header, header)
+	if request.Header.Get("User-Agent") == "" {
+		request.Header.Set("User-Agent", c.userAgent)
+	}
+	// Byte ranges and lengths must reach the player unchanged.
+	request.Header.Set("Accept-Encoding", "identity")
+	return c.do(request, confined)
+}
+
+// Post sends body to an address a stream needs, as a ClearKey licence
+// request goes to its licence server, through the same rules as Open:
+// header is sent as given, and the response is returned whatever its
+// status, its body to be closed by the caller.
+func (c *Client) Post(ctx context.Context, target string, header http.Header, body []byte, confined bool) (*http.Response, error) {
+	request, err := http.NewRequestWithContext(ctx, http.MethodPost, target, bytes.NewReader(body))
+	if err != nil || (request.URL.Scheme != "https" && request.URL.Scheme != "http") {
+		return nil, fmt.Errorf("%w: invalid URL", ErrUnreachable)
+	}
+	maps.Copy(request.Header, header)
+	if request.Header.Get("User-Agent") == "" {
+		request.Header.Set("User-Agent", c.userAgent)
+	}
+	return c.do(request, confined)
+}
+
+// Manifest downloads and validates an addon manifest. confined restricts
+// the request to public addresses.
+func (c *Client) Manifest(ctx context.Context, manifestURL string, confined bool) (Manifest, error) {
+	body, err := c.get(ctx, manifestURL, manifestURL, confined, c.timeout)
+	if errors.Is(err, ErrInvalidResponse) {
+		return Manifest{}, fmt.Errorf("%w: %v", ErrInvalidManifest, err)
+	}
+	if err != nil {
+		return Manifest{}, err
+	}
+	return ParseManifest(body)
+}
+
+// maxImageBytes bounds artwork downloads.
+const maxImageBytes = 15 << 20
+
+// Image downloads artwork referenced by an addon. Only image responses are
+// accepted, so an addon cannot make the server relay arbitrary content. An
+// artwork server that answers 429, or 503, with a Retry-After asks to wait
+// that long, which RetryAfter reads from the error.
+func (c *Client) Image(ctx context.Context, target string, confined bool) ([]byte, string, error) {
+	ctx, cancel := context.WithTimeout(ctx, c.timeout)
+	defer cancel()
+	request, err := http.NewRequestWithContext(ctx, http.MethodGet, target, nil)
+	if err != nil || (request.URL.Scheme != "https" && request.URL.Scheme != "http") {
+		return nil, "", fmt.Errorf("%w: invalid image URL", ErrUnreachable)
+	}
+	request.Header.Set("Accept", "image/*")
+	request.Header.Set("User-Agent", c.userAgent)
+	response, err := c.do(request, confined)
+	if err != nil {
+		return nil, "", err
+	}
+	defer response.Body.Close()
+	contentType := response.Header.Get("Content-Type")
+	if response.StatusCode != http.StatusOK || !strings.HasPrefix(contentType, "image/") {
+		wait, waits := parseRetryAfter(response.Header.Get("Retry-After"), time.Now())
+		if waits && (response.StatusCode == http.StatusTooManyRequests || response.StatusCode == http.StatusServiceUnavailable) {
+			return nil, "", fmt.Errorf("%w: %w %s, %w", ErrUnreachable, httpStatus(response.StatusCode), contentType, wait)
+		}
+		return nil, "", fmt.Errorf("%w: %w %s", ErrUnreachable, httpStatus(response.StatusCode), contentType)
+	}
+	body, err := io.ReadAll(io.LimitReader(response.Body, maxImageBytes+1))
+	if err != nil {
+		return nil, "", fmt.Errorf("%w: %w", ErrUnreachable, err)
+	}
+	if len(body) > maxImageBytes {
+		return nil, "", fmt.Errorf("%w: image larger than %d bytes", ErrInvalidResponse, maxImageBytes)
+	}
+	return body, contentType, nil
+}

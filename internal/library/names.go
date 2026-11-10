@@ -1,0 +1,227 @@
+package library
+
+import (
+	"strconv"
+	"strings"
+
+	"github.com/ferforastieri/mira/internal/addons"
+	"github.com/ferforastieri/mira/internal/eclipse"
+)
+
+// words are the names Mira generates, in one server language.
+type words struct {
+	season   string // followed by the season number
+	specials string // season 0
+	episode  string // followed by the episode number, for untitled episodes
+	// otherEpisodes names the season of an episode order that holds the
+	// episodes it leaves out (see episodeorder.go).
+	otherEpisodes string
+	video         string // followed by the video's number, for untitled videos of a folder
+	chapter       string // followed by the chapter number, for untitled chapters
+	movies        string
+	shows         string
+	videos        string
+	collections   string
+	// The content of music rows: songs, albums, artists and playlists.
+	songs, albums, artists, playlists string
+	// myMusic names a music addon's My music (see eclipse.MyMusic).
+	myMusic string
+	// replay names the Replay view (see ReplayViewID).
+	replay string
+	// watchlist names a watchlist that keeps its default name (see
+	// WatchlistName).
+	watchlist string
+	// homeRelease tells, given the day, when a movie waiting for its
+	// digital release is out at home (see releases.go).
+	homeRelease string
+	// language is the language of the words, one of i18n.Languages.
+	language string
+}
+
+var vocabulary = map[string]words{
+	"en": {season: "Season", specials: "Specials", episode: "Episode", otherEpisodes: "Other episodes", video: "Video", chapter: "Chapter",
+		movies: "Movies", shows: "Shows", videos: "Videos", collections: "Collections",
+		songs: "Songs", albums: "Albums", artists: "Artists", playlists: "Playlists", myMusic: "My music", replay: "Replay",
+		watchlist: "Watchlist", homeRelease: "Out at home on %s."},
+	"fr": {season: "Saison", specials: "Épisodes spéciaux", episode: "Épisode", otherEpisodes: "Autres épisodes", video: "Vidéo", chapter: "Chapitre",
+		movies: "Films", shows: "Séries", videos: "Vidéos", collections: "Collections",
+		songs: "Titres", albums: "Albums", artists: "Artistes", playlists: "Listes de lecture", myMusic: "Ma musique", replay: "Replay",
+		watchlist: "À regarder", homeRelease: "Sortie en vidéo le %s."},
+	"de": {season: "Staffel", specials: "Specials", episode: "Folge", otherEpisodes: "Weitere Folgen", video: "Video", chapter: "Kapitel",
+		movies: "Filme", shows: "Serien", videos: "Videos", collections: "Sammlungen",
+		songs: "Titel", albums: "Alben", artists: "Künstler", playlists: "Wiedergabelisten", myMusic: "Meine Musik", replay: "Replay",
+		watchlist: "Merkliste", homeRelease: "Fürs Heimkino ab %s."},
+	"es": {season: "Temporada", specials: "Especiales", episode: "Episodio", otherEpisodes: "Otros episodios", video: "Vídeo", chapter: "Capítulo",
+		movies: "Películas", shows: "Series", videos: "Vídeos", collections: "Colecciones",
+		songs: "Canciones", albums: "Álbumes", artists: "Artistas", playlists: "Listas de reproducción", myMusic: "Mi música", replay: "Replay",
+		watchlist: "Para ver", homeRelease: "Disponible en casa el %s."},
+	"it": {season: "Stagione", specials: "Speciali", episode: "Episodio", otherEpisodes: "Altri episodi", video: "Video", chapter: "Capitolo",
+		movies: "Film", shows: "Serie TV", videos: "Video", collections: "Collezioni",
+		songs: "Brani", albums: "Album", artists: "Artisti", playlists: "Playlist", myMusic: "La mia musica", replay: "Replay",
+		watchlist: "Da guardare", homeRelease: "Disponibile a casa dal %s."},
+	"pt-BR": {season: "Temporada", specials: "Especiais", episode: "Episódio", otherEpisodes: "Outros episódios", video: "Vídeo", chapter: "Capítulo",
+		movies: "Filmes", shows: "Séries", videos: "Vídeos", collections: "Coleções",
+		songs: "Músicas", albums: "Álbuns", artists: "Artistas", playlists: "Playlists", myMusic: "Minha música", replay: "Replay",
+		watchlist: "Para assistir", homeRelease: "Disponível em casa em %s."},
+}
+
+// vocabularyOf returns the words of a server language, English when the
+// language is unknown.
+func vocabularyOf(language string) words {
+	w, ok := vocabulary[language]
+	if !ok {
+		language, w = "en", vocabulary["en"]
+	}
+	w.language = language
+	return w
+}
+
+// seasonName names a season as Jellyfin does.
+func (w words) seasonName(number int) string {
+	if number == 0 {
+		return w.specials
+	}
+	return w.season + " " + strconv.Itoa(number)
+}
+
+// episodeName names an episode without a title.
+func (w words) episodeName(number int) string {
+	return w.episode + " " + strconv.Itoa(number)
+}
+
+// ChapterName names the chapter at a position, counted from 1, in a server
+// language, as Jellyfin names chapters a file leaves untitled.
+func ChapterName(language string, number int) string {
+	return vocabularyOf(language).chapter + " " + strconv.Itoa(number)
+}
+
+// CollectionsName names the Collections view in a server language.
+func CollectionsName(language string) string {
+	return vocabularyOf(language).collections
+}
+
+// PlaylistsName names the Playlists view in a server language.
+func PlaylistsName(language string) string {
+	return vocabularyOf(language).playlists
+}
+
+// contentType names the content of a catalog type for a library name, as
+// collectionType groups them, music rows by what they list; other types
+// are named as they are.
+func (w words) contentType(catalogType string) string {
+	switch catalogType {
+	case eclipse.TypeTrack:
+		return w.songs
+	case eclipse.TypeAlbum:
+		return w.albums
+	case eclipse.TypeArtist:
+		return w.artists
+	case eclipse.TypePlaylist:
+		return w.playlists
+	}
+	switch collectionType(catalogType) {
+	case "movies":
+		return w.movies
+	case "tvshows":
+		return w.shows
+	case "homevideos":
+		return w.videos
+	case "boxsets":
+		return w.collections
+	default:
+		return catalogType
+	}
+}
+
+// LibraryNames returns the names Jellyfin apps show for libraries, in the
+// same order: libraries is everything one user browses, in their order. A
+// library is named after its catalog, and the genre it is narrowed to
+// ("Popular · Comedy"), unless it was given a name. Jellyfin apps never
+// show two libraries with the same name, so names that collide (ignoring
+// surrounding spaces and letter case) are told apart, one step after the
+// other while collisions remain:
+//
+//  1. Each colliding library named after its catalog gets its content type
+//     in the server language: "Popular (Movies)" and "Popular (Shows)". A
+//     custom name is kept: a library renamed "Popular" stays so, and only
+//     the catalogs it collides with are suffixed.
+//  2. Libraries that still collide under their own name, mostly custom
+//     names given twice, get their content type the same way.
+//  3. Libraries that still collide with their content type, the same type
+//     from two addons, get their addon's name too: "Popular (Movies, Alpha)".
+//  4. Every remaining duplicate after the first gets a counter, skipping
+//     names in use: "Popular (Movies, Alpha) (2)".
+//
+// Names depend only on the libraries and their order. Only names change:
+// item identifiers come from catalog keys.
+func LibraryNames(libraries []addons.Library, language string) []string {
+	w := vocabularyOf(language)
+	// level is how much of the suffix a library's name has: none, its
+	// content type, or its content type and addon.
+	level := make([]int, len(libraries))
+	name := func(i int) string {
+		l := libraries[i]
+		base := strings.TrimSpace(l.Catalog.Name)
+		if l.Catalog.ID == eclipse.MyMusic {
+			// Mira's own catalog, named in the server's language.
+			base = w.myMusic
+		}
+		if l.Name != nil {
+			base = strings.TrimSpace(*l.Name)
+		} else if genre := strings.TrimSpace(l.Genre); genre != "" {
+			base += " · " + genre
+		}
+		switch level[i] {
+		case 0:
+			return base
+		case 1:
+			return base + " (" + w.contentType(l.Catalog.Type) + ")"
+		default:
+			return base + " (" + w.contentType(l.Catalog.Type) + ", " + strings.TrimSpace(l.AddonName) + ")"
+		}
+	}
+	names := make([]string, len(libraries))
+	current := func() map[string]int {
+		counts := map[string]int{}
+		for i := range libraries {
+			names[i] = name(i)
+			counts[nameKey(names[i])]++
+		}
+		return counts
+	}
+	// raise adds the next suffix to the colliding libraries that qualify.
+	raise := func(qualifies func(i int) bool) {
+		counts := current()
+		for i := range libraries {
+			if counts[nameKey(names[i])] > 1 && qualifies(i) {
+				level[i]++
+			}
+		}
+	}
+	raise(func(i int) bool { return level[i] == 0 && libraries[i].Name == nil })
+	raise(func(i int) bool { return level[i] == 0 })
+	raise(func(i int) bool { return level[i] == 1 })
+
+	used := current()
+	taken := map[string]bool{}
+	for i, base := range names {
+		if key := nameKey(base); !taken[key] {
+			taken[key] = true
+			continue
+		}
+		for n := 2; ; n++ {
+			candidate := base + " (" + strconv.Itoa(n) + ")"
+			if key := nameKey(candidate); used[key] == 0 && !taken[key] {
+				names[i] = candidate
+				taken[key] = true
+				break
+			}
+		}
+	}
+	return names
+}
+
+// nameKey is what two library names are compared by.
+func nameKey(name string) string {
+	return strings.ToLower(strings.TrimSpace(name))
+}

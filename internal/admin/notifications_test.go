@@ -1,0 +1,180 @@
+package admin
+
+import (
+	"encoding/json"
+	"io"
+	"log/slog"
+	"net/http"
+	"slices"
+	"strings"
+	"testing"
+
+	"github.com/ferforastieri/mira/internal/notifications"
+)
+
+// The server's targets are an administrator's to see and change, each
+// user's own their own: the secret part of an address is never answered,
+// a member may not choose health events nor a target on the local network,
+// and reaches no other owner's target.
+func TestNotificationTargetsBelongToTheirOwner(t *testing.T) {
+	t.Parallel()
+	api := newTestAPI(t, 10, func(o *Options, deps testDeps) {
+		o.Notifications = notifications.New(notifications.Options{DB: deps.pool, Accounts: o.Accounts, Version: "1.2.3",
+			Logger: slog.New(slog.NewTextHandler(io.Discard, nil))})
+		t.Cleanup(o.Notifications.Close)
+	})
+	administrator := api.signedIn("admin", true)
+	member := api.signedIn("member", false)
+
+	secret := "https://hooks.example.org/api/webhooks/42/a-secret-token"
+	status, created, _ := administrator.call(http.MethodPost, "/notifications/targets", map[string]any{"kind": "discord", "name": "Family",
+		"address": secret, "events": []string{"health_problem", "new_episode"}})
+	if status != http.StatusCreated || created["address"] != "https://hooks.example.org" || created["problem"] != nil {
+		t.Fatalf("adding a server target: %d %v", status, created)
+	}
+	if events, _ := json.Marshal(created["events"]); string(events) != `["new_episode","health_problem"]` {
+		t.Errorf("events: %s", events)
+	}
+	_, listed, response := administrator.call(http.MethodGet, "/notifications", nil)
+	encoded, _ := json.Marshal(listed)
+	if strings.Contains(string(encoded), "a-secret-token") || len(listed["targets"].([]any)) != 1 {
+		t.Errorf("listed: %s", encoded)
+	}
+	// Every event but the sign-ins on new devices, the programme
+	// reminders and the watchlist titles found available, which only
+	// users' own targets receive.
+	if got := listed["events"].([]any); len(got) != len(notifications.Events)-3 || slices.Contains(got, any("new_device")) ||
+		slices.Contains(got, any("programme_reminder")) || slices.Contains(got, any("title_available")) {
+		t.Errorf("the server's events: %v", got)
+	}
+	if response.Header.Get("Content-Type") != "application/json" {
+		t.Errorf("content type: %s", response.Header.Get("Content-Type"))
+	}
+
+	// Members reach their own targets only.
+	if status, _, _ := member.call(http.MethodGet, "/notifications", nil); status != http.StatusForbidden {
+		t.Errorf("a member reading the server's targets: %d", status)
+	}
+	id := created["id"].(string)
+	if status, _, _ := member.call(http.MethodPatch, "/account/notifications/targets/"+id, map[string]any{"enabled": false}); status != http.StatusNotFound {
+		t.Errorf("a member changing the server's target as their own: %d", status)
+	}
+	_, own, _ := member.call(http.MethodGet, "/account/notifications", nil)
+	var events []string
+	for _, event := range own["events"].([]any) {
+		events = append(events, event.(string))
+	}
+	if slices.Contains(events, "health_problem") || !slices.Contains(events, "new_episode") || !slices.Contains(events, "new_device") ||
+		!slices.Contains(events, "account_blocked") || len(own["targets"].([]any)) != 0 {
+		t.Errorf("a member's notifications: %v", own)
+	}
+	// Addresses are written as public IP addresses, which are checked
+	// without asking DNS.
+	for _, refused := range []struct {
+		body map[string]any
+		code string
+	}{
+		{map[string]any{"kind": "webhook", "name": "Mine", "address": "https://203.0.113.10/mine", "events": []string{"health_solved"}}, "invalid_events"},
+		{map[string]any{"kind": "webhook", "name": "Mine", "address": "http://127.0.0.1:8080/hook", "events": []string{"new_episode"}}, "private_target_address"},
+		{map[string]any{"kind": "ntfy", "name": "Mine", "address": "https://203.0.113.10", "topic": "has spaces"}, "invalid_topic"},
+		{map[string]any{"kind": "webhook", "name": "Mine", "address": "ftp://203.0.113.10/"}, "invalid_target_address"},
+	} {
+		if status, body, _ := member.call(http.MethodPost, "/account/notifications/targets", refused.body); status != http.StatusBadRequest || body["error"] != refused.code {
+			t.Errorf("%v: %d %v, want %s", refused.body, status, body, refused.code)
+		}
+	}
+	// An ntfy target's token is never answered, only that it has one.
+	status, ntfy, _ := member.call(http.MethodPost, "/account/notifications/targets", map[string]any{"kind": "ntfy", "name": "Phone",
+		"address": "https://203.0.113.10/", "topic": "member-alerts", "token": "tk_secret-token", "events": []string{"new_episode"}})
+	if status != http.StatusCreated || ntfy["address"] != "https://203.0.113.10" || ntfy["tokenSet"] != true || ntfy["token"] != nil {
+		t.Errorf("a member's ntfy target: %d %v", status, ntfy)
+	}
+	status, changed, _ := member.call(http.MethodPatch, "/account/notifications/targets/"+ntfy["id"].(string), map[string]any{"token": ""})
+	if status != http.StatusOK || changed["tokenSet"] != false || changed["topic"] != "member-alerts" {
+		t.Errorf("removing the token: %d %v", status, changed)
+	}
+	if status, _, _ := member.call(http.MethodDelete, "/account/notifications/targets/"+ntfy["id"].(string), nil); status != http.StatusNoContent {
+		t.Errorf("deleting: %d", status)
+	}
+	// Without a server, an ntfy target uses the public one.
+	status, public, _ := administrator.call(http.MethodPost, "/account/notifications/targets", map[string]any{"kind": "ntfy", "name": "Phone",
+		"topic": "admin-alerts"})
+	if status != http.StatusCreated || public["address"] != notifications.DefaultNtfyServer || public["tokenSet"] != false {
+		t.Errorf("an ntfy target without a server: %d %v", status, public)
+	}
+}
+
+// The public address links in messages start with is an http or https
+// address, kept without its trailing slash.
+func TestPublicAddressSetting(t *testing.T) {
+	t.Parallel()
+	api := newTestAPI(t, 10)
+	administrator := api.signedIn("admin", true)
+	with := func(address string) map[string]any {
+		return map[string]any{"serverName": "Mira", "quickConnectEnabled": true, "legacyAuthorization": false, "language": "en",
+			"publicAddress": address}
+	}
+	for _, refused := range []string{"media.example.org", "https://media.example.org/?a=b", "https://user:pass@media.example.org"} {
+		if status, body, _ := administrator.call(http.MethodPut, "/settings", with(refused)); status != http.StatusBadRequest ||
+			body["error"] != "invalid_public_address" {
+			t.Errorf("%q: %d %v", refused, status, body)
+		}
+	}
+	if status, body, _ := administrator.call(http.MethodPut, "/settings", with(" https://media.example.org/mira/ ")); status != http.StatusOK ||
+		body["publicAddress"] != "https://media.example.org/mira" {
+		t.Errorf("a public address: %d %v", status, body["publicAddress"])
+	}
+}
+
+// Email targets need the SMTP server of the settings: without it, none can
+// be added, and the notifications pages say so. Its password is saved but
+// never answered, and kept when a save leaves it out.
+func TestEmailTargetsNeedTheSMTPServer(t *testing.T) {
+	t.Parallel()
+	api := newTestAPI(t, 10, func(o *Options, deps testDeps) {
+		o.Notifications = notifications.New(notifications.Options{DB: deps.pool, Accounts: o.Accounts, Version: "1.2.3",
+			Logger: slog.New(slog.NewTextHandler(io.Discard, nil))})
+		t.Cleanup(o.Notifications.Close)
+	})
+	administrator := api.signedIn("admin", true)
+	member := api.signedIn("member", false)
+	email := map[string]any{"kind": "email", "name": "Inbox", "address": "member@example.org", "events": []string{"new_episode"}}
+	if status, body, _ := member.call(http.MethodPost, "/account/notifications/targets", email); status != http.StatusConflict ||
+		body["error"] != "email_unavailable" {
+		t.Errorf("an email target without an SMTP server: %d %v", status, body)
+	}
+	if _, own, _ := member.call(http.MethodGet, "/account/notifications", nil); own["emailAvailable"] != false {
+		t.Errorf("without an SMTP server: %v", own["emailAvailable"])
+	}
+
+	smtp := map[string]any{"serverName": "Mira", "quickConnectEnabled": true, "legacyAuthorization": false, "language": "en",
+		"smtpHost": "smtp.example.org", "smtpPort": 465, "smtpSecurity": "tls", "smtpUser": "mira", "smtpPassword": "smtp-secret-value",
+		"smtpFrom": "mira@example.org", "smtpFromName": "Home"}
+	status, saved, _ := administrator.call(http.MethodPut, "/settings", smtp)
+	if encoded, _ := json.Marshal(saved); status != http.StatusOK || saved["smtpPasswordSet"] != true || strings.Contains(string(encoded), "smtp-secret-value") {
+		t.Fatalf("saving the SMTP server: %d %s", status, encoded)
+	}
+	delete(smtp, "smtpPassword")
+	smtp["smtpFromName"] = "Home server"
+	if status, _, _ := administrator.call(http.MethodPut, "/settings", smtp); status != http.StatusOK || api.store.Settings().SMTPPassword != "smtp-secret-value" {
+		t.Errorf("a save leaving the password out: %d, password kept: %v", status, api.store.Settings().SMTPPassword == "smtp-secret-value")
+	}
+	smtp["smtpFrom"] = "Mira <mira@example.org>"
+	if status, body, _ := administrator.call(http.MethodPut, "/settings", smtp); status != http.StatusBadRequest || body["error"] != "invalid_smtp_sender" {
+		t.Errorf("a sender with a name: %d %v", status, body)
+	}
+
+	if _, own, _ := member.call(http.MethodGet, "/account/notifications", nil); own["emailAvailable"] != true {
+		t.Errorf("with an SMTP server: %v", own["emailAvailable"])
+	}
+	email["address"] = "member at example.org"
+	if status, body, _ := member.call(http.MethodPost, "/account/notifications/targets", email); status != http.StatusBadRequest ||
+		body["error"] != "invalid_email_address" {
+		t.Errorf("a malformed email address: %d %v", status, body)
+	}
+	email["address"] = " member@example.org "
+	if status, created, _ := member.call(http.MethodPost, "/account/notifications/targets", email); status != http.StatusCreated ||
+		created["address"] != "member@example.org" || created["kind"] != "email" {
+		t.Errorf("an email target: %d %v", status, created)
+	}
+}

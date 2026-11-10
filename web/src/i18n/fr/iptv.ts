@@ -1,0 +1,470 @@
+import type en from '../en/iptv'
+
+const iptv: typeof en = {
+  iptv: {
+    address: 'Adresse',
+    lastFetch: 'Dernier téléchargement',
+    nextFetch: 'Prochain téléchargement',
+    never: 'Jamais',
+    errors: {
+      unreachable:
+        'Le dernier téléchargement a échoué\u202f: impossible de joindre le serveur. Les chaînes précédentes sont gardées.',
+      private_network:
+        'Le dernier téléchargement a échoué\u202f: cette adresse est sur un réseau local. Seuls les administrateurs peuvent utiliser ce type d’adresse.',
+      too_large:
+        'Le dernier téléchargement a échoué\u202f: la liste est trop grande. Les chaînes précédentes sont gardées.',
+      malformed:
+        'Le dernier téléchargement a échoué\u202f: le serveur n’a pas renvoyé de liste de chaînes, ou a refusé les identifiants. Les chaînes précédentes sont gardées.',
+      rate_limited:
+        'Le dernier téléchargement a échoué\u202f: le serveur a demandé à Mira de ralentir. Il est réessayé dans quelques minutes\u202f; les chaînes précédentes sont gardées.',
+      file_unreadable:
+        'Le dernier téléchargement a échoué\u202f: le fichier a disparu, ou Mira ne peut plus le lire. Les chaînes précédentes sont gardées.',
+      file_refused:
+        'Le dernier téléchargement a échoué\u202f: seuls les administrateurs peuvent utiliser un fichier du serveur. Les chaînes précédentes sont gardées.',
+    },
+  },
+  lineup: {
+    open: 'Ouvrir la source',
+    description:
+      'Ce que cette source importe et comment les applis Jellyfin l’affichent\u202f: ses chaînes de TV en direct, avec leur ordre, leurs noms et leurs guides des programmes, et ses films et séries.',
+    backMine: 'Retour à mes sources',
+    notFoundTitle: 'Source introuvable',
+    reset: 'Réinitialiser',
+    unmappedNotice: (count: string) => `${count} chaînes n’ont pas de guide.`,
+    openMapping: 'Ouvrir la correspondance',
+    archivedNotice: (count: number, formatted: string) =>
+      count === 1
+        ? 'Une chaîne garde ses programmes passés\u202f: les applis Jellyfin les lisent depuis Replay.'
+        : `${formatted} chaînes gardent leurs programmes passés\u202f: les applis Jellyfin les lisent depuis Replay.`,
+    openArchived: 'Les voir',
+    channelsEmpty: 'Aucune chaîne pour l’instant',
+    channelsEmptyHelp:
+      'La liste n’a pas été téléchargée, ou rien n’est importé. Téléchargez-la à nouveau depuis l’en-tête, ou changez ce qu’il faut importer.',
+    guidesNoneHelp: 'Ajoutez l’adresse d’un guide XMLTV ci-dessous, puis enregistrez.',
+    dragHandle: (name: string) => `Déplacer ${name}`,
+    guideErrors: {
+      unreachable:
+        'La dernière récupération a échoué\u202f: impossible de télécharger le guide. Vérifiez l’adresse et réessayez.',
+      private_network:
+        'La dernière récupération a échoué\u202f: ce guide se trouve à une adresse du réseau local. Seuls les administrateurs peuvent utiliser ce type d’adresse.',
+      too_large: 'La dernière récupération a échoué\u202f: le guide dépasse 300 Mo.',
+      malformed: 'La dernière récupération a échoué\u202f: ce fichier n’est pas un guide XMLTV.',
+      channels_unreachable:
+        'La dernière récupération a échoué\u202f: l’addon n’a pas donné les chaînes de ce catalogue. Réessayez plus tard.',
+      rate_limited:
+        'La dernière récupération a échoué\u202f: le serveur a demandé à Mira de ralentir. Elle est réessayée dans quelques minutes.',
+      file_unreadable:
+        'La dernière récupération a échoué\u202f: le fichier a disparu, ou Mira ne peut plus le lire.',
+      file_refused:
+        'La dernière récupération a échoué\u202f: seuls les administrateurs peuvent utiliser un fichier du serveur.',
+    } as Record<string, string>,
+    sectionsLabel: 'Sections',
+    sections: {
+      summary: 'Résumé',
+      options: 'Options d’import',
+      categories: 'Catégories',
+      channels: 'Chaînes',
+      guides: 'Guides',
+      mapping: 'Correspondance des guides',
+    },
+    close: 'Fermer',
+    pager: {
+      label: 'Pages',
+      labelEnd: 'Pages, sous la liste',
+      range: (from: string, to: string, total: string) => `${from} à ${to} sur ${total}`,
+      previous: 'Précédent',
+      next: 'Suivant',
+    },
+    summary: {
+      categories: 'Catégories activées',
+      shown: 'Chaînes affichées',
+      mappedOf: (mapped: string, total: string) => `${mapped} sur ${total} avec un guide`,
+      shownOf: (shown: string, total: string) => `${shown} affichées sur ${total}`,
+      mapped: 'Avec un guide',
+      entries: 'Entrées en direct',
+      listTitle: 'Listes',
+      refreshHelp:
+        'Télécharge les listes à nouveau (la liste en direct, et celles des films et séries quand ils sont importés), puis met à jour la grille, la correspondance des guides et les bibliothèques. Vos modifications sont gardées pour chaque chaîne encore dans la liste.',
+      refresh: 'Télécharger à nouveau',
+      refreshing: 'Téléchargement…',
+      refreshed: 'Les listes ont été téléchargées à nouveau et la source mise à jour.',
+      vodTitle: 'Films et séries',
+      movies: 'Films importés',
+      series: 'Séries importées',
+      episodes: 'Épisodes connus',
+      vodShort: (movies: string, series: string) => `${movies} films et ${series} séries importés`,
+      lastAttempt: 'Dernière tentative',
+      allChannels: (count: string) => `Les ${count} chaînes`,
+      hidden: 'Masquée',
+      noGuide: 'Sans guide',
+    },
+    tuner: {
+      title: 'Tuner',
+      help: 'Le tuner lit autant de chaînes à la fois qu’il a de tuners. Plusieurs spectateurs d’une même chaîne partagent un tuner\u202f; un enregistrement prend le tuner d’une chaîne seulement regardée.',
+      model: 'Modèle',
+      device: 'Identifiant de l’appareil',
+      tuners: 'Tuners',
+      tunersHelp: 'Chaînes lues à la fois',
+      favoritesSaved: (on: boolean) =>
+        on
+          ? 'Seules les chaînes favorites du tuner sont gardées.'
+          : 'Toutes les chaînes du tuner sont gardées.',
+      scan: 'Rechercher les chaînes',
+      scanHelp:
+        'Le tuner parcourt à nouveau ses fréquences, ce qui prend quelques minutes et occupe ses tuners\u202f; ses chaînes sont relues à la fin de la recherche.',
+      scanning: 'Recherche…',
+      scanStarted: 'Le tuner a commencé à rechercher les chaînes.',
+      scanDone: 'La recherche est finie et les chaînes du tuner ont été relues.',
+      scanProgress: 'Avancement de la recherche',
+      scanFound: (progress: string, found: string) =>
+        `${progress} % parcourus, ${found} chaînes trouvées`,
+      unreachable: 'Le tuner n’a pas répondu à l’ouverture d’une chaîne.',
+      failed: 'Le tuner n’a pas pu lire une chaîne.',
+    },
+    options: {
+      title: 'Options d’import',
+      help: 'Enregistrer reconstruit la grille et les bibliothèques à partir des listes déjà téléchargées\u202f; seul un type de titres tout juste activé est téléchargé. Les noms, l’ordre, les déplacements, les numéros, les chaînes activées et la correspondance des guides sont gardés pour chaque chaîne encore présente.',
+      categoriesMode: 'Catégories',
+      categoriesModeHelp:
+        'Les groupes du fournisseur, ou une catégorie par pays trouvé dans les noms.',
+      categoriesOriginal: 'Comme le fournisseur les regroupe',
+      categoriesCountry: 'Une par pays',
+      channelsMode: 'Chaînes',
+      channelsModeHelp:
+        'Fusionner fait des entrées du même nom dans une catégorie (par exemple FHD, HD et SD) une seule chaîne avec plusieurs flux, le meilleur en premier.',
+      channelsOriginal: 'Une par entrée',
+      channelsMerged: 'Fusionner les variantes de qualité',
+      numbering: 'Numérotation',
+      numberingHelp: 'Une chaîne avec un numéro fixe le garde.',
+      numberingProvider: 'Les numéros du fournisseur',
+      numberingSequential: 'Dans l’ordre de la grille',
+      newChannels: 'Activer les nouvelles chaînes',
+      newChannelsHelp:
+        'Les chaînes qui apparaissent quand la liste est téléchargée à nouveau arrivent activées. Sinon, elles arrivent désactivées pour que vous les passiez en revue.',
+      save: 'Enregistrer et reconstruire',
+      saving: 'Reconstruction…',
+      saved: 'Options enregistrées. La source a été reconstruite.',
+    },
+    content: {
+      title: 'À importer',
+      help: 'Choisissez ce que cette source apporte aux applis Jellyfin. Vous pourrez le changer plus tard depuis la page de la source.',
+      liveTv: 'Chaînes de TV en direct',
+      liveTvHelp:
+        'Les chaînes en direct, avec leurs catégories, leurs numéros et leurs guides des programmes.',
+      movies: 'Films',
+      moviesHelp: 'Les films à la demande du fournisseur, dans des bibliothèques de films.',
+      series: 'Séries',
+      seriesHelp: 'Les séries à la demande du fournisseur, avec leurs saisons et leurs épisodes.',
+      none: 'Choisissez au moins un élément.',
+      liveTitle: 'TV en direct',
+      vodTitle: 'Films et séries',
+      liveOffWarning:
+        'Désactiver la TV en direct retire sa bibliothèque et ses guides (il faudra ajouter les guides à nouveau). Les catégories, les chaînes et vos modifications sont gardées pour le jour où vous la réactivez.',
+      liveOff: 'Les chaînes de TV en direct ne sont pas importées de cette source.',
+      liveOffAction: 'Le changer dans les options d’import',
+      notImported: 'Non importées',
+    },
+    vod: {
+      libraries: 'Bibliothèques',
+      librariesHelp:
+        'Une bibliothèque Films et une bibliothèque Séries, la catégorie de chaque titre devenant son genre\u202f; ou une bibliothèque par catégorie du fournisseur. Avec beaucoup de catégories, cela fait beaucoup de bibliothèques\u202f: vous choisissez celles que montrent les applis Jellyfin dans Bibliothèques.',
+      librariesType: 'Une par type\u202f: Films, Séries',
+      librariesCategory: 'Une par catégorie du fournisseur',
+      enrichment: 'Décrire les titres avec les addons de métadonnées',
+      enrichmentHelp:
+        'Quand un film ou une série a un identifiant TMDB ou IMDb, l’ouvrir demande à l’addon de métadonnées du serveur sa description, ses images et sa classification\u202f: une requête par titre, la première fois qu’il est ouvert, puis gardée. Sinon, les titres n’affichent que ce que donne le fournisseur, sans classification\u202f: les utilisateurs qui bloquent les titres non classés ne les voient pas.',
+    },
+    vodExclusions: {
+      title: 'Catégories à importer',
+      help: 'Les catégories décochées ne sont pas importées. Une catégorie ajoutée plus tard par le fournisseur est importée.',
+      by: 'Afficher',
+      byMovie: 'Films',
+      bySeries: 'Séries',
+      search: 'Chercher une catégorie',
+      includeAll: 'Tout inclure',
+      excludeAll: 'Tout exclure',
+      includeListed: 'Inclure celles affichées',
+      excludeListed: 'Exclure celles affichées',
+      keptInView: (kept: string, total: string) =>
+        `Dans cette vue, ${kept} titres importés sur ${total}`,
+      excludedKeys: (movies: number, series: number) =>
+        [
+          movies > 0
+            ? movies === 1
+              ? '1 catégorie de films'
+              : `${movies} catégories de films`
+            : '',
+          series > 0
+            ? series === 1
+              ? '1 catégorie de séries'
+              : `${series} catégories de séries`
+            : '',
+        ]
+          .filter(Boolean)
+          .join(' et ') + ' exclues',
+      titleCount: (count: number) => (count === 1 ? '1 titre' : `${count} titres`),
+      noCategory: 'Sans catégorie',
+      noMatch: 'Aucune catégorie ne correspond.',
+      tooMany: 'Au plus 5 000 catégories peuvent être exclues.',
+    },
+    exclusions: {
+      title: 'Catégories à importer',
+      help: 'Les catégories décochées ne sont pas importées. Groupes et pays peuvent être décochés tous les deux\u202f: une entrée dans l’un ou l’autre est laissée de côté.',
+      by: 'Afficher',
+      byGroup: 'Par groupe',
+      byCountry: 'Par pays',
+      search: 'Chercher une catégorie',
+      includeAll: 'Tout inclure',
+      excludeAll: 'Tout exclure',
+      includeListed: 'Inclure celles affichées',
+      excludeListed: 'Exclure celles affichées',
+      keptInView: (kept: string, total: string) =>
+        `Dans cette vue, ${kept} entrées importées sur ${total}`,
+      excludedKeys: (groups: number, countries: number) =>
+        [
+          groups > 0 ? (groups === 1 ? '1 groupe' : `${groups} groupes`) : '',
+          countries > 0 ? (countries === 1 ? '1 pays' : `${countries} pays`) : '',
+        ]
+          .filter(Boolean)
+          .join(' et ') + ' exclus',
+      channelCount: (count: number) => (count === 1 ? '1 chaîne' : `${count} chaînes`),
+      noGroup: 'Sans groupe',
+      otherCountries: 'Autres pays',
+      noMatch: 'Aucune catégorie ne correspond.',
+      tooMany: 'Au plus 5 000 catégories peuvent être exclues.',
+    },
+    categories: {
+      title: 'Catégories',
+      help: 'Affichées dans cet ordre dans les applis Jellyfin. Faites glisser une catégorie, ou utilisez ses flèches, pour la déplacer.',
+      reorderOff: 'Videz la recherche pour changer l’ordre.',
+      search: 'Chercher une catégorie',
+      enableAll: 'Tout activer',
+      disableAll: 'Tout désactiver',
+      enableListed: 'Activer celles affichées',
+      disableListed: 'Désactiver celles affichées',
+      bulkDone: (count: number) =>
+        count === 1 ? '1 catégorie modifiée.' : `${count} catégories modifiées.`,
+      empty: 'Pas encore de catégorie\u202f: la liste n’a pas été téléchargée.',
+      noMatch: 'Aucune catégorie ne correspond.',
+      createTitle: 'Nouvelle catégorie',
+      createHelp: 'Une catégorie à vous, pour regrouper des chaînes de n’importe quelle catégorie.',
+      createLabel: 'Nom',
+      create: 'Créer',
+      created: (name: string) => `${name} a été créée, en fin de liste.`,
+      enabledLabel: (name: string) => `Afficher ${name}`,
+      custom: 'À vous',
+      providerName: (name: string) => `Nom du fournisseur\u202f: ${name}`,
+      channelCounts: (enabled: string, total: string) => `${enabled} chaînes activées sur ${total}`,
+      channels: 'Chaînes',
+      channelsLabel: (name: string) => `Chaînes de ${name}`,
+      renameLabel: (name: string) => `Renommer ${name}`,
+      delete: 'Supprimer',
+      deleteLabel: (name: string) => `Supprimer ${name}`,
+      resetNameLabel: (name: string) => `Reprendre le nom du fournisseur pour ${name}`,
+      deleteConfirm: (name: string) =>
+        `Supprimer ${name}\u202f? Ses chaînes retournent dans leur catégorie d’origine.`,
+    },
+    channels: {
+      title: 'Chaînes',
+      help: 'Choisissez une catégorie, sans autre filtre, pour changer l’ordre de ses chaînes.',
+      reorderHelp:
+        'Faites glisser une chaîne, ou utilisez ses flèches, pour la déplacer dans sa catégorie.',
+      search: 'Chercher par nom ou identifiant de guide',
+      category: 'Catégorie',
+      allCategories: 'Toutes les catégories',
+      enabledFilter: 'Activée ou non',
+      shownFilter: 'Dans les applis',
+      mappedFilter: 'Guide',
+      archiveFilter: 'Archive',
+      any: 'Toutes',
+      on: 'Activées',
+      off: 'Désactivées',
+      shown: 'Affichées',
+      hidden: 'Non affichée',
+      hiddenHelp: 'Activée, mais sa catégorie est désactivée ou aucun de ses flux ne l’est.',
+      mapped: 'Avec un guide',
+      unmapped: 'Sans guide',
+      archived: 'Avec archive',
+      notArchived: 'Sans archive',
+      archiveDays: (days: number) => (days === 1 ? 'Replay, 1 jour' : `Replay, ${days} jours`),
+      archiveHelp:
+        'Le fournisseur garde aussi longtemps les programmes passés de cette chaîne\u202f: les applis Jellyfin les lisent depuis Replay.',
+      manual: 'Guide choisi à la main',
+      streamCount: (count: number) => `${count} flux`,
+      selectPage: 'Sélectionner cette page',
+      select: (name: string) => `Sélectionner ${name}`,
+      selected: (count: number) => (count === 1 ? '1 sélectionnée' : `${count} sélectionnées`),
+      turnOn: 'Activer',
+      turnOff: 'Désactiver',
+      clearSelection: 'Vider la sélection',
+      bulkDone: (count: number) =>
+        count === 1 ? '1 chaîne modifiée.' : `${count} chaînes modifiées.`,
+      noMatch: 'Aucune chaîne ne correspond à ces filtres.',
+      enabledLabel: (name: string) => `Activer ${name}`,
+      edit: 'Modifier',
+      editLabel: (name: string) => `Modifier ${name}`,
+    },
+    keyword: {
+      title: 'Modifier par mot-clé',
+      help: 'Active ou désactive toutes les chaînes dont le nom, le nom du fournisseur ou l’identifiant de guide contient un mot, après les avoir comptées.',
+      label: 'Mot-clé',
+      hint: 'Au moins 2 caractères, par exemple «\u202f4K\u202f» ou «\u202fSport\u202f».',
+      inCategory: 'Seulement dans la catégorie choisie plus haut',
+      count: 'Compter',
+      counting: 'Comptage…',
+      matched: (count: string) => `${count} chaînes correspondent.`,
+      turnOn: (count: string) => `Activer les ${count}`,
+      turnOff: (count: string) => `Désactiver les ${count}`,
+      done: (count: number) => (count === 1 ? '1 chaîne modifiée.' : `${count} chaînes modifiées.`),
+    },
+    editor: {
+      title: (name: string) => `Modifier ${name}`,
+      shownInApps: 'Affichée dans les applis Jellyfin',
+      notShownInApps: 'Non affichée dans les applis Jellyfin',
+      numberNow: (number: string) => `numéro ${number}`,
+      name: 'Nom',
+      providerValue: (value: string) => `Fournisseur\u202f: ${value}`,
+      resetName: 'Reprendre le nom du fournisseur',
+      logo: 'Adresse du logo',
+      logoHint: 'Une adresse d’image https://.',
+      resetLogo: 'Reprendre le logo du fournisseur',
+      description: 'Description',
+      category: 'Catégorie',
+      providerCategory: '(du fournisseur)',
+      movedHint: 'Déplacée depuis la catégorie du fournisseur.',
+      number: 'Numéro fixe',
+      numberHint: 'De 1 à 99 999. Vide\u202f: la numérotation de la grille s’applique.',
+      numberInvalid: 'Saisissez un nombre entier de 1 à 99 999, ou laissez vide.',
+      saved: 'Chaîne enregistrée.',
+      guideTitle: 'Guide des programmes',
+      providerGuideId: 'Identifiant de guide du fournisseur',
+      mappedTo: 'Prend son guide de',
+    },
+    streams: {
+      title: 'Flux',
+      help: 'Les applis lisent le premier flux activé\u202f; les suivants sont essayés s’il échoue.',
+      provider: 'Du fournisseur',
+      custom: 'À vous',
+      unnamed: 'Flux',
+      save: 'Enregistrer les flux',
+      saveFirst: 'Enregistrez d’abord l’ordre.',
+      removeLabel: (label: string) => `Retirer le flux ${label}`,
+      addTitle: 'Ajouter un flux',
+      url: 'Adresse du flux',
+      urlHint:
+        'Une adresse http(s). Elle peut contenir un identifiant\u202f: elle n’est jamais affichée en entier.',
+      label: 'Libellé',
+      labelHint: 'Jusqu’à 32 caractères.',
+      defaultLabel: 'Perso',
+      add: 'Ajouter le flux',
+      adding: 'Ajout…',
+      failures: {
+        dead: 'Aucun flux en direct',
+        refused: 'Refusé par le fournisseur',
+        timeout: 'Rien n’est venu',
+        drm: 'Demande un DRM que Mira ne prend pas en charge',
+        keys: 'Les clés de la liste ne le déchiffrent pas',
+      },
+      leftOutUntil: 'écarté jusqu’à',
+      retry: 'Réessayer tous les flux',
+      retried: 'Tous les flux sont essayés au prochain démarrage.',
+    },
+    guides: {
+      title: 'Guides',
+      help: 'Guides XMLTV, dans l’ordre\u202f: une chaîne prend ses programmes du premier guide qui l’a. Les adresses peuvent contenir un identifiant\u202f: elles ne sont jamais affichées en entier.',
+      channels: 'Chaînes',
+      mapped: 'Avec un guide',
+      unmapped: 'Sans guide',
+      manual: 'Choisies à la main',
+      none: 'Pas encore de guide.',
+      address: 'Adresse du guide',
+      addressHint: 'Fichier XMLTV, compressé (.gz) ou non. 10 guides au plus.',
+      addressOrFile: 'Adresse ou fichier du guide',
+      addressOrFileHint:
+        'Fichier XMLTV, compressé (.gz) ou non, par son adresse ou son chemin sur le serveur. 10 guides au plus.',
+      tooMany: 'Ce catalogue a 10 guides\u202f: retirez-en un pour en ajouter un autre.',
+      add: 'Ajouter',
+      remove: 'Retirer',
+      removeLabel: (url: string) => `Retirer le guide ${url}`,
+      notSaved: 'Téléchargé une fois enregistré.',
+      save: 'Enregistrer et télécharger',
+      saving: 'Téléchargement…',
+      saved: 'Guides enregistrés et téléchargés.',
+      saveFirst: 'Enregistrez d’abord la liste.',
+      refresh: 'Télécharger à nouveau',
+      refreshing: 'Téléchargement…',
+      refreshed: 'Guides téléchargés à nouveau et chaînes mises en correspondance.',
+      ok: 'Téléchargé',
+      failing: 'En échec',
+      notYet: 'Pas encore téléchargé',
+      fetched: 'Dernier téléchargement',
+      contents: (channels: string, programmes: string) =>
+        `${channels} chaînes, ${programmes} programmes`,
+      next: 'Prochain téléchargement',
+    },
+    automap: {
+      title: 'Correspondance automatique',
+      help: 'Associe les chaînes aux chaînes des guides par identifiant, puis par nom, en parcourant les guides dans l’ordre. Les correspondances choisies à la main sont gardées, sauf si vous refaites toutes les chaînes.',
+      unmapped: 'Associer les chaînes sans guide',
+      remap: 'Refaire toutes les chaînes',
+      remapConfirm:
+        'Refaire la correspondance de toutes les chaînes\u202f? Celles choisies à la main, «\u202fsans guide\u202f» compris, sont perdues.',
+      running: 'Association…',
+      done: (changed: string, mapped: string, channels: string) =>
+        `${changed} modifiées. ${mapped} chaînes sur ${channels} ont un guide.`,
+    },
+    mapping: {
+      title: 'Correspondance des guides',
+      help: 'La chaîne de guide dont chaque chaîne prend ses programmes. Choisissez-la à la main quand l’association automatique se trompe ou ne trouve rien.',
+      show: 'Afficher',
+      states: {
+        all: 'Toutes',
+        mapped: 'Avec un guide',
+        unmapped: 'Sans guide',
+        manual: 'Choisies à la main',
+      },
+      search: 'Chercher une chaîne',
+      empty: 'Aucune chaîne ne correspond.',
+      none: 'Sans guide',
+      manualNone: 'Choisi à la main',
+      manual: 'À la main',
+      automatic: 'Automatique',
+      choose: 'Choisir une chaîne de guide',
+      chooseLabel: (name: string) => `Choisir la chaîne de guide de ${name}`,
+      noGuide: 'Sans guide',
+      noGuideLabel: (name: string) => `Pas de guide pour ${name}`,
+      backToAutomatic: 'Revenir à l’automatique',
+      automaticLabel: (name: string) => `Associer ${name} automatiquement à nouveau`,
+      changed: (name: string, guide: string) => `${name}\u202f: ${guide}.`,
+    },
+    picker: {
+      title: (name: string) => `Chaîne de guide pour ${name}`,
+      search: 'Chercher dans les guides par nom ou identifiant',
+      guide: 'Guide',
+      allGuides: 'Tous les guides',
+      guideN: (position: number) => `Guide ${position}`,
+      alsoNamed: (names: string) => `Aussi\u202f: ${names}`,
+      now: (title: string, start: string, end: string) =>
+        `En ce moment\u202f: ${title} (${start}–${end})`,
+      nothingNow: 'Rien en ce moment',
+      choose: 'Choisir',
+      chooseLabel: (name: string) => `Choisir ${name}`,
+      empty: 'Aucune chaîne de guide ne correspond.',
+      noGuides: 'Ce catalogue n’a pas encore de guide\u202f: ajoutez-en un dans Guides.',
+    },
+    catalog: {
+      title: (name: string, addon: string) => `${name} (${addon})\u202f: guides`,
+      titleLoading: 'Guides',
+      description:
+        'Les guides XMLTV de ce catalogue de TV en direct, et la chaîne de guide de chacune de ses chaînes.',
+      back: 'Retour à la TV en direct',
+    },
+    library: {
+      guides: (count: number) => (count === 1 ? '1 guide' : `${count} guides`),
+      mapped: (mapped: string, channels: string) =>
+        `${mapped} chaînes sur ${channels} avec un guide`,
+    },
+  },
+}
+
+export default iptv

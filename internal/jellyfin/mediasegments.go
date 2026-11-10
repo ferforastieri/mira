@@ -1,0 +1,469 @@
+package jellyfin
+
+import (
+	"cmp"
+	"context"
+	"crypto/sha256"
+	"errors"
+	"net/http"
+	"slices"
+	"strconv"
+	"strings"
+	"time"
+	"unicode"
+
+	"github.com/ferforastieri/mira/internal/accounts"
+	"github.com/ferforastieri/mira/internal/iptv"
+	"github.com/ferforastieri/mira/internal/library"
+	"github.com/ferforastieri/mira/internal/media"
+	"github.com/ferforastieri/mira/internal/mediasegments"
+)
+
+// MediaSegmentDto is a part of an item that apps offer to skip.
+type MediaSegmentDto struct {
+	Id         string
+	ItemId     string
+	Type       string
+	StartTicks int64
+	EndTicks   int64
+}
+
+// MediaSegmentDtoQueryResult lists an item's segments.
+type MediaSegmentDtoQueryResult struct {
+	Items            []MediaSegmentDto
+	TotalRecordCount int
+	StartIndex       int
+}
+
+// segmentTypes are the types Jellyfin names, by their lower-case names.
+var segmentTypes = map[string]string{
+	"unknown": "Unknown", "commercial": "Commercial", "preview": "Preview",
+	"recap": "Recap", "outro": "Outro", "intro": "Intro",
+}
+
+// mediaSegments answers the segments of a movie or an episode, opened by
+// its own identifier or by one of its versions', and the commercial breaks
+// found in a recording (see package commercials). Other items have none.
+// The segments of titles come from community databases; one that fails
+// only leaves its segments out. They are then shaped for the version
+// asked, the first for the title's own identifier, once it is analyzed,
+// and that version's chapters may give its own (see versionSegments). A
+// version not analyzed yet is never analyzed for this. An episode's local
+// file without an intro or credits yet may have them found in its audio
+// (see audioSegments). The credits of an analyzed version are then split
+// around the scenes within them (see splitAtStingers). With the skip
+// buttons turned off in the settings, no database is asked and every item
+// has none, as on a Jellyfin server without a segment provider.
+func (h *Handler) mediaSegments(w http.ResponseWriter, r *http.Request) {
+	opened, segments, ok := h.openedSegments(w, r)
+	if !ok {
+		return
+	}
+	result := MediaSegmentDtoQueryResult{Items: []MediaSegmentDto{}}
+	wanted := map[string]bool{}
+	included := listQuery(r, "includeSegmentTypes")
+	for _, name := range included {
+		if kind, ok := segmentTypes[strings.ToLower(name)]; ok {
+			wanted[kind] = true
+		}
+	}
+	for _, segment := range segments {
+		if len(included) > 0 && !wanted[string(segment.Type)] {
+			continue
+		}
+		result.Items = append(result.Items, MediaSegmentDto{
+			Id:         segmentID(opened, segment).String(),
+			ItemId:     opened.String(),
+			Type:       string(segment.Type),
+			StartTicks: int64(segment.Start / 100),
+			EndTicks:   int64(segment.End / 100),
+		})
+	}
+	result.TotalRecordCount = len(result.Items)
+	writeJSON(w, http.StatusOK, result)
+}
+
+// SegmentOriginDto is a segment as GET /Mira/MediaSegments/{itemId}
+// lists it: its Type and times as Jellyfin's, and where it comes from (see
+// mediasegments.Origin): Found, how it was found, empty when unknown;
+// Database, which database gave it; Confidence, that database's rating of
+// it, from 0 to 1, absent when it gives none.
+type SegmentOriginDto struct {
+	Type       string
+	StartTicks int64
+	EndTicks   int64
+	Found      string   `json:",omitempty"`
+	Database   string   `json:",omitempty"`
+	Confidence *float64 `json:",omitempty"`
+}
+
+// segmentOrigins answers GET /Mira/MediaSegments/{itemId}: the segments
+// GET /MediaSegments/{itemId} answers, of every type, each with where it
+// comes from, which Jellyfin's segments do not tell. Silo's apps show it
+// (see package silo).
+func (h *Handler) segmentOrigins(w http.ResponseWriter, r *http.Request) {
+	_, segments, ok := h.openedSegments(w, r)
+	if !ok {
+		return
+	}
+	result := struct{ Items []SegmentOriginDto }{Items: []SegmentOriginDto{}}
+	for _, segment := range segments {
+		result.Items = append(result.Items, SegmentOriginDto{Type: string(segment.Type), StartTicks: int64(segment.Start / 100),
+			EndTicks: int64(segment.End / 100), Found: string(segment.Origin.Found), Database: segment.Origin.Database,
+			Confidence: segment.Origin.Confidence})
+	}
+	writeJSON(w, http.StatusOK, result)
+}
+
+// openedSegments are the segments of the item a request's itemId opens, as
+// mediaSegments describes them, answering the request when it cannot.
+func (h *Handler) openedSegments(w http.ResponseWriter, r *http.Request) (accounts.ID, []mediasegments.Segment, bool) {
+	b := bindErrors{}
+	opened := b.pathID(r, "itemId")
+	if len(b) > 0 {
+		validationProblem(w, b)
+		return opened, nil, false
+	}
+	user := callerFrom(r.Context()).User
+	item, err := h.title(r.Context(), user, opened)
+	if errors.Is(err, library.ErrNotFound) {
+		// Jellyfin answers an empty list for an item without segments,
+		// such as a series, and Not Found for an unknown one.
+		if _, err := h.Library.Item(r.Context(), user, opened); err != nil {
+			h.browseError(w, r, err)
+			return opened, nil, false
+		}
+		return opened, nil, true
+	}
+	if err != nil {
+		h.browseError(w, r, err)
+		return opened, nil, false
+	}
+	if !h.Accounts.Settings().SkipButtons {
+		return opened, nil, true
+	}
+	var segments []mediasegments.Segment
+	if item.Kind == library.KindRecording {
+		segments = h.Commercials.Segments(r.Context(), item.ID)
+	} else if h.Segments.Asks() {
+		title, err := h.segmentTitle(r.Context(), user, item)
+		if err != nil {
+			h.browseError(w, r, err)
+			return opened, nil, false
+		}
+		segments = h.Segments.Segments(r.Context(), title)
+	}
+	if version, ok := h.segmentVersion(r.Context(), user, item, opened); ok {
+		analysis, analyzed := h.Playback.Analyzed(r.Context(), version)
+		if analyzed {
+			segments = versionSegments(segments, analysis, item.Runtime)
+		}
+		if item.Kind == library.KindEpisode {
+			segments = h.audioSegments(r.Context(), segments, version, analysis.Duration, item.Runtime)
+		}
+		if analyzed {
+			segments = h.splitAtStingers(r.Context(), segments, version, analysis, item.Runtime)
+		}
+	}
+	return opened, segments, true
+}
+
+// segmentVersion is the version a movie's or an episode's segments are
+// asked for: the version of the identifier asked, or, for the title's own
+// identifier, its first version listed, which media sources name after the
+// title (see sourceID). There is none before its versions are listed.
+func (h *Handler) segmentVersion(ctx context.Context, user accounts.User, item library.Item, opened accounts.ID) (accounts.ID, bool) {
+	if item.Kind != library.KindMovie && item.Kind != library.KindEpisode {
+		return accounts.ID{}, false
+	}
+	if opened != item.ID {
+		return opened, true
+	}
+	versions := h.cachedPlayable(ctx, user, item).versions
+	if len(versions) == 0 {
+		return accounts.ID{}, false
+	}
+	return versions[0].ID, true
+}
+
+// audioSegments adds to an episode's segments, shaped for its version (see
+// versionSegments), the intro and the credits found in the audio of the
+// version's file, if a local file (see package audiosegments), of the
+// types none of them is: its chapters and the databases come first. They
+// are fitted to the version lasting end, listed as lasting listed, as the
+// others are (see fitSegments); end is 0 for a version not analyzed.
+func (h *Handler) audioSegments(ctx context.Context, segments []mediasegments.Segment, version accounts.ID, end, listed time.Duration) []mediasegments.Segment {
+	if h.AudioSegments == nil {
+		return segments
+	}
+	known, ok := h.Library.KnownVersion(version)
+	if !ok {
+		return segments
+	}
+	found := slices.DeleteFunc(h.AudioSegments.Segments(ctx, known.URL), func(s mediasegments.Segment) bool { return hasSegment(segments, s.Type) })
+	if len(found) == 0 {
+		return segments
+	}
+	return fitSegments(append(segments, found...), end, listed)
+}
+
+// hasSegment reports whether one of segments is of type kind.
+func hasSegment(segments []mediasegments.Segment, kind mediasegments.Type) bool {
+	return slices.ContainsFunc(segments, func(s mediasegments.Segment) bool { return s.Type == kind })
+}
+
+// foundInAudio reports whether an intro or credits were found in the audio
+// of a version's file (see audioSegments).
+func (h *Handler) foundInAudio(ctx context.Context, version library.Version) bool {
+	return h.AudioSegments != nil && len(h.AudioSegments.Segments(ctx, version.URL)) > 0
+}
+
+// audioLookup bounds the look for the segments of an episode played,
+// before its season is compared: the databases were asked as it started.
+const audioLookup = time.Minute
+
+// findInAudio has the season of an episode played from a local file
+// compared in the background (see package audiosegments) when the version
+// played, mediaSource, has no intro or no credits from its chapters or a
+// database.
+func (h *Handler) findInAudio(ctx context.Context, user accounts.User, item library.Item, mediaSource string) {
+	if h.AudioSegments == nil || item.Kind != library.KindEpisode || !h.Accounts.Settings().SkipButtons {
+		return
+	}
+	id, ok := parseGUID(mediaSource)
+	if !ok {
+		return
+	}
+	go func() {
+		ctx, cancel := context.WithTimeout(context.WithoutCancel(ctx), audioLookup)
+		defer cancel()
+		// The title's own identifier stands for the version its first
+		// media source describes, as in PlaybackInfo (see
+		// firstWorkingVersion).
+		if id == item.ID {
+			id = h.firstWorkingVersion(ctx, user, item)
+		}
+		version, err := h.Library.Version(ctx, user, item.ID, id)
+		// Only a local file is read: the databases are not asked for others.
+		if err != nil || !h.AudioSegments.Reads(ctx, version.URL) {
+			return
+		}
+		var segments []mediasegments.Segment
+		if h.Segments.Asks() {
+			if title, err := h.segmentTitle(ctx, user, item); err == nil {
+				segments = h.Segments.Segments(ctx, title)
+			}
+		}
+		if analysis, ok := h.Playback.Analyzed(ctx, version.ID); ok {
+			segments = versionSegments(segments, analysis, item.Runtime)
+		}
+		if !hasSegment(segments, mediasegments.Intro) || !hasSegment(segments, mediasegments.Outro) {
+			h.AudioSegments.Played(ctx, version.URL)
+		}
+	}()
+}
+
+// Credits ending within creditsAtEnd of a version's end run to its end.
+// Those jellyfin-web is to offer to skip end creditsLead before it, and
+// only when they still last minSkippable, as it ignores shorter segments.
+const (
+	creditsAtEnd = 2 * time.Second
+	creditsLead  = time.Second
+	minSkippable = 3 * time.Second
+)
+
+// versionSegments shapes a title's segments for a version of it, from the
+// version's analysis, as jellyfin-web plays them. listed is the runtime the
+// title is listed with, which jellyfin-web queues it with. The version's
+// own chapters named as an intro, a recap, a preview or credits (see
+// chapterSegments) give its segments of those types in place of the
+// databases', which may be timed on another cut; all are then fitted to
+// the version (see fitSegments).
+func versionSegments(segments []mediasegments.Segment, analysis media.Analysis, listed time.Duration) []mediasegments.Segment {
+	own := chapterSegments(analysis)
+	shaped := make([]mediasegments.Segment, 0, len(segments)+len(own))
+	for _, segment := range segments {
+		if !slices.ContainsFunc(own, func(o mediasegments.Segment) bool { return o.Type == segment.Type }) {
+			shaped = append(shaped, segment)
+		}
+	}
+	return fitSegments(append(shaped, own...), analysis.Duration, listed)
+}
+
+// fitSegments fits segments to a version lasting end, unknown when 0, of a
+// title listed as lasting listed, and sorts them by start. No segment
+// passes the version's end: one starting at or after it is left out, and
+// the others end at the latest there.
+//
+// jellyfin-web shows no skip button for credits ending at or after the
+// listed runtime when a next item is queued: its video page shows its "Up
+// Next" card instead, but only for credits ending at or after the version's
+// own length. Credits running to the end of a version that the listed
+// runtime does not fall short of thus end creditsLead before the end, so
+// that jellyfin-web offers to skip them and skipping still ends the
+// version; the others end exactly at the end, so that it shows its card.
+// Segments fitted once are fitted the same again.
+func fitSegments(segments []mediasegments.Segment, end, listed time.Duration) []mediasegments.Segment {
+	if end > 0 {
+		segments = slices.DeleteFunc(segments, func(s mediasegments.Segment) bool { return s.Start >= end })
+		for i := range segments {
+			segment := &segments[i]
+			segment.End = min(segment.End, end)
+			if segment.Type != mediasegments.Outro || end-segment.End > creditsAtEnd {
+				continue
+			}
+			segment.End = end
+			// Compared in ticks, as jellyfin-web compares them.
+			if listed/100 >= end/100 && end-creditsLead-segment.Start >= minSkippable {
+				segment.End = end - creditsLead
+			}
+		}
+	}
+	slices.SortStableFunc(segments, func(a, b mediasegments.Segment) int { return cmp.Compare(a.Start, b.Start) })
+	return segments
+}
+
+// chapterSegments are the segments a version's chapters name (see
+// chapterKind), as Jellyfin's Chapter Segments Provider makes them: each
+// runs from its chapter's start to the next chapter's, the last to the
+// version's end. Chapters of the same kind in a row make one segment.
+func chapterSegments(analysis media.Analysis) []mediasegments.Segment {
+	chapters := analysis.Chapters
+	var segments []mediasegments.Segment
+	var previous mediasegments.Type
+	for i, chapter := range chapters {
+		end := chapterEnd(analysis, i)
+		kind := chapterKind(chapter.Title)
+		switch {
+		case kind == "" || end <= chapter.Start:
+			previous = ""
+		case kind == previous:
+			last := &segments[len(segments)-1]
+			last.End = max(last.End, end)
+		default:
+			segments = append(segments, mediasegments.Segment{Type: kind, Start: chapter.Start, End: end,
+				Origin: mediasegments.Origin{Found: mediasegments.InChapters}})
+			previous = kind
+		}
+	}
+	return segments
+}
+
+// chapterNames are the chapter names that mark each type of segment, in
+// the order they are tried, as whole words in lower case and without
+// accents: the default patterns of Jellyfin's Chapter Segments Provider,
+// but its commercial breaks, with their French. "Credits" covers end and
+// closing credits, and "crédits".
+var chapterNames = []struct {
+	kind  mediasegments.Type
+	names []string
+}{
+	{mediasegments.Intro, []string{"intro", "introduction", "opening",
+		"generique de debut", "generique d ouverture", "ouverture"}},
+	{mediasegments.Preview, []string{"preview", "previews", "next time on", "next on", "sneak peek", "next episode",
+		"apercu", "prochainement", "prochain episode", "a suivre"}},
+	{mediasegments.Recap, []string{"recap", "previously", "last time on", "last on",
+		"recapitulatif", "resume", "precedemment", "episode precedent"}},
+	{mediasegments.Outro, []string{"outro", "closing", "credits", "ending",
+		"generique de fin", "generique final"}},
+}
+
+// chapterKind tells the segment a chapter's name marks: Intro, Preview,
+// Recap or Outro, matching its whole words in any letter case, with or
+// without accents; none for other names, such as "Chapter 2", and for a
+// scene during or after the credits (see stingerNames), which is not to be
+// skipped with them. The types are tried in that order, as Jellyfin's
+// plugin tries them, so that "Opening Credits" is an intro. The short forms
+// OP and ED count only as the whole name (see shortName), as words such as
+// "Ed" in "Ed Wood" are often something else.
+func chapterKind(name string) mediasegments.Type {
+	words, text := chapterWords(name)
+	if stingerText(text) {
+		return ""
+	}
+	for _, kind := range chapterNames {
+		if slices.ContainsFunc(kind.names, func(n string) bool { return strings.Contains(text, " "+n+" ") }) ||
+			kind.kind == mediasegments.Intro && shortName(words, "op") ||
+			kind.kind == mediasegments.Outro && shortName(words, "ed") {
+			return kind.kind
+		}
+	}
+	return ""
+}
+
+// chapterWords are the words of a chapter's name, in lower case and without
+// accents, and text the same words joined by spaces, with a space before
+// and after them, so that whole words are found with " "+words+" ".
+func chapterWords(name string) (words []string, text string) {
+	words = strings.FieldsFunc(iptv.Fold(name), func(r rune) bool { return !unicode.IsLetter(r) && !unicode.IsDigit(r) })
+	return words, " " + strings.Join(words, " ") + " "
+}
+
+// chapterEnd is where the chapter at index i of a version ends, as
+// Jellyfin's Chapter Segments Provider has it: at the next chapter's start,
+// the last at the version's end, or at its own end when that is unknown.
+func chapterEnd(analysis media.Analysis, i int) time.Duration {
+	switch {
+	case i+1 < len(analysis.Chapters):
+		return analysis.Chapters[i+1].Start
+	case analysis.Duration > 0:
+		return analysis.Duration
+	}
+	return analysis.Chapters[i].End
+}
+
+// shortName reports whether a name's words are only a short form, maybe
+// followed by a number, with or without a space or a sign before it: "OP",
+// "op 1", "ED2", "ED - 2".
+func shortName(words []string, short string) bool {
+	switch len(words) {
+	case 1:
+		rest, ok := strings.CutPrefix(words[0], short)
+		return ok && (rest == "" || decimalDigits(rest))
+	case 2:
+		return words[0] == short && decimalDigits(words[1])
+	}
+	return false
+}
+
+// segmentTitle identifies a movie or an episode to the segment databases:
+// an episode by its series' identifiers and its numbers, and, while
+// PublicMetaDB is asked, by TMDB's numbers too (see
+// library.Service.TMDBNumbering, which keeps them). PublicMetaDB is not
+// asked for an episode of a series whose TMDB identifier is the
+// moviedb_id of its description when nothing tells TMDB's numbering of
+// it: the addon that gives it may number the series otherwise, and have
+// PublicMetaDB asked for another episode.
+func (h *Handler) segmentTitle(ctx context.Context, user accounts.User, item library.Item) (mediasegments.Title, error) {
+	title := mediasegments.Title{Item: item.ID, Runtime: item.Runtime}
+	ids := item.ProviderIDs
+	if item.Kind == library.KindEpisode {
+		series, err := h.Library.Item(ctx, user, item.SeriesID)
+		if err != nil {
+			return title, err
+		}
+		ids = series.ProviderIDs
+		title.Season, title.Episode = item.ParentIndexNumber, item.IndexNumber
+		if h.Segments.AsksPublicMetaDB() {
+			// An error leaves the zero numbering: TMDB's alike, unsourced.
+			numbering, _ := h.Library.TMDBNumbering(ctx, item.SeriesID)
+			if series.TMDBFromMoviedb && !numbering.Sourced() {
+				title.SetTMDBNumbers(0, 0, false)
+			} else {
+				title.SetTMDBNumbers(numbering.ToTMDB(title.Season, title.Episode))
+			}
+		}
+	}
+	title.IMDb, title.TMDB = ids["Imdb"], ids["Tmdb"]
+	return title, nil
+}
+
+// segmentID derives a segment's identifier from the item opened and the
+// segment, so that it stays the same from one request to the next.
+func segmentID(item accounts.ID, segment mediasegments.Segment) accounts.ID {
+	sum := sha256.Sum256([]byte("mira:segment:" + item.String() + "|" + string(segment.Type) + "|" +
+		strconv.FormatInt(int64(segment.Start), 10)))
+	var id accounts.ID
+	copy(id[:], sum[:16])
+	return id
+}

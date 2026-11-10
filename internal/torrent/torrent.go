@@ -1,0 +1,1871 @@
+package torrent
+
+import (
+	"context"
+	"crypto/sha1"
+	"encoding/binary"
+	"errors"
+	"fmt"
+	"io"
+	"net/netip"
+	"os"
+	"runtime/debug"
+	"slices"
+	"sync"
+	"time"
+
+	"github.com/ferforastieri/mira/internal/torrent/utp"
+)
+
+const (
+	// maxPeers is how many peers a torrent connects to, maxDialing how many
+	// it dials at once: a dial no peer answers holds its slot for the
+	// handshake's 20 seconds, so twice as many dials reach a seeder behind
+	// 23 silent peers in 20 seconds rather than 40, while the connections
+	// through a proxy stay within maxPeers.
+	maxPeers   = 30
+	maxDialing = 16
+	// redialWait is how long a peer whose dial failed, or whose
+	// connection ended, waits before it is dialed again, doubled for each
+	// failure in a row up to maxRedialWait: a peer refuses while its
+	// slots are full, a route drops a connection, and both come back. A
+	// connection that lasted stableFor counts as no failure, and a peer
+	// given up for its silence counts as givenUpFails, which waits
+	// maxRedialWait.
+	redialWait    = 10 * time.Second
+	maxRedialWait = 5 * time.Minute
+	stableFor     = time.Minute
+	givenUpFails  = 64
+	// pipeline is how many blocks a peer is asked for at once. dropWait is
+	// how long a request a peer skipped, sending blocks asked after it,
+	// waits before it is taken as dropped and its block asked again, of
+	// another peer or the same; past maxReasks drops of a block, the peer
+	// is not asked for it again (see reask).
+	pipeline  = 32
+	dropWait  = 5 * time.Second
+	maxReasks = 2
+	// stallWait is how long a peer that sent blocks may then send not a
+	// byte before the oldest request it holds is asked again, when no new
+	// request can tell whether it dropped it: twice as long as a uTP
+	// connection lives on unanswered, longer than any stall of the link.
+	// Tests that shorten dropWait shorten it alike.
+	stallWait = 30 * time.Second
+	// maxDuplicates bounds the blocks of the endgame asked of a second
+	// peer and not received yet.
+	maxDuplicates = 16
+	// readWindow is how far past a read the pieces are fetched, and
+	// edgePieces how many pieces of a file's start and end are, for its
+	// index.
+	readWindow = 16 << 20
+	edgePieces = 2
+	// unchokeSlots is how many interested peers are shared with at once,
+	// while sharing.
+	unchokeSlots = 4
+	// checkEvery is how often the route is checked while a torrent runs,
+	// chokeEvery how often the peers shared with are chosen again.
+	checkEvery = 5 * time.Second
+	chokeEvery = 10 * time.Second
+	// dhtEvery is how often the DHT is looked up again once the torrent
+	// has a peer, dhtAgain how soon while it has none, or after a lookup
+	// that found no peer or could not be made: peers a lookup found may
+	// all be gone or unreachable, and the next lookup may find others
+	// within the torrent's start. maxNodesLearned is how many nodes peers
+	// tell are kept.
+	dhtEvery        = 5 * time.Minute
+	dhtAgain        = 10 * time.Second
+	maxNodesLearned = 50
+	// keptPeers is how many of the peers a torrent connected to it keeps
+	// for its next run (see Engine.keepLocked).
+	keptPeers = 50
+)
+
+// errStopped reports a read of a torrent that stopped: its playback ended.
+var errStopped = errors.New("the torrent stopped: its playback ended")
+
+// torrent is a torrent being played: its swarm, its pieces, its readers.
+type torrent struct {
+	engine *Engine
+	hash   Hash
+	route  Route
+	// udp tells whether the route carries UDP: UDP trackers and the DHT.
+	udp bool
+	// run is the store's number for this run of the torrent (see
+	// store.started), set as it joins the engine.
+	run    uint64
+	ctx    context.Context
+	cancel context.CancelFunc
+
+	mu       sync.Mutex
+	trackers []string
+	nodes    []string
+	dht      bool
+	info     *Info
+	infoData []byte
+	// metadata is the info dictionary being received from peers, by
+	// pieces of metadataBlock.
+	metadata    []byte
+	metadataGot []bool
+	have        []bool
+	inflight    map[int]*inflightPiece
+	peers       map[netip.AddrPort]*peer
+	known       map[netip.AddrPort]candidate
+	queue       []netip.AddrPort
+	dialing     int
+	// redials are the peers waiting to be dialed again, nextRedial the
+	// soonest time one may be, zero when none waits.
+	redials    []netip.AddrPort
+	nextRedial time.Time
+	reads      map[*Reader]readSpan
+	files      []File
+	changed    chan struct{}
+	// flowing is closed, and replaced, as a block of a piece arrives, and
+	// as the route is found down within its grace, at waitedOn: the reads
+	// waiting for pieces tell their callers to wait on (see
+	// Reader.ReadAtProgress and guard), and the torrent counts as
+	// receiving (see Engine.Received).
+	flowing   chan struct{}
+	waitedOn  time.Time
+	err       error
+	upBytes   int64
+	downBytes int64
+	refs      int
+	linger    *time.Timer
+	// ending tells that the torrent stops once its playbacks end, without
+	// the linger (see Engine.End).
+	ending bool
+	// announces is what each tracker last answered, nil for peers, and
+	// looked whether the DHT was looked up, for a StartError.
+	announces map[string]error
+	looked    bool
+
+	// extra are the trackers of the settings that no listing of the
+	// torrent named (see Settings.Trackers). A private torrent's trackers
+	// are its own (BEP 27): extraCtx, from which their announces run,
+	// ends once its info tells it is private.
+	extra     map[string]bool
+	extraCtx  context.Context
+	stopExtra context.CancelFunc
+	// reached are the peers the torrent connected to, the latest last,
+	// keptPeers at most, and closest the DHT nodes nearest the torrent
+	// that answered its last lookup: both are kept once it stops, for its
+	// next run (see Engine.keepLocked).
+	reached []netip.AddrPort
+	closest []string
+
+	// duplicates counts the blocks asked of more than one peer, once for
+	// each peer past the first.
+	duplicates int
+	// flags are the flags peer exchange told of peers (pexUTP among
+	// them), and pexWaiting the peers it told before the torrent's info
+	// tells whether it is private, dialed once it is not.
+	flags      map[netip.AddrPort]byte
+	pexWaiting []netip.AddrPort
+	// stopLookup stops the DHT lookup running, nil when none runs.
+	stopLookup context.CancelFunc
+	// utpMu guards the uTP socket (see utpSocket): it is opened while
+	// the torrent's lock is free.
+	utpMu      sync.Mutex
+	utpSock    *utp.Socket
+	utpStopped bool
+	utpRetryAt time.Time
+}
+
+// candidate is a peer the torrent knows of: fails counts its dials in a
+// row that failed, or its connections that ended soon, and retryAt, while
+// it waits to be dialed again, is when it may be; last is how its last
+// dial or connection ended, outcomeNone before any.
+type candidate struct {
+	fails   int
+	retryAt time.Time
+	last    outcome
+}
+
+// inflightPiece is a piece being downloaded: its bytes, the blocks
+// received, when each was last asked for, and of how many peers.
+type inflightPiece struct {
+	data      []byte
+	got       []bool
+	requested []time.Time
+	asks      []uint8
+	left      int
+}
+
+// readSpan is what a read waits for: the bytes from at to end, among the
+// torrent's. Once read, end is at.
+type readSpan struct {
+	at, end int64
+}
+
+func newTorrent(e *Engine, spec Spec, route Route, udp bool) *torrent {
+	ctx, cancel := context.WithCancel(context.Background())
+	t := &torrent{engine: e, hash: spec.Hash, route: route, udp: udp, ctx: ctx, cancel: cancel,
+		trackers: slices.Clone(spec.Trackers), nodes: slices.Clone(spec.Nodes), dht: spec.DHT,
+		inflight: map[int]*inflightPiece{}, peers: map[netip.AddrPort]*peer{}, known: map[netip.AddrPort]candidate{},
+		flags: map[netip.AddrPort]byte{}, reads: map[*Reader]readSpan{}, changed: make(chan struct{}),
+		flowing: make(chan struct{}), announces: map[string]error{}, extra: map[string]bool{}}
+	t.extraCtx, t.stopExtra = context.WithCancel(ctx)
+	return t
+}
+
+// seed starts a new run of the torrent from what its last run learned:
+// its info dictionary, which no peer then needs to send, the peers it
+// connected to, dialed first, and the DHT nodes nearest it, which its
+// first lookup starts from. Called before start.
+func (t *torrent) seed(kept keptRun) {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	if kept.info != nil {
+		t.info, t.infoData = kept.info, kept.infoData
+		t.have = make([]bool, len(kept.info.Pieces))
+		t.engine.store.mark(t.hash, t.have)
+		if kept.info.Private {
+			t.stopExtra()
+		}
+	}
+	for _, address := range kept.peers {
+		if !t.knows(address) {
+			t.known[address] = candidate{}
+			t.queue = append(t.queue, address)
+		}
+	}
+	t.closest = slices.Clone(kept.nodes)
+}
+
+// addExtra adds the trackers of the settings that the torrent's listings
+// do not name (see Settings.Trackers), and returns those it added. A
+// private torrent takes none. The lock is held.
+func (t *torrent) addExtra(trackers []string) []string {
+	if t.extraCtx.Err() != nil {
+		return nil
+	}
+	var added []string
+	for _, tracker := range trackers {
+		if !slices.Contains(t.trackers, tracker) {
+			t.trackers = append(t.trackers, tracker)
+			t.extra[tracker] = true
+			added = append(added, tracker)
+		}
+	}
+	return added
+}
+
+// named counts the trackers the torrent's listings name, those of the
+// settings aside. The lock is held.
+func (t *torrent) named() int {
+	return len(t.trackers) - len(t.extra)
+}
+
+// start runs the torrent's swarm until it stops, with extra, the trackers
+// of the settings, besides those its listing names.
+func (t *torrent) start(extra []string) {
+	go t.watch()
+	go t.guard()
+	go t.connect()
+	t.mu.Lock()
+	t.addExtra(extra)
+	trackers := slices.Clone(t.trackers)
+	t.mu.Unlock()
+	for _, tracker := range trackers {
+		t.goAnnounce(tracker)
+	}
+	go t.lookup()
+}
+
+// goAnnounce announces the torrent to a tracker until it stops, or, for
+// one of the settings, until its info tells it is private.
+func (t *torrent) goAnnounce(tracker string) {
+	t.mu.Lock()
+	ctx := t.ctx
+	if t.extra[tracker] {
+		ctx = t.extraCtx
+	}
+	t.mu.Unlock()
+	if ctx.Err() == nil {
+		go t.announce(ctx, tracker)
+	}
+}
+
+// merge adds the trackers and nodes of another listing of the torrent,
+// and extra, the trackers of the settings now.
+func (t *torrent) merge(spec Spec, extra []string) {
+	t.mu.Lock()
+	var added []string
+	for _, tracker := range spec.Trackers {
+		if t.extra[tracker] {
+			// Announced already, now named by a listing too.
+			delete(t.extra, tracker)
+			continue
+		}
+		if !slices.Contains(t.trackers, tracker) {
+			t.trackers = append(t.trackers, tracker)
+			added = append(added, tracker)
+		}
+	}
+	added = append(added, t.addExtra(extra)...)
+	for _, node := range spec.Nodes {
+		if !slices.Contains(t.nodes, node) {
+			t.nodes = append(t.nodes, node)
+		}
+	}
+	t.dht = t.dht || spec.DHT
+	t.mu.Unlock()
+	for _, tracker := range added {
+		t.goAnnounce(tracker)
+	}
+}
+
+// signal wakes whoever waits for the torrent to change. The lock is held.
+func (t *torrent) signal() {
+	close(t.changed)
+	t.changed = make(chan struct{})
+}
+
+// fail stops the torrent at once, telling its readers why.
+func (t *torrent) fail(err error) {
+	t.mu.Lock()
+	if t.err != nil {
+		t.mu.Unlock()
+		return
+	}
+	t.err = err
+	peers := make([]*peer, 0, len(t.peers))
+	for _, p := range t.peers {
+		peers = append(peers, p)
+	}
+	t.signal()
+	t.mu.Unlock()
+	t.cancel()
+	t.stopUTP()
+	for _, p := range peers {
+		p.close()
+	}
+}
+
+// recovered is deferred at the top of each goroutine that handles one
+// peer connection, tracker announce or DHT lookup, and the route's checks:
+// the parsers check what other programs send, and recovered is the last
+// line of defence beside them. A panic ends only that goroutine, logged
+// once with its stack, then, when set, tells then why; the server and the
+// torrent's other exchanges go on.
+func (t *torrent) recovered(what string, then func(error)) {
+	v := recover()
+	if v == nil {
+		return
+	}
+	t.engine.config.Logger.Error("A torrent's "+what+" ended on a panic", "panic", fmt.Sprint(v), "stack", string(debug.Stack()))
+	if then != nil {
+		then(fmt.Errorf("the torrent's %s ended on a panic: %v", what, v))
+	}
+}
+
+// watch chooses the peers shared with, and asks again for the blocks peers
+// dropped (see reask), until the torrent stops. A panic stops the torrent.
+func (t *torrent) watch() {
+	defer t.recovered("watch of its peers", func(err error) {
+		t.engine.failed(err)
+		t.engine.remove(t, err)
+	})
+	chokes := time.NewTicker(chokeEvery)
+	defer chokes.Stop()
+	stale := time.NewTicker(max(t.engine.dropWait/4, 10*time.Millisecond))
+	defer stale.Stop()
+	for {
+		select {
+		case <-t.ctx.Done():
+			return
+		case <-chokes.C:
+			t.mu.Lock()
+			t.chooseUnchoked()
+			t.mu.Unlock()
+		case <-stale.C:
+			t.reask()
+		}
+	}
+}
+
+// guard checks the torrent's route every checkEvery while it runs, apart
+// from watch, which a check that waits for the route would hold up.
+// Nothing falls back to another route: a route the settings no longer
+// set, or torrents turned off, stop the torrent at once. A route that does
+// not answer stops it once it gave no answer, and the peers no byte, for
+// the engine's grace (RouteGrace), counted from the later of its first
+// failed check and the last byte received: meanwhile the connections open
+// go on through it, new ones are dialed through it alone, failing while
+// it does not answer, and each failed check tells the reads waiting for
+// pieces to wait on, as a block arriving does, so that the source cache,
+// and a play waiting for the torrent, do not take them for stalled before
+// the grace is over. Once the route answers again, the peers waiting to be
+// dialed again are dialed at once (see redialNow). A panic stops the
+// torrent too.
+func (t *torrent) guard() {
+	defer t.recovered("route check", func(err error) {
+		t.engine.failed(err)
+		t.engine.remove(t, err)
+	})
+	ticker := time.NewTicker(t.engine.checkEvery)
+	defer ticker.Stop()
+	// downSince is the first failed check of the outage under way, zero
+	// while the route answers; heard is the last byte received.
+	var downSince, heard time.Time
+	for {
+		select {
+		case <-t.ctx.Done():
+			return
+		case <-ticker.C:
+		}
+		route, err := t.engine.currentRoute()
+		if err == nil && route != t.route {
+			err = errors.New("the route for torrents changed")
+		}
+		if err != nil {
+			if t.ctx.Err() == nil {
+				t.engine.failed(err)
+				t.engine.remove(t, err)
+			}
+			return
+		}
+		err = t.route.Check(t.ctx)
+		if t.ctx.Err() != nil {
+			return
+		}
+		if err == nil {
+			if !downSince.IsZero() {
+				downSince = time.Time{}
+				t.engine.routeUp(t)
+				t.redialNow()
+			}
+			continue
+		}
+		now := time.Now()
+		if downSince.IsZero() {
+			downSince = now
+			t.engine.routeDown(t, err)
+		}
+		if last := t.lastByte(); last.After(heard) {
+			heard = last
+		}
+		if now.Sub(later(downSince, heard)) >= t.engine.routeGrace {
+			t.engine.routeStopped(err, downSince)
+			t.engine.remove(t, err)
+			return
+		}
+		t.mu.Lock()
+		close(t.flowing)
+		t.flowing = make(chan struct{})
+		t.waitedOn = now
+		t.mu.Unlock()
+	}
+}
+
+// lastByte is when a peer connected to the torrent last sent it a byte,
+// zero when none did.
+func (t *torrent) lastByte() time.Time {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	var last int64
+	for _, p := range t.peers {
+		last = max(last, p.received.Load())
+	}
+	if last == 0 {
+		return time.Time{}
+	}
+	return time.Unix(0, last)
+}
+
+// later is the later of a and b.
+func later(a, b time.Time) time.Time {
+	if b.After(a) {
+		return b
+	}
+	return a
+}
+
+// addPeers queues peers to connect to.
+func (t *torrent) addPeers(peers []netip.AddrPort) {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	for _, address := range peers {
+		if !address.IsValid() || address.Port() == 0 || t.knows(address) || len(t.known) > 2000 {
+			continue
+		}
+		t.known[address] = candidate{}
+		t.queue = append(t.queue, address)
+	}
+	t.signal()
+}
+
+// knows reports whether the torrent knows of a peer. The lock is held.
+func (t *torrent) knows(address netip.AddrPort) bool {
+	_, known := t.known[address]
+	return known
+}
+
+// connect keeps the torrent connected to up to maxPeers peers, dialing
+// again those that wait once their time comes (see redial).
+func (t *torrent) connect() {
+	timer := time.NewTimer(time.Hour)
+	timer.Stop()
+	defer timer.Stop()
+	for {
+		t.mu.Lock()
+		next := t.requeue(time.Now())
+		for len(t.queue) > 0 && t.dialing < maxDialing && len(t.peers)+t.dialing < maxPeers && t.err == nil {
+			address := t.queue[0]
+			t.queue = t.queue[1:]
+			t.dialing++
+			go t.dial(address)
+		}
+		changed := t.changed
+		t.mu.Unlock()
+		var due <-chan time.Time
+		if !next.IsZero() {
+			timer.Reset(time.Until(next))
+			due = timer.C
+		}
+		select {
+		case <-t.ctx.Done():
+			return
+		case <-changed:
+		case <-due:
+		}
+	}
+}
+
+// requeue queues the peers whose wait to be dialed again ended by now,
+// and returns when the next one's ends, zero when none waits. The lock is
+// held.
+func (t *torrent) requeue(now time.Time) time.Time {
+	if t.nextRedial.IsZero() || now.Before(t.nextRedial) {
+		return t.nextRedial
+	}
+	t.nextRedial = time.Time{}
+	waiting := t.redials[:0]
+	for _, address := range t.redials {
+		c := t.known[address]
+		if c.retryAt.After(now) {
+			waiting = append(waiting, address)
+			if t.nextRedial.IsZero() || c.retryAt.Before(t.nextRedial) {
+				t.nextRedial = c.retryAt
+			}
+			continue
+		}
+		c.retryAt = time.Time{}
+		t.known[address] = c
+		t.queue = append(t.queue, address)
+	}
+	clear(t.redials[len(waiting):])
+	t.redials = waiting
+	return t.nextRedial
+}
+
+// redial has a known peer dialed again after its wait, its dial or
+// connection having ended as last tells: the engine's redialWait, doubled
+// for each of its fails in a row past the first, up to maxRedialWait.
+// Nothing waits once the torrent stopped. The lock is held.
+func (t *torrent) redial(address netip.AddrPort, last outcome, fails int) {
+	c, known := t.known[address]
+	if !known || t.err != nil {
+		return
+	}
+	wait := redialWait
+	if t.engine != nil && t.engine.redialWait > 0 {
+		wait = t.engine.redialWait
+	}
+	for i := 1; i < fails && wait < maxRedialWait; i++ {
+		wait *= 2
+	}
+	c.fails, c.last, c.retryAt = fails, last, time.Now().Add(min(wait, maxRedialWait))
+	t.known[address] = c
+	t.redials = append(t.redials, address)
+	if t.nextRedial.IsZero() || c.retryAt.Before(t.nextRedial) {
+		t.nextRedial = c.retryAt
+	}
+	t.signal()
+}
+
+// redialNow has the peers waiting to be dialed again dialed at once, but
+// those given up for their silence, as the route answers again after an
+// outage: their dials, and connections, failed for the route rather than
+// for them, and they may take a connection now. The dials go through the
+// route, as every other.
+func (t *torrent) redialNow() {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	now := time.Now()
+	waiting := false
+	for _, address := range t.redials {
+		if c := t.known[address]; c.fails < givenUpFails && c.retryAt.After(now) {
+			c.retryAt, waiting = now, true
+			t.known[address] = c
+		}
+	}
+	if waiting {
+		t.nextRedial = now
+		t.signal()
+	}
+}
+
+// dial connects to a peer, and reads it until the connection ends. A peer
+// that sent nothing for the engine's idleTimeout is given up.
+func (t *torrent) dial(address netip.AddrPort) {
+	defer t.recovered("peer connection", nil)
+	p := t.join(address)
+	if p == nil {
+		return
+	}
+	defer t.leave(p)
+	go p.write()
+	if err := p.read(); errors.Is(err, os.ErrDeadlineExceeded) {
+		t.mu.Lock()
+		p.givenUp = true
+		t.mu.Unlock()
+	}
+}
+
+// join dials a peer counted in dialing, and adds it to the torrent's
+// peers; nil when it does not answer, or is no longer needed. The dial is
+// uncounted as it ends, by a panic too; a dial that failed is made again
+// after its wait (see redial).
+func (t *torrent) join(address netip.AddrPort) *peer {
+	t.mu.Lock()
+	dht := t.usesDHT()
+	t.mu.Unlock()
+	dialed := false
+	defer func() {
+		if !dialed {
+			t.mu.Lock()
+			t.dialing--
+			t.redial(address, outcomeOther, t.known[address].fails+1)
+			t.signal()
+			t.mu.Unlock()
+		}
+	}()
+	conn, extensions, err := t.dialPeer(address, dht)
+	dialed = true
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	t.dialing--
+	t.signal()
+	if err != nil || t.err != nil || t.peers[address] != nil {
+		if conn != nil {
+			conn.Close()
+		}
+		if err != nil {
+			// A dial the route did not carry tells nothing of the peer:
+			// it does not count among its failures, and the peer is
+			// dialed at once when the route answers again (see
+			// redialNow).
+			fails := t.known[address].fails
+			if !RouteFailure(err) {
+				fails++
+			}
+			t.redial(address, outcomeOf(err), fails)
+		}
+		return nil
+	}
+	p := newPeer(t, conn, address)
+	p.joined = time.Now()
+	t.peers[address] = p
+	t.reached = append(slices.DeleteFunc(t.reached, func(a netip.AddrPort) bool { return a == address }), address)
+	if len(t.reached) > keptPeers {
+		t.reached = slices.Delete(t.reached, 0, len(t.reached)-keptPeers)
+	}
+	over := "TCP"
+	if overUTP(p) {
+		over = "uTP"
+	}
+	t.engine.config.Logger.Debug("A torrent reached a peer", "over", over)
+	if extensions {
+		size := 0
+		if t.engine.up.allows() {
+			size = len(t.infoData)
+		}
+		p.sendExtendedHandshake(size)
+	}
+	t.sendBitfield(p)
+	return p
+}
+
+// leave closes a peer's connection, and gives the blocks asked of it to
+// the other peers. The peer is dialed again after its wait (see redial):
+// the first one when its connection lasted stableFor, the longest one
+// when it was given up, and the next one of its failures otherwise.
+func (t *torrent) leave(p *peer) {
+	p.close()
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	delete(t.peers, p.address)
+	t.release(p)
+	t.chooseUnchoked()
+	fails := t.known[p.address].fails + 1
+	switch {
+	case p.givenUp:
+		fails = givenUpFails
+	case time.Since(p.joined) >= stableFor:
+		fails = 1
+	}
+	t.redial(p.address, outcomeLeft, fails)
+	t.signal()
+}
+
+// sendBitfield tells a peer the pieces Mira has, while it shares them.
+// The lock is held.
+func (t *torrent) sendBitfield(p *peer) {
+	if t.info == nil || !t.engine.up.allows() || !slices.Contains(t.have, true) {
+		return
+	}
+	bits := make([]byte, (len(t.have)+7)/8)
+	for i, has := range t.have {
+		if has {
+			bits[i/8] |= 0x80 >> (i % 8)
+		}
+	}
+	p.send(msgBitfield, bits)
+}
+
+// release forgets the blocks asked of a peer, which others may be asked
+// for. The lock is held.
+func (t *torrent) release(p *peer) {
+	for b := range p.requests {
+		t.forget(p, b)
+	}
+}
+
+// ask asks a peer for block i of an inflight piece. The lock is held.
+func (t *torrent) ask(p *peer, in *inflightPiece, i int, b block, now time.Time) {
+	if in.asks[i] > 0 {
+		t.duplicates++
+	}
+	in.asks[i]++
+	in.requested[i] = now
+	if len(p.requests) == 0 {
+		p.heard = now
+	}
+	p.seq++
+	p.requests[b] = &request{seq: p.seq}
+	p.send(msgRequest, requestPayload(b))
+}
+
+// arrived notes a block a peer sent: the requests asked of it before the
+// block and still waiting are overtaken, and the peer is heard. The lock
+// is held.
+func (t *torrent) arrived(p *peer, b block, now time.Time) {
+	r := p.requests[b]
+	if r == nil {
+		return
+	}
+	for _, other := range p.requests {
+		if !r.again && other.seq < r.seq && other.overtaken.IsZero() {
+			other.overtaken = now
+		}
+	}
+	if wait := now.Sub(p.heard); !p.paced {
+		p.pace, p.paced = wait, true
+	} else {
+		p.pace = (3*p.pace + wait) / 4
+	}
+	p.heard, p.probed = now, false
+}
+
+// forget forgets a block asked of a peer, received or not; false when it
+// was not asked. The lock is held.
+func (t *torrent) forget(p *peer, b block) bool {
+	if _, asked := p.requests[b]; !asked {
+		return false
+	}
+	delete(p.requests, b)
+	if in := t.inflight[b.piece]; in != nil {
+		i := b.offset / blockSize
+		if in.asks[i] > 1 {
+			t.duplicates--
+		}
+		in.asks[i]--
+		if in.asks[i] == 0 {
+			in.requested[i] = time.Time{}
+		}
+	}
+	return true
+}
+
+// cancelOthers cancels a block asked of peers other than the one that
+// sent it. The lock is held.
+func (t *torrent) cancelOthers(in *inflightPiece, b block) {
+	if in.asks[b.offset/blockSize] == 0 {
+		return
+	}
+	for _, other := range t.peers {
+		if t.forget(other, b) {
+			other.send(msgCancel, requestPayload(b))
+		}
+	}
+}
+
+// reask asks again for the blocks peers dropped, of the other peers
+// first, and of the same peer when none of them takes it: a peer may drop
+// a REQUEST without a word, and a torrent it serves alone would wait for
+// the block for good. Mira does not offer the fast extension (BEP 6),
+// so no peer tells a drop with REJECT_REQUEST.
+//
+// A peer serves requests in order: a request is dropped once blocks asked
+// after it arrived and it did not, dropWait later. A slow peer is not
+// taken for one that drops: its blocks come in order, however long the
+// last ones wait. A peer that dropped the last requests asked of it sends
+// nothing after them; nor does one whose connection stalls, as uTP's do
+// on a loaded link, while the blocks asked are on their way. So silence
+// asks nothing again at first: once the peer sent not a byte for four
+// times as long as it takes to send a block, dropWait at least, it is
+// asked for one more block, never asked yet, once until it sends again:
+// its arrival tells the requests before it were dropped, and a peer that
+// only stalls sends it in turn. Only when no such block is left, and the
+// peer stayed silent for stallWait, longer than a connection stalls, is
+// the oldest request asked again. The CANCEL goes first, so that a peer
+// that only queued a request does not send its block twice. A block
+// a peer dropped more than maxReasks times is not asked of it again: it
+// may not have it, and the others may. A peer is given up, as one that
+// sends nothing is after idleTimeout, only when it sent no block asked
+// for idleTimeout, keep-alives aside; it stays known, and is dialed again
+// only after maxRedialWait (see leave). A request cancelled is no longer
+// counted as asked, so the endgame's duplicates, of the blocks reads wait
+// for, stay within maxDuplicates.
+func (t *torrent) reask() {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	if t.info == nil || t.err != nil {
+		return
+	}
+	now := time.Now()
+	var asked []*peer
+	again := map[*peer]block{}
+	cancel := func(p *peer, b block) {
+		t.forget(p, b)
+		p.send(msgCancel, requestPayload(b))
+	}
+	for _, p := range t.peers {
+		if len(p.requests) == 0 {
+			continue
+		}
+		silent := now.Sub(p.heard)
+		if silent >= t.engine.idleTimeout {
+			t.engine.config.Logger.Debug("A torrent's peer was given up: it sent none of the blocks asked", "for", silent.Round(time.Second))
+			p.close()
+			p.givenUp = true
+			t.release(p)
+			asked = append(asked, p)
+			continue
+		}
+		dropped := false
+		for b, r := range p.requests {
+			if !r.overtaken.IsZero() && now.Sub(r.overtaken) >= t.engine.dropWait {
+				p.reasked[b]++
+				cancel(p, b)
+				dropped = true
+			}
+		}
+		last := p.heard
+		if received := time.Unix(0, p.received.Load()); received.After(last) {
+			last = received
+		}
+		quiet := now.Sub(last)
+		switch {
+		case dropped || !p.paced || p.probed || quiet < max(t.engine.dropWait, 4*p.pace):
+		case t.probe(p, now):
+			p.probed = true
+		case quiet >= stallWait/dropWait*t.engine.dropWait:
+			var oldest block
+			for b, r := range p.requests {
+				if (oldest == block{}) || r.seq < p.requests[oldest].seq {
+					oldest = b
+				}
+			}
+			cancel(p, oldest)
+			again[p] = oldest
+			p.probed, dropped = true, true
+		}
+		if dropped {
+			asked = append(asked, p)
+		}
+	}
+	if len(asked) == 0 {
+		return
+	}
+	defer func() {
+		for p, b := range again {
+			if r := p.requests[b]; r != nil {
+				r.again = true
+			}
+		}
+	}()
+	for _, p := range t.peers {
+		if !slices.Contains(asked, p) {
+			t.fill(p)
+		}
+	}
+	for _, p := range asked {
+		select {
+		case <-p.closed:
+		default:
+			t.fill(p)
+		}
+	}
+}
+
+// probe asks a silent peer for one more block, past its pipeline: the
+// first it has of those wanted, asked of no peer yet; false when none is
+// left. The lock is held.
+func (t *torrent) probe(p *peer, now time.Time) bool {
+	for _, index := range t.wanted() {
+		if index >= len(p.has) || !p.has[index] {
+			continue
+		}
+		in := t.inflightOf(index)
+		for i := range in.got {
+			b := blockOf(in, index, i)
+			if !in.got[i] && in.asks[i] == 0 && p.reasked[b] <= maxReasks {
+				t.ask(p, in, i, b, now)
+				return true
+			}
+		}
+	}
+	return false
+}
+
+// announce asks a tracker for peers until ctx, the torrent's or that of
+// the settings' trackers, is done, then tells it the torrent stopped.
+func (t *torrent) announce(ctx context.Context, tracker string) {
+	defer t.recovered("tracker announce", nil)
+	event := "started"
+	failures := 0
+	for {
+		answer, err := announceTo(ctx, t.route, tracker, t.announced(event), t.udp)
+		if errors.Is(err, errTrackerUDP) {
+			return
+		}
+		if ctx.Err() == nil {
+			t.mu.Lock()
+			t.announces[tracker] = err
+			t.mu.Unlock()
+		}
+		wait := time.Minute
+		if err != nil {
+			failures++
+			wait = min(time.Duration(failures)*15*time.Second, 5*time.Minute)
+			if ctx.Err() == nil {
+				t.engine.config.Logger.Debug("A tracker could not be reached", "tracker", trackerHost(tracker), "error", err)
+			}
+		} else {
+			failures = 0
+			event = ""
+			t.addPeers(answer.peers)
+			wait = min(max(answer.interval, time.Minute), 30*time.Minute)
+		}
+		timer := time.NewTimer(wait)
+		select {
+		case <-ctx.Done():
+			timer.Stop()
+			if event == "" && !t.failed() {
+				// The tracker forgets Mira, over the route still up.
+				ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+				_, _ = announceTo(ctx, t.route, tracker, t.announced("stopped"), t.udp)
+				cancel()
+			}
+			return
+		case <-timer.C:
+		}
+	}
+}
+
+// announced is what the torrent tells trackers now.
+func (t *torrent) announced(event string) announce {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	left := int64(1)
+	if t.info != nil {
+		left = t.info.Length
+	}
+	return announce{hash: t.hash, peerID: t.engine.peerID, port: announcePort(t.engine.peerID), event: event, left: left,
+		uploaded: t.upBytes, downloaded: t.downBytes}
+}
+
+// lookup looks the torrent's peers up on the DHT while it runs, when the
+// route carries UDP and its sources ask for it or name no tracker, from
+// the nodes nearest the torrent that answered its last lookup, the nodes
+// its sources name and the engine's bootstrap nodes. While the torrent
+// has no peer, it looks again every dhtAgain, whether the last lookup
+// found peers or not: those may all be gone or unreachable. Once it has
+// one, it looks again dhtEvery after the last lookup that found peers.
+// It ends once the torrent's info tells it is private (BEP 27).
+func (t *torrent) lookup() {
+	defer t.recovered("DHT lookup", nil)
+	var found time.Time
+	for {
+		known := t.engine.knownDHT()
+		t.mu.Lock()
+		private := t.private()
+		on, starts := t.usesDHT(), slices.Concat(t.closest, t.nodes, known, t.engine.config.Bootstrap)
+		connected := len(t.peers) > 0
+		t.mu.Unlock()
+		if private {
+			return
+		}
+		wait := t.engine.lookupAgain()
+		switch {
+		case connected && !found.IsZero() && time.Since(found) < dhtEvery:
+			wait = dhtEvery - time.Since(found)
+		case on && len(starts) > 0:
+			found = time.Time{}
+			if t.lookupOnce(starts) {
+				found = time.Now()
+			}
+		}
+		timer := time.NewTimer(wait)
+		select {
+		case <-t.ctx.Done():
+			timer.Stop()
+			return
+		case <-timer.C:
+		}
+	}
+}
+
+// lookupOnce looks the torrent's peers up on the DHT from starts, over a
+// socket of the route; false when the route opens none, or the lookup
+// found no peer: a node's answer lost or later than dhtWait, as a
+// datagram may be, would otherwise keep the torrent off the DHT for
+// dhtEvery, past the wait for its start. The lookup stops as soon as the
+// torrent's info tells it is private.
+func (t *torrent) lookupOnce(starts []string) bool {
+	conn, err := t.route.ListenPacket(t.ctx)
+	if err != nil {
+		return false
+	}
+	defer conn.Close()
+	ctx, cancel := context.WithTimeout(t.ctx, 2*time.Minute)
+	defer cancel()
+	t.mu.Lock()
+	if !t.usesDHT() {
+		t.mu.Unlock()
+		return true
+	}
+	t.looked = true
+	t.stopLookup = cancel
+	t.mu.Unlock()
+	defer func() {
+		t.mu.Lock()
+		t.stopLookup = nil
+		t.mu.Unlock()
+	}()
+	found := false
+	closest, _ := lookupPeers(ctx, conn, t.hash, starts, func(peers []netip.AddrPort) {
+		found = true
+		t.addPeers(peers)
+	})
+	if len(closest) > 0 {
+		t.engine.rememberDHT(closest)
+		t.mu.Lock()
+		t.closest = closest
+		t.mu.Unlock()
+	}
+	return found
+}
+
+// usesDHT reports whether the torrent is looked up on the DHT: its route
+// carries UDP, and its sources ask for it or name no tracker, the DHT
+// being then the only way to its peers, whatever the settings add, and it
+// is not private. The lock is held.
+func (t *torrent) usesDHT() bool {
+	return t.udp && (t.dht || t.named() == 0) && !t.private()
+}
+
+// private reports whether the torrent's info is known and tells it is
+// private (BEP 27): no DHT, no peer exchange. The lock is held.
+func (t *torrent) private() bool {
+	return t.info != nil && t.info.Private
+}
+
+// handle reads a peer's message. Its locks are released by defer, so that
+// a panic, which recovered turns into the connection's end, leaves the
+// torrent's lock free for its other peers.
+func (t *torrent) handle(p *peer, id byte, payload []byte) error {
+	switch id {
+	case msgChoke:
+		t.mu.Lock()
+		defer t.mu.Unlock()
+		p.choked = true
+		t.release(p)
+		t.signal()
+	case msgUnchoke:
+		t.mu.Lock()
+		defer t.mu.Unlock()
+		p.choked = false
+		t.fill(p)
+	case msgInterested, msgNotInterested:
+		t.mu.Lock()
+		defer t.mu.Unlock()
+		p.peerInterested = id == msgInterested
+		t.chooseUnchoked()
+	case msgHave:
+		if len(payload) != 4 {
+			return errors.New("a malformed have")
+		}
+		index := binary.BigEndian.Uint32(payload)
+		t.mu.Lock()
+		defer t.mu.Unlock()
+		// A torrent has maxPieces pieces at most, which bounds what a
+		// peer is known to have before the torrent's info is.
+		if index >= maxPieces || t.info != nil && int(index) >= len(t.info.Pieces) {
+			return errors.New("a have past the torrent's pieces")
+		}
+		for len(p.has) <= int(index) {
+			p.has = append(p.has, false)
+		}
+		p.has[index] = true
+		t.fill(p)
+	case msgBitfield:
+		t.mu.Lock()
+		defer t.mu.Unlock()
+		// A bit a piece: the torrent's pieces once its info is known,
+		// maxPieces at most before.
+		pieces := maxPieces
+		if t.info != nil {
+			pieces = len(t.info.Pieces)
+		}
+		if len(payload) > (pieces+7)/8 {
+			return errors.New("a bitfield past the torrent's pieces")
+		}
+		p.has = make([]bool, len(payload)*8)
+		for i := range p.has {
+			p.has[i] = payload[i/8]&(0x80>>(i%8)) != 0
+		}
+		t.fill(p)
+	case msgRequest:
+		b, ok := readBlock(payload)
+		if !ok {
+			return errors.New("a malformed request")
+		}
+		t.serve(p, b)
+	case msgPiece:
+		if len(payload) < 8 {
+			return errors.New("a malformed piece")
+		}
+		t.received(p, int(binary.BigEndian.Uint32(payload)), int64(binary.BigEndian.Uint32(payload[4:])), payload[8:])
+	case msgPort:
+		if len(payload) == 2 {
+			t.learnNode(p, binary.BigEndian.Uint16(payload))
+		}
+	case msgExtended:
+		if len(payload) == 0 {
+			return errors.New("a malformed extended message")
+		}
+		return t.extended(p, payload[0], payload[1:])
+	}
+	return nil
+}
+
+// learnNode keeps the DHT node a peer runs, to look the torrent up from.
+func (t *torrent) learnNode(p *peer, port uint16) {
+	if port == 0 {
+		return
+	}
+	address := netip.AddrPortFrom(p.address.Addr(), port).String()
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	if len(t.nodes) < maxNodesLearned && !slices.Contains(t.nodes, address) {
+		t.nodes = append(t.nodes, address)
+	}
+}
+
+// serve answers a peer's request for a block, while Mira shares and
+// unchokes it, and fewer than pipeline messages wait for the peer.
+func (t *torrent) serve(p *peer, b block) {
+	if !t.shares(p, b) || !t.engine.up.allows() || p.queued() > pipeline {
+		return
+	}
+	// The block is 2*blockSize at most.
+	data := make([]byte, b.length)
+	if found, err := t.engine.store.read(pieceKey{t.hash, b.piece}, data, b.offset); !found || err != nil {
+		return
+	}
+	header := make([]byte, 8)
+	binary.BigEndian.PutUint32(header, uint32(b.piece))
+	binary.BigEndian.PutUint32(header[4:], uint32(b.offset))
+	p.send(msgPiece, header, data)
+}
+
+// shares reports whether a peer may have a block: Mira unchokes it,
+// and has the piece, of which the block is 2*blockSize at most.
+func (t *torrent) shares(p *peer, b block) bool {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	return p.unchoked && t.info != nil && b.piece >= 0 && b.piece < len(t.have) && t.have[b.piece] && b.length > 0 &&
+		b.length <= 2*blockSize && b.offset+b.length <= t.info.pieceSize(b.piece)
+}
+
+// uploaded counts bytes shared.
+func (t *torrent) uploaded(n int64) {
+	t.mu.Lock()
+	t.upBytes += n
+	t.mu.Unlock()
+	t.engine.countUpload(n)
+}
+
+// chooseUnchoked unchokes the interested peers, up to unchokeSlots, while
+// Mira shares, and chokes every one otherwise. The lock is held.
+func (t *torrent) chooseUnchoked() {
+	sharing := t.engine.up.allows() && t.info != nil
+	slots := 0
+	for _, p := range t.peers {
+		switch {
+		case p.unchoked && (!sharing || !p.peerInterested):
+			p.unchoked = false
+			p.send(msgChoke)
+		case p.unchoked:
+			slots++
+		}
+	}
+	if !sharing {
+		return
+	}
+	for _, p := range t.peers {
+		if slots >= unchokeSlots {
+			return
+		}
+		if p.peerInterested && !p.unchoked {
+			p.unchoked = true
+			p.send(msgUnchoke)
+			slots++
+		}
+	}
+}
+
+// wanted lists the pieces to fetch, most urgent first: those at and after
+// each read, nearest first, then the start and end of each file read. A
+// read fetches ahead within its file alone, up to the piece holding its
+// last byte, which it may share with the next file: never the next
+// file's own pieces. A whole file's read (see Engine.ReadFile) fetches
+// its own pieces alone. The lock is held.
+func (t *torrent) wanted() []int {
+	if t.info == nil {
+		return nil
+	}
+	length := t.info.PieceLength
+	count := len(t.info.Pieces)
+	seen := map[int]bool{}
+	var order []int
+	add := func(i int) {
+		if i >= 0 && i < count && !t.have[i] && !seen[i] {
+			seen[i] = true
+			order = append(order, i)
+		}
+	}
+	window := t.window()
+	for d := range window {
+		for r, span := range t.reads {
+			i := int(span.at/length) + d
+			if _, last := r.file.pieces(length); i > last || r.whole && (span.end <= span.at || int64(i)*length >= span.end) {
+				continue
+			}
+			add(i)
+		}
+	}
+	for _, f := range t.files {
+		first, last := f.pieces(length)
+		for d := range edgePieces {
+			add(min(first+d, last))
+			add(max(last-d, first))
+		}
+	}
+	return order
+}
+
+// pieces are the first and last pieces holding the file's bytes, of
+// length each: those it may share with the files beside it included.
+func (f File) pieces(length int64) (first, last int) {
+	return int(f.Offset / length), int((f.Offset + max(f.Length, 1) - 1) / length)
+}
+
+// window is how many pieces past a read are fetched: readWindow, within
+// room in the store for the pieces read now. A read asks for them again
+// each time it moves past the back half of the window last asked (see
+// Reader.ReadAtProgress), so the window rolls ahead of it, never past
+// its bound. The lock is held.
+func (t *torrent) window() int {
+	length := t.info.PieceLength
+	return int(max(1, min(max(4, readWindow/length), t.engine.store.budget()/length/2)))
+}
+
+// needed lists the pieces the reads wait for, those of their spans, up
+// to a window each. The lock is held.
+func (t *torrent) needed() []int {
+	length := t.info.PieceLength
+	var pieces []int
+	for _, span := range t.reads {
+		if span.end <= span.at {
+			continue
+		}
+		first := int(span.at / length)
+		last := min(int((span.end-1)/length), first+t.window()-1, len(t.have)-1)
+		for i := first; i <= last; i++ {
+			if !t.have[i] && !slices.Contains(pieces, i) {
+				pieces = append(pieces, i)
+			}
+		}
+	}
+	return pieces
+}
+
+// blockOf is block i of an inflight piece.
+func blockOf(in *inflightPiece, index, i int) block {
+	offset := int64(i) * blockSize
+	return block{piece: index, offset: offset, length: min(blockSize, int64(len(in.data))-offset)}
+}
+
+// inflightOf is the piece index being downloaded, started when it is
+// not. The lock is held.
+func (t *torrent) inflightOf(index int) *inflightPiece {
+	in := t.inflight[index]
+	if in == nil {
+		size := t.info.pieceSize(index)
+		blocks := int((size + blockSize - 1) / blockSize)
+		in = &inflightPiece{data: make([]byte, size), got: make([]bool, blocks), requested: make([]time.Time, blocks),
+			asks: make([]uint8, blocks), left: blocks}
+		t.inflight[index] = in
+	}
+	return in
+}
+
+// fill asks a peer that unchoked Mira for the blocks it lacks, up to
+// pipeline: those of the endgame first, then the pieces wanted in order.
+// The lock is held.
+func (t *torrent) fill(p *peer) {
+	if t.info == nil || t.err != nil {
+		return
+	}
+	now := time.Now()
+	// The peer is told Mira is interested before it is asked anything,
+	// endgame duplicates included: a peer that unchoked first may drop a
+	// REQUEST from a peer that did not say it is interested. The endgame's
+	// pieces are among those wanted.
+	wanted := t.wanted()
+	wants := slices.ContainsFunc(wanted, func(index int) bool { return index < len(p.has) && p.has[index] })
+	if wants != p.interested {
+		p.interested = wants
+		if wants {
+			p.send(msgInterested)
+		} else {
+			p.send(msgNotInterested)
+		}
+	}
+	if !wants {
+		return
+	}
+	t.endgame(p, now)
+	for _, index := range wanted {
+		if index >= len(p.has) || !p.has[index] {
+			continue
+		}
+		if p.choked || len(p.requests) >= pipeline {
+			break
+		}
+		in := t.inflightOf(index)
+		for i := range in.got {
+			if len(p.requests) >= pipeline {
+				break
+			}
+			// A block asked is left to its peer until reask cancels it:
+			// only the endgame asks a block of two peers at once. A block
+			// the peer dropped past maxReasks times is left to the others.
+			if in.got[i] || in.asks[i] > 0 {
+				continue
+			}
+			b := blockOf(in, index, i)
+			if p.reasked[b] > maxReasks {
+				continue
+			}
+			t.ask(p, in, i, b, now)
+		}
+	}
+}
+
+// endgame asks a peer, once every block the reads wait for is asked, for
+// those other peers were asked for, the longest waiting first: a slow
+// peer's blocks come from the first to send them, the others cancelled.
+// A block is asked of two peers at most, maxDuplicates blocks at once,
+// and the pieces no read waits for are left to the peers asked. The lock
+// is held.
+func (t *torrent) endgame(p *peer, now time.Time) {
+	if t.engine.noEndgame || p.choked || len(p.requests) >= pipeline || t.duplicates >= maxDuplicates {
+		return
+	}
+	type held struct {
+		in    *inflightPiece
+		i     int
+		b     block
+		since time.Time
+	}
+	var blocks []held
+	for _, index := range t.needed() {
+		in := t.inflight[index]
+		if in == nil {
+			// A piece not asked yet: not the endgame.
+			return
+		}
+		for i, got := range in.got {
+			switch {
+			case got:
+				continue
+			case in.asks[i] == 0:
+				return
+			case in.asks[i] > 1 || index >= len(p.has) || !p.has[index]:
+				continue
+			}
+			b := blockOf(in, index, i)
+			if _, mine := p.requests[b]; !mine && p.reasked[b] <= maxReasks {
+				blocks = append(blocks, held{in: in, i: i, b: b, since: in.requested[i]})
+			}
+		}
+	}
+	slices.SortFunc(blocks, func(a, b held) int { return a.since.Compare(b.since) })
+	for _, h := range blocks {
+		if len(p.requests) >= pipeline || t.duplicates >= maxDuplicates {
+			return
+		}
+		t.ask(p, h.in, h.i, h.b, now)
+	}
+}
+
+// received keeps a block a peer sent, and the piece once it is whole and
+// matches its hash.
+func (t *torrent) received(p *peer, index int, offset int64, data []byte) {
+	in, expected, whole := t.keepBlock(p, index, offset, data)
+	if !whole {
+		return
+	}
+	if sha1.Sum(in.data) != expected {
+		t.engine.config.Logger.Debug("A torrent's piece did not match its hash")
+		t.discard(p, index)
+		return
+	}
+	if err := t.engine.store.put(pieceKey{t.hash, index}, in.data); errors.Is(err, errClosed) {
+		return
+	} else if err != nil {
+		t.engine.config.Logger.Warn("A torrent's piece could not be kept", "error", err)
+		t.discard(p, index)
+		return
+	}
+	t.completed(index)
+}
+
+// keepBlock copies a block into its piece, cancels it where others were
+// asked for it too, and returns the piece and its hash once it is whole;
+// until then, it asks the peer for more.
+func (t *torrent) keepBlock(p *peer, index int, offset int64, data []byte) (*inflightPiece, Hash, bool) {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	in := t.inflight[index]
+	b := block{piece: index, offset: offset, length: int64(len(data))}
+	t.arrived(p, b, time.Now())
+	t.forget(p, b)
+	if in == nil || offset%blockSize != 0 || offset >= int64(len(in.data)) || in.got[offset/blockSize] ||
+		b != blockOf(in, index, int(offset/blockSize)) {
+		t.fill(p)
+		return nil, Hash{}, false
+	}
+	copy(in.data[offset:], data)
+	in.got[offset/blockSize] = true
+	in.left--
+	t.downBytes += int64(len(data))
+	close(t.flowing)
+	t.flowing = make(chan struct{})
+	t.cancelOthers(in, b)
+	for _, other := range t.peers {
+		delete(other.reasked, b)
+	}
+	if in.left > 0 {
+		t.fill(p)
+		return nil, Hash{}, false
+	}
+	// The piece stays in flight, whole, until it is kept or found wrong:
+	// meanwhile, none of its blocks is asked again.
+	return in, t.info.Pieces[index], true
+}
+
+// discard drops a whole piece found wrong, or that could not be kept, and
+// asks the peer for the blocks Mira lacks.
+func (t *torrent) discard(p *peer, index int) {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	delete(t.inflight, index)
+	t.fill(p)
+}
+
+// completed records a piece kept, tells the peers while Mira shares,
+// and asks them for more.
+func (t *torrent) completed(index int) {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	delete(t.inflight, index)
+	if t.err != nil {
+		return
+	}
+	t.have[index] = true
+	t.signal()
+	sharing := t.engine.up.allows()
+	have := make([]byte, 4)
+	binary.BigEndian.PutUint32(have, uint32(index))
+	for _, other := range t.peers {
+		if sharing {
+			other.send(msgHave, have)
+		}
+		t.fill(other)
+	}
+}
+
+// evicted forgets a piece the store removed.
+func (t *torrent) evicted(index int) {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	if index < len(t.have) {
+		t.have[index] = false
+	}
+}
+
+// extended reads a message of the extension protocol.
+func (t *torrent) extended(p *peer, id byte, payload []byte) error {
+	if id == extPEX {
+		t.mu.Lock()
+		defer t.mu.Unlock()
+		return t.receivedPEX(p, payload)
+	}
+	d, rest, err := decodeDict(payload)
+	if err != nil {
+		return err
+	}
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	if id == 0 {
+		if n, ok := num(dict(d, "m"), "ut_metadata"); ok && n > 0 && n < 256 {
+			p.metadataID = int(n)
+		}
+		if n, ok := num(d, "metadata_size"); ok && n > 0 && n <= maxInfoSize {
+			p.metadataSize = int(n)
+		}
+		t.askMetadata(p)
+		return nil
+	}
+	if id != extMetadata {
+		return nil
+	}
+	kind, _ := num(d, "msg_type")
+	piece, _ := num(d, "piece")
+	switch kind {
+	case 0:
+		if p.metadataID == 0 {
+			return nil
+		}
+		// The piece is checked against the info dictionary's pieces of
+		// metadataBlock before it is multiplied, which a large one would
+		// overflow. Like blocks, metadata is answered while fewer than
+		// pipeline messages wait for the peer.
+		pieces := int64(len(t.infoData)+metadataBlock-1) / metadataBlock
+		if !t.engine.up.allows() || piece < 0 || piece >= pieces || p.queued() > pipeline {
+			p.send(msgExtended, []byte{byte(p.metadataID)}, encode(map[string]any{"msg_type": 2, "piece": piece}))
+			return nil
+		}
+		start := piece * metadataBlock
+		end := min(start+metadataBlock, int64(len(t.infoData)))
+		p.send(msgExtended, []byte{byte(p.metadataID)},
+			encode(map[string]any{"msg_type": 1, "piece": piece, "total_size": len(t.infoData)}), t.infoData[start:end])
+	case 1:
+		t.receivedMetadata(piece, rest)
+	}
+	return nil
+}
+
+// askMetadata asks a peer for the pieces of the info dictionary Mira
+// lacks. The lock is held.
+func (t *torrent) askMetadata(p *peer) {
+	if t.info != nil || p.metadataID == 0 || p.metadataSize == 0 {
+		return
+	}
+	if t.metadata == nil || len(t.metadata) != p.metadataSize {
+		t.metadata = make([]byte, p.metadataSize)
+		t.metadataGot = make([]bool, (p.metadataSize+metadataBlock-1)/metadataBlock)
+	}
+	for i, got := range t.metadataGot {
+		if !got {
+			p.send(msgExtended, []byte{byte(p.metadataID)}, encode(map[string]any{"msg_type": 0, "piece": i}))
+		}
+	}
+}
+
+// receivedMetadata keeps a piece of the info dictionary, and reads it once
+// whole. The lock is held.
+func (t *torrent) receivedMetadata(index int64, data []byte) {
+	if t.info != nil || index < 0 || index >= int64(len(t.metadataGot)) {
+		return
+	}
+	piece := int(index)
+	start := piece * metadataBlock
+	if len(data) != min(metadataBlock, len(t.metadata)-start) {
+		return
+	}
+	copy(t.metadata[start:], data)
+	t.metadataGot[piece] = true
+	if slices.Contains(t.metadataGot, false) {
+		return
+	}
+	info, err := checkInfo(t.hash, t.metadata)
+	if err != nil {
+		// A peer sent wrong pieces: start over.
+		clear(t.metadataGot)
+		return
+	}
+	t.info, t.infoData = &info, t.metadata
+	t.metadata, t.metadataGot = nil, nil
+	t.have = make([]bool, len(info.Pieces))
+	t.engine.store.mark(t.hash, t.have)
+	for _, p := range t.peers {
+		if len(p.has) > len(info.Pieces) {
+			p.has = p.has[:len(info.Pieces)]
+		}
+		if info.Private && p.extended {
+			// Peer exchange, offered while the info was not known, is
+			// turned off.
+			p.send(msgExtended, []byte{0}, encode(map[string]any{"m": map[string]any{"ut_pex": 0}}))
+		}
+		t.fill(p)
+	}
+	t.queuePEX()
+	if info.Private && t.stopLookup != nil {
+		// A private torrent is not looked up on the DHT.
+		t.stopLookup()
+	}
+	if info.Private {
+		// Nor announced to the trackers of the settings.
+		t.stopExtra()
+	}
+	t.signal()
+}
+
+// Reader reads a file of a torrent being played, as a source of the
+// source cache: each read asks for its pieces first. whole marks a read
+// of a file whole (see Engine.ReadFile), which fetches its pieces alone.
+// ahead is the piece the read-ahead was last asked from, once rolled
+// tells it was; the torrent's lock guards them.
+type Reader struct {
+	t      *torrent
+	file   File
+	ctx    context.Context
+	size   int64
+	whole  bool
+	ahead  int
+	rolled bool
+}
+
+// Size is the file's size.
+func (r *Reader) Size() int64 { return r.size }
+
+// ReadAt reads the file at off, waiting for its pieces as long as the
+// reader's context allows. What it waits for is the endgame's.
+func (r *Reader) ReadAt(p []byte, off int64) (int, error) {
+	return r.ReadAtProgress(p, off, nil)
+}
+
+// ReadAtProgress is ReadAt, calling progress, when set, each time a block
+// of the torrent arrives while it waits for a piece: a piece is read only
+// once whole and checked, so a read waits for bytes long before it returns
+// any, which those calls tell.
+func (r *Reader) ReadAtProgress(p []byte, off int64, progress func()) (int, error) {
+	t := r.t
+	if off >= r.file.Length {
+		return 0, io.EOF
+	}
+	start := r.file.Offset + off
+	end := min(start+int64(len(p)), r.file.Offset+r.file.Length)
+	defer func() {
+		t.mu.Lock()
+		if span, reading := t.reads[r]; reading {
+			t.reads[r] = readSpan{at: span.at, end: span.at}
+		}
+		t.mu.Unlock()
+	}()
+	n := 0
+	for position := start; position < end; {
+		t.mu.Lock()
+		t.reads[r] = readSpan{at: position, end: end}
+		length := t.info.PieceLength
+		index := int(position / length)
+		within := position - int64(index)*length
+		chunk := min(end-position, length-within)
+		has := t.have[index]
+		err, changed, flowing := t.err, t.changed, t.flowing
+		// The read-ahead rolls: a read that misses its piece, or moves
+		// past the back half of the window asked last, or before it, has
+		// the peers asked for the pieces ahead of it now. Otherwise the
+		// next window would be asked only once a read misses its first
+		// piece, and a reader paced by playback would wait for it at each
+		// step of the window, the swarm idle meanwhile.
+		if !has || !r.rolled || index < r.ahead || index-r.ahead >= max(1, t.window()/2) {
+			r.ahead, r.rolled = index, true
+			for _, peer := range t.peers {
+				t.fill(peer)
+			}
+		}
+		t.mu.Unlock()
+		if err != nil {
+			return n, err
+		}
+		if has {
+			found, err := t.engine.store.read(pieceKey{t.hash, index}, p[n:n+int(chunk)], within)
+			if err != nil {
+				return n, err
+			}
+			if found {
+				n += int(chunk)
+				position += chunk
+			} else {
+				// The store removed the piece meanwhile: fetch it again.
+				t.evicted(index)
+			}
+			continue
+		}
+		for waiting := true; waiting; {
+			select {
+			case <-r.ctx.Done():
+				return n, r.ctx.Err()
+			case <-changed:
+				waiting = false
+			case <-flowing:
+				if progress != nil {
+					progress()
+				}
+				t.mu.Lock()
+				flowing = t.flowing
+				t.mu.Unlock()
+			}
+		}
+	}
+	if n < len(p) {
+		return n, io.EOF
+	}
+	return n, nil
+}
+
+// Close ends the reader's reads.
+func (r *Reader) Close() error {
+	r.t.mu.Lock()
+	delete(r.t.reads, r)
+	r.t.mu.Unlock()
+	return nil
+}
+
+// waitInfo waits for the torrent's start: its info dictionary, and a peer
+// connected, which sent the info or, when the torrent's last run kept it
+// (see seed), may send its pieces. Past the engine's StartTimeout
+// without them, the torrent did not start: a *StartError tells what came
+// of the search for its peers.
+func (t *torrent) waitInfo(ctx context.Context) (*Info, error) {
+	started := time.Now()
+	deadline := time.NewTimer(t.engine.config.StartTimeout)
+	defer deadline.Stop()
+	for {
+		t.mu.Lock()
+		info, err, changed, reached := t.info, t.err, t.changed, len(t.reached) > 0
+		t.mu.Unlock()
+		if err != nil {
+			return nil, err
+		}
+		if info != nil && reached {
+			return info, nil
+		}
+		select {
+		case <-ctx.Done():
+			return nil, ctx.Err()
+		case <-deadline.C:
+			t.mu.Lock()
+			err := t.startError(time.Since(started))
+			t.mu.Unlock()
+			t.engine.startFailed(err)
+			return nil, err
+		case <-changed:
+		}
+	}
+}
+
+// open waits for the torrent's info (see waitInfo), and returns a reader
+// of the file spec plays (see Info.File). The reader reads under ctx, the
+// wait being bounded alone.
+func (t *torrent) open(ctx context.Context, spec Spec) (*Reader, error) {
+	info, err := t.waitInfo(ctx)
+	if err != nil {
+		return nil, err
+	}
+	file, err := info.File(spec)
+	if err != nil {
+		return nil, err
+	}
+	t.mu.Lock()
+	if !slices.Contains(t.files, file) {
+		t.files = append(t.files, file)
+		for _, p := range t.peers {
+			t.fill(p)
+		}
+	}
+	t.mu.Unlock()
+	t.engine.startedOne()
+	return &Reader{t: t, file: file, ctx: ctx, size: file.Length}, nil
+}
+
+// readFile waits for the torrent's info (see waitInfo), and reads whole
+// its file at index, fetching its pieces alone, under ctx. A file longer
+// than limit is not read.
+func (t *torrent) readFile(ctx context.Context, index int, limit int64) ([]byte, error) {
+	info, err := t.waitInfo(ctx)
+	if err != nil {
+		return nil, err
+	}
+	file, err := info.File(Spec{File: index})
+	if err != nil {
+		return nil, err
+	}
+	if file.Length > limit {
+		return nil, fmt.Errorf("the torrent's file %d is %d bytes, more than %d", index, file.Length, limit)
+	}
+	t.engine.startedOne()
+	data := make([]byte, file.Length)
+	if len(data) == 0 {
+		return data, nil
+	}
+	r := &Reader{t: t, file: file, ctx: ctx, size: file.Length, whole: true}
+	defer r.Close()
+	if n, err := r.ReadAt(data, 0); n < len(data) {
+		return nil, err
+	}
+	return data, nil
+}
+
+// failed reports whether the torrent stopped because its route failed.
+func (t *torrent) failed() bool {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	return t.err != nil && t.err != errStopped
+}
+
+// peerCount is how many peers the torrent is connected to, and how many of
+// them over uTP.
+func (t *torrent) peerCount() (all, viaUTP int) {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	return len(t.peers), t.utpPeers()
+}
+
+// utpPeers counts the peers reached over uTP. The lock is held.
+func (t *torrent) utpPeers() int {
+	n := 0
+	for _, p := range t.peers {
+		if overUTP(p) {
+			n++
+		}
+	}
+	return n
+}

@@ -1,0 +1,307 @@
+#!/usr/bin/env bash
+# Usage: scripts/packaging/test.sh <package> [work folder]
+#
+# Installs or opens a package of Mira Desktop on the system it is for,
+# checks the install layout, runs scripts/desktop-smoke.py on the installed
+# app (on a data folder of the work folder, behind a proxy that refuses
+# every request for outside, leaving no process), then removes it:
+#   .dmg        mounted read-only, the app run from the disk image;
+#   -setup.exe  installed for the current user, silently, its programs and
+#               libraries checked to be the package's architecture (x64 or
+#               arm64) and to find every DLL they import, the version info
+#               of mira.exe and mira-desktop.exe to be the package's,
+#               then uninstalled: the data folder, %LOCALAPPDATA%\Mira,
+#               must stay;
+#   .deb        installed with apt (sudo), then removed;
+#   .AppImage   run as it is when FUSE is there, else from its files
+#               extracted.
+# CI runs it on each runner; it changes the system it runs on, so run it
+# locally on a throwaway machine or container. VERSION, when set, must be
+# the version the app reports.
+source "$(dirname "$0")/common.sh"
+
+package="$(cd "$(dirname "$1")" && pwd)/$(basename "$1")"
+work="${2:-$WORK/test}"
+rm -rf "$work"
+mkdir -p "$work"
+
+smoke() {
+	"$PYTHON" "$ROOT/scripts/desktop-smoke.py" --installed "$@"
+}
+
+check_version() {
+	local reported
+	# Through a pipe, which a Windows app without a console writes to too.
+	reported="$("$@" -version | cat)"
+	if [ "$VERSION" != dev ] && [ "$reported" != "$VERSION" ]; then
+		echo "$* reports version $reported, not $VERSION" >&2
+		exit 1
+	fi
+}
+
+as_root() {
+	if [ "$(id -u)" = 0 ]; then "$@"; else sudo "$@"; fi
+}
+
+test_dmg() {
+	local app
+	mount="$work/mount"
+	mkdir -p "$mount"
+	hdiutil attach -nobrowse -readonly -noautoopen -mountpoint "$mount" "$package" > /dev/null
+	trap 'hdiutil detach -force "$mount" > /dev/null || true' EXIT
+	# One app, which the update replaces the installed one with.
+	ls -d "$mount"/*.app > "$work/apps"
+	test "$(cat "$work/apps")" = "$mount/Mira.app" || { echo "the disk image holds: $(cat "$work/apps")" >&2; exit 1; }
+	test "$(readlink "$mount/Applications")" = /Applications
+	app="$mount/Mira.app"
+	test "$(plutil -extract LSUIElement raw "$app/Contents/Info.plist")" = true
+	test "$(plutil -extract CFBundleExecutable raw "$app/Contents/Info.plist")" = mira-desktop
+	codesign --verify --deep --strict "$app"
+	case "$package" in
+	*-arm64.dmg) lipo "$app/Contents/MacOS/mira-desktop" -verify_arch arm64 ;;
+	*-x64.dmg) lipo "$app/Contents/MacOS/mira-desktop" -verify_arch x86_64 ;;
+	esac
+	check_install "$app/Contents/Resources" ""
+	check_version "$app/Contents/MacOS/mira-desktop"
+	smoke "$app/Contents/MacOS/mira-desktop" "$app/Contents/Resources" "$work/smoke"
+	# The secret key the smoke's data folder made, in the login keychain.
+	security delete-generic-password -s Mira -a "Secret key of $work/smoke/data" > /dev/null 2>&1 || true
+}
+
+# check_programs DIR MACHINE: every program and library of DIR, a Windows
+# install folder, is built for MACHINE, the PE header's: 0xAA64 for ARM64,
+# 0x8664 for x64; a package that took another architecture's programs
+# would still run, under Windows' emulation. And each finds the DLLs it
+# imports, delay-loaded ones too, where its process loads them from:
+# postgresql/bin for PostgreSQL's (lib's modules are loaded by postgres),
+# DIR for the others; else among API sets, or in System32, but for the
+# Visual C++ runtime, which a fresh Windows lacks while runners have it
+# (msvcrt.dll, the system's own C runtime, is Windows'). It prints the
+# DLLs taken from System32. The uninstaller NSIS writes is
+# its x86 stub on every system, and is left out.
+check_programs() {
+	"$PYTHON" -c 'import os, re, struct, sys
+root, want = sys.argv[1], int(sys.argv[2], 16)
+system = sys.argv[3] if len(sys.argv) > 3 else os.path.join(os.environ["SYSTEMROOT"], "System32")
+runtime = re.compile(r"msvcp|vcruntime|concrt|vccorlib|msvcr\d|ucrtbased")
+listings = {}
+def listing(folder):
+    if folder not in listings:
+        listings[folder] = {name.lower() for name in os.listdir(folder)}
+    return listings[folder]
+def pe(data):
+    """The machine and the imported DLLs, the delay-loaded ones too."""
+    if data[:2] != b"MZ" or len(data) < 0x40:
+        return None, []
+    header, = struct.unpack_from("<I", data, 0x3C)
+    if data[header:header + 4] != b"PE\0\0":
+        return None, []
+    machine, count = struct.unpack_from("<HH", data, header + 4)
+    optional = header + 24
+    plus = struct.unpack_from("<H", data, optional)[0] == 0x20B
+    base, = struct.unpack_from("<Q" if plus else "<I", data, optional + (24 if plus else 28))
+    directories, = struct.unpack_from("<I", data, optional + (108 if plus else 92))
+    table = optional + struct.unpack_from("<H", data, header + 20)[0]
+    sections = [struct.unpack_from("<IIII", data, table + 40 * i + 8) for i in range(count)]
+    def offset(rva):
+        for size, address, raw_size, raw in sections:
+            if address <= rva < address + max(size, raw_size):
+                return raw + rva - address
+        raise ValueError("RVA %#x is in no section" % rva)
+    found = []
+    # The import table (1): 20-byte entries, the name at 12; the delay-load
+    # one (13): 32-byte entries, the name at 4, a VA unless attribute 1.
+    for index, size, at in ((1, 20, 12), (13, 32, 4)):
+        rva = struct.unpack_from("<I", data, optional + (112 if plus else 96) + 8 * index)[0] if index < directories else 0
+        entry = offset(rva) if rva else None
+        while entry is not None:
+            name, = struct.unpack_from("<I", data, entry + at)
+            if not name:
+                break
+            if index == 13 and not data[entry] & 1:
+                name -= base
+            start = offset(name)
+            found.append(data[start:data.index(b"\0", start)].decode("ascii"))
+            entry += size
+    return machine, found
+problems, from_system = [], set()
+for folder, _, files in os.walk(root):
+    for name in files:
+        path = os.path.join(folder, name)
+        program = os.path.relpath(path, root)
+        if not name.lower().endswith((".exe", ".dll")) or program == "Uninstall.exe":
+            continue
+        with open(path, "rb") as f:
+            machine, imports = pe(f.read())
+        if machine != want:
+            problems.append("%s: built for %s, not %#x" % (program, "no machine" if machine is None else "%#x" % machine, want))
+            continue
+        beside = os.path.join(root, "postgresql", "bin") if program.split(os.sep)[0] == "postgresql" else root
+        for dll in imports:
+            lower = dll.lower()
+            if lower in listing(beside) or lower.startswith(("api-ms-win-", "ext-ms-win-")):
+                continue
+            if not runtime.match(lower) and lower in listing(system):
+                from_system.add(lower)
+                continue
+            problems.append("%s: imports %s, which is neither beside it nor in %s" % (program, dll, system))
+if problems:
+    sys.exit("\n".join(sorted(problems)))
+print("DLLs from %s: %s" % (system, ", ".join(sorted(from_system))))' "$(cygpath -w "$1")" "$2"
+}
+
+# check_version_info EXE DESCRIPTION VERSION: the version info of EXE, a
+# Windows program, as Windows reads it: the product Mira, the
+# description DESCRIPTION, the product version VERSION and the file
+# version its numbers.
+check_version_info() {
+	local got want powershell
+	# PowerShell 7 when it is there: Windows PowerShell takes about 20 s a
+	# call on the Windows on Arm runners.
+	powershell="$(command -v pwsh || echo powershell)"
+	# PowerShell's variables, which bash leaves as they are.
+	# shellcheck disable=SC2016
+	got="$(EXE="$(cygpath -w "$1")" "$powershell" -NoProfile -Command \
+		'$i = (Get-Item -LiteralPath $env:EXE).VersionInfo; "$($i.ProductName)|$($i.FileDescription)|$($i.ProductVersion)|$($i.FileVersion)"' |
+		tr -d '\r')"
+	want="Mira|$2|$3|$(VERSION="$3" numeric_version)"
+	if [ "$got" != "$want" ]; then
+		echo "the version info of $1 is $got, not $want" >&2
+		exit 1
+	fi
+}
+
+test_windows() {
+	local local_data install programs marker run_key uninstall_key machine package_version left
+	case "$package" in
+	*-windows-arm64-setup.exe) machine=0xAA64 ;;
+	*-windows-x64-setup.exe) machine=0x8664 ;;
+	*) echo "not a Windows installer of Mira Desktop: $package" >&2; exit 2 ;;
+	esac
+	# The version the package is named after.
+	package_version="$(basename "$package")"
+	package_version="${package_version#Mira-Desktop-}"
+	package_version="${package_version%-windows-*-setup.exe}"
+	local_data="$(cygpath -u "$LOCALAPPDATA")"
+	install="$local_data/Programs/Mira"
+	programs="$(cygpath -u "$APPDATA")/Microsoft/Windows/Start Menu/Programs"
+	run_key='HKCU\Software\Microsoft\Windows\CurrentVersion\Run'
+	uninstall_key='HKCU\Software\Microsoft\Windows\CurrentVersion\Uninstall\Mira'
+	# Git Bash leaves the switches of Windows programs as they are with
+	# MSYS_NO_PATHCONV, rather than taking them for paths.
+	MSYS_NO_PATHCONV=1 "$package" /S
+	check_install "$install" .exe
+	check_programs "$install" "$machine"
+	test -f "$install/mira-desktop.exe"
+	test -f "$install/postgresql/bin/vcruntime140.dll"
+	test -f "$programs/Mira.lnk"
+	MSYS_NO_PATHCONV=1 reg query "$uninstall_key" /v UninstallString
+	check_version "$install/mira-desktop.exe"
+	check_version_info "$install/mira-desktop.exe" "Mira Desktop" "$package_version"
+	check_version_info "$install/mira.exe" Mira "$package_version"
+	# The package's app itself, which has no console: mira-desktop -quit
+	# quits it.
+	smoke "$(cygpath -w "$install/mira-desktop.exe")" "$(cygpath -w "$install")" "$(cygpath -w "$work/smoke")"
+
+	# Uninstalling leaves the data folder, and removes the login item.
+	marker=
+	if [ ! -e "$local_data/Mira" ]; then
+		mkdir -p "$local_data/Mira"
+		marker="$local_data/Mira/kept-by-the-uninstaller"
+		touch "$marker"
+	fi
+	MSYS_NO_PATHCONV=1 reg add "$run_key" /v io.github.ferforastieri.mira-desktop /d "\"$(cygpath -w "$install/mira-desktop.exe")\" --background" /f > /dev/null
+	MSYS_NO_PATHCONV=1 "$install/Uninstall.exe" /S
+	# The uninstaller runs from a copy of itself, which returns at once.
+	# mira.nsi's Uninstall section removes the programs and the
+	# install folder, then the Start menu shortcut, the login item and
+	# last the uninstall key: wait for all of them within the same 60 s.
+	# uninstall_left prints the first one still there, and fails when
+	# none is.
+	uninstall_left() {
+		if [ -e "$install" ]; then
+			echo "$install"
+		elif [ -e "$programs/Mira.lnk" ]; then
+			echo "the Start menu shortcut $programs/Mira.lnk"
+		elif MSYS_NO_PATHCONV=1 reg query "$run_key" /v io.github.ferforastieri.mira-desktop > /dev/null 2>&1; then
+			echo "the login item in $run_key"
+		elif MSYS_NO_PATHCONV=1 reg query "$uninstall_key" > /dev/null 2>&1; then
+			echo "the uninstall key $uninstall_key"
+		else
+			return 1
+		fi
+	}
+	for _ in $(seq 60); do
+		uninstall_left > /dev/null || break
+		sleep 1
+	done
+	if left="$(uninstall_left)"; then
+		echo "the uninstaller left $left after 60 s" >&2
+		if [ -e "$install" ]; then find "$install" >&2; fi
+		exit 1
+	fi
+	test -d "$local_data/Mira"
+	if [ -n "$marker" ]; then
+		test -f "$marker"
+		rm -rf "$local_data/Mira"
+	fi
+}
+
+test_deb() {
+	as_root apt-get install -y --no-install-recommends "$package"
+	check_install /opt/mira ""
+	test -x /opt/mira/mira-desktop
+	test "$(readlink /usr/bin/mira-desktop)" = /opt/mira/mira-desktop
+	test -f /usr/share/applications/mira-desktop.desktop
+	test -f /usr/share/icons/hicolor/scalable/apps/mira-desktop.svg
+	if command -v desktop-file-validate > /dev/null; then
+		desktop-file-validate /usr/share/applications/mira-desktop.desktop
+	fi
+	check_version /usr/bin/mira-desktop
+	smoke /usr/bin/mira-desktop /opt/mira "$work/smoke"
+	as_root apt-get remove -y mira-desktop
+	test ! -e /opt/mira
+	test ! -e /usr/bin/mira-desktop
+}
+
+test_appimage() {
+	chmod +x "$package"
+	# Its files, extracted without FUSE, from the file system that follows
+	# the runtime, whose ELF headers give its size: unsquashfs reads it
+	# without running the runtime, which an emulator may refuse to run.
+	if command -v unsquashfs > /dev/null; then
+		local offset
+		offset="$("$PYTHON" -c 'import struct, sys
+head = open(sys.argv[1], "rb").read(64)
+shoff, = struct.unpack_from("<Q", head, 0x28)
+size, count = struct.unpack_from("<HH", head, 0x3A)
+print(shoff + size * count)' "$package")"
+		unsquashfs -q -o "$offset" -d "$work/squashfs-root" "$package" > /dev/null
+	else
+		(cd "$work" && "$package" --appimage-extract > /dev/null)
+	fi
+	check_install "$work/squashfs-root" ""
+	test -x "$work/squashfs-root/AppRun"
+	test -f "$work/squashfs-root/mira-desktop.desktop"
+	if command -v desktop-file-validate > /dev/null; then
+		desktop-file-validate "$work/squashfs-root/mira-desktop.desktop"
+	fi
+	if [ -c /dev/fuse ] && { command -v fusermount3 || command -v fusermount; } > /dev/null; then
+		check_version "$package"
+		# Mounted where the system chooses: any install folder will do.
+		smoke "$package" auto "$work/smoke"
+	else
+		echo "no FUSE here: the smoke runs the AppImage's extracted files" >&2
+		check_version "$work/squashfs-root/AppRun"
+		smoke "$work/squashfs-root/AppRun" "$work/squashfs-root" "$work/smoke"
+	fi
+}
+
+case "$package" in
+*.dmg) test_dmg ;;
+*-setup.exe) test_windows ;;
+*.deb) test_deb ;;
+*.AppImage) test_appimage ;;
+*) echo "not a package of Mira Desktop: $package" >&2; exit 2 ;;
+esac
+echo "ok: $(basename "$package")"

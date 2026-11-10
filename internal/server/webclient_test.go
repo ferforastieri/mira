@@ -1,0 +1,3802 @@
+package server
+
+import (
+	"context"
+	"encoding/json"
+	"errors"
+	"io"
+	"log/slog"
+	"net/http"
+	"net/http/httptest"
+	"os"
+	"os/exec"
+	"path/filepath"
+	"slices"
+	"strconv"
+	"strings"
+	"testing"
+	"testing/fstest"
+)
+
+const (
+	webIndex = `<!doctype html><html dir="ltr"><head><meta charset="utf-8"><title>Jellyfin</title>` +
+		`<script defer="defer" src="main.jellyfin.bundle.js?0123456789abcdef0123"></script></head><body></body></html>`
+	webConfig = `{"multiserver": false, "servers": []}`
+)
+
+// webFiles stand for jellyfin-web: an index.html, bundles named with and
+// without a hash, its config.json and a theme folder.
+var webFiles = fstest.MapFS{
+	"index.html":                         {Data: []byte(webIndex)},
+	"main.jellyfin.bundle.js":            {Data: []byte("console.log('jellyfin')")},
+	"1133.03edf3bb7ee048ee10be.css":      {Data: []byte("body{}")},
+	"font.0123456789abcdef0123.woff2":    {Data: []byte("wOF2")},
+	"config.json":                        {Data: []byte(webConfig)},
+	"themes/dark/theme.css":              {Data: []byte("html{}")},
+	"session-login.0123456789abcdef.htm": {Data: []byte("<html><head></head></html>")},
+}
+
+// setupState stands for the accounts store.
+type setupState struct {
+	required bool
+	err      error
+}
+
+func (s setupState) SetupRequired(context.Context) (bool, error) { return s.required, s.err }
+
+func webHandler(state setupState) http.Handler {
+	return New(Options{
+		Database:      database{},
+		Admin:         fstest.MapFS{"index.html": {Data: []byte("<!doctype html><title>Mira</title>")}},
+		AdminAPI:      owner("admin api"),
+		Jellyfin:      owner("jellyfin"),
+		Web:           webFiles,
+		SetupRequired: state.SetupRequired,
+		Logger:        slog.New(slog.NewTextHandler(io.Discard, nil)),
+	})
+}
+
+func TestRootOpensTheWebClientOnceSetUp(t *testing.T) {
+	t.Parallel()
+	for _, tc := range []struct {
+		name    string
+		handler http.Handler
+		want    string
+	}{
+		{"set up, with a web client", webHandler(setupState{}), "/web/"},
+		{"before setup", webHandler(setupState{required: true}), "/admin/"},
+		{"database unavailable", webHandler(setupState{err: errors.New("connection refused")}), "/admin/"},
+		{"without a web client", handler(database{}), "/admin/"},
+	} {
+		response := get(tc.handler, "/")
+		if response.Code != http.StatusFound || response.Header().Get("Location") != tc.want {
+			t.Errorf("%s: / answered %d to %q, want 302 to %s", tc.name, response.Code, response.Header().Get("Location"), tc.want)
+		}
+	}
+}
+
+func TestWebClientServesJellyfinWebFiles(t *testing.T) {
+	t.Parallel()
+	h := webHandler(setupState{})
+	for _, tc := range []struct {
+		target      string
+		body        string
+		contentType string
+		cache       string
+	}{
+		{"/web/", "<title>Jellyfin</title>", "text/html; charset=utf-8", "no-cache"},
+		{"/web/index.html", "<title>Jellyfin</title>", "text/html; charset=utf-8", "no-cache"},
+		// Bundles carry the build hash as their query, in index.html.
+		{"/web/main.jellyfin.bundle.js?0123456789abcdef0123", "console.log", "text/javascript; charset=utf-8", immutableCache},
+		{"/web/main.jellyfin.bundle.js", "console.log", "text/javascript; charset=utf-8", "no-cache"},
+		{"/web/1133.03edf3bb7ee048ee10be.css", "body{}", "text/css; charset=utf-8", immutableCache},
+		{"/web/font.0123456789abcdef0123.woff2", "wOF2", "font/woff2", immutableCache},
+		{"/web/themes/dark/theme.css", "html{}", "text/css; charset=utf-8", "no-cache"},
+		// Unmodified: no server listed and a single server, so that the
+		// client connects to the one that served it.
+		{"/web/config.json", webConfig, "application/json", "no-cache"},
+		{"/web/mira.js", "location.replace", "text/javascript; charset=utf-8", "no-cache"},
+	} {
+		response := get(h, tc.target)
+		if response.Code != http.StatusOK {
+			t.Errorf("%s: status %d", tc.target, response.Code)
+			continue
+		}
+		header := response.Header()
+		if !strings.Contains(response.Body.String(), tc.body) {
+			t.Errorf("%s: body %q does not contain %q", tc.target, response.Body, tc.body)
+		}
+		if header.Get("Content-Type") != tc.contentType {
+			t.Errorf("%s: Content-Type %q, want %q", tc.target, header.Get("Content-Type"), tc.contentType)
+		}
+		if header.Get("Cache-Control") != tc.cache {
+			t.Errorf("%s: Cache-Control %q, want %q", tc.target, header.Get("Cache-Control"), tc.cache)
+		}
+		// The admin app's policy would stop jellyfin-web from working.
+		if policy := header.Get("Content-Security-Policy"); policy != "" {
+			t.Errorf("%s: Content-Security-Policy %q", tc.target, policy)
+		}
+		if header.Get("X-Content-Type-Options") != "nosniff" {
+			t.Errorf("%s: no nosniff", tc.target)
+		}
+	}
+	if body := get(h, "/web/config.json").Body.String(); body != webConfig {
+		t.Errorf("config.json changed: %q", body)
+	}
+}
+
+// What no file answers goes to the Jellyfin API, which has routes under
+// /web/ too, as on Jellyfin.
+func TestWebClientLeavesOtherPathsToJellyfin(t *testing.T) {
+	t.Parallel()
+	h := webHandler(setupState{})
+	for _, target := range []string{"/web/missing.0123456789abcdef0123.js", "/web/themes", "/web/ConfigurationPages", "/web/themes/"} {
+		if response := get(h, target); response.Body.String() != "jellyfin" {
+			t.Errorf("%s answered %d %q, want Jellyfin's handler", target, response.Code, response.Body)
+		}
+	}
+	recorder := httptest.NewRecorder()
+	h.ServeHTTP(recorder, httptest.NewRequest(http.MethodPost, "/web/index.html", nil))
+	if recorder.Body.String() != "jellyfin" {
+		t.Errorf("POST /web/index.html answered %q, want Jellyfin's handler", recorder.Body)
+	}
+	// Jellyfin's answers.
+	for _, tc := range []struct {
+		target, location string
+		status           int
+	}{
+		{"/web", "/web/", http.StatusMovedPermanently},
+		{"/robots.txt", "/web/robots.txt", http.StatusFound},
+	} {
+		response := get(h, tc.target)
+		if response.Code != tc.status || response.Header().Get("Location") != tc.location {
+			t.Errorf("%s: %d to %q, want %d to %s", tc.target, response.Code, response.Header().Get("Location"), tc.status, tc.location)
+		}
+	}
+}
+
+func TestOnlyTheWebClientPageLoadsMiraScript(t *testing.T) {
+	t.Parallel()
+	h := webHandler(setupState{})
+	tag := string(webScriptTag)
+	for range 2 {
+		for _, target := range []string{"/web/", "/web/index.html"} {
+			body := get(h, target).Body.String()
+			if strings.Count(body, tag) != 1 {
+				t.Fatalf("%s: %d script tags in %s", target, strings.Count(body, tag), body)
+			}
+			// In the head, before jellyfin-web's deferred scripts run.
+			if at := strings.Index(body, tag); at > strings.Index(body, "</head>") || !strings.HasPrefix(body, webIndex[:strings.Index(webIndex, "</head>")]) {
+				t.Errorf("%s: script misplaced in %s", target, body)
+			}
+		}
+	}
+	if body := get(h, "/web/session-login.0123456789abcdef.htm").Body.String(); strings.Contains(body, "mira.js") {
+		t.Errorf("another page got the script: %s", body)
+	}
+	if string(webFiles["index.html"].Data) != webIndex {
+		t.Error("jellyfin-web's index.html was changed")
+	}
+	if page := string(withWebScripts([]byte("<p>Jellyfin</p>"), nil)); page != "<p>Jellyfin</p>"+tag {
+		t.Errorf("a page without a head: %q", page)
+	}
+	// The page is revalidated, not downloaded again.
+	first := get(h, "/web/")
+	request := httptest.NewRequest(http.MethodGet, "/web/", nil)
+	request.Header.Set("If-None-Match", first.Header().Get("ETag"))
+	recorder := httptest.NewRecorder()
+	h.ServeHTTP(recorder, request)
+	if first.Header().Get("ETag") == "" || recorder.Code != http.StatusNotModified {
+		t.Errorf("revalidating /web/ with ETag %q: %d", first.Header().Get("ETag"), recorder.Code)
+	}
+}
+
+// Before setup nobody can sign in to the web client: its page leads to the
+// admin app, where setup is.
+func TestWebClientPageLeadsToSetupFirst(t *testing.T) {
+	t.Parallel()
+	h := webHandler(setupState{required: true})
+	for _, target := range []string{"/web/", "/web/index.html"} {
+		response := get(h, target)
+		if response.Code != http.StatusFound || response.Header().Get("Location") != "/admin/" {
+			t.Errorf("%s before setup: %d to %q", target, response.Code, response.Header().Get("Location"))
+		}
+	}
+	if response := get(h, "/web/config.json"); response.Code != http.StatusOK {
+		t.Errorf("config.json before setup: %d", response.Code)
+	}
+}
+
+func TestWebClientNeedsJellyfinWebIndex(t *testing.T) {
+	t.Parallel()
+	dir := t.TempDir()
+	if WebClientFiles(filepath.Join(dir, "missing")) != nil || WebClientFiles(dir) != nil || WebClientFiles("") != nil {
+		t.Fatal("a web client without jellyfin-web's index.html")
+	}
+	if err := os.WriteFile(filepath.Join(dir, "index.html"), []byte(webIndex), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	files := WebClientFiles(dir)
+	if files == nil {
+		t.Fatal("no web client with an index.html")
+	}
+	h := New(Options{
+		Database: database{}, Admin: fstest.MapFS{}, AdminAPI: owner("admin api"), Jellyfin: owner("jellyfin"),
+		Web: files, SetupRequired: setupState{}.SetupRequired, Logger: slog.New(slog.NewTextHandler(io.Discard, nil)),
+	})
+	if body := get(h, "/web/").Body.String(); !strings.Contains(body, string(webScriptTag)) {
+		t.Errorf("/web/ from a folder: %q", body)
+	}
+}
+
+// The script sends jellyfin-web's administration routes to the admin app
+// however the client gets to them: on load, through its router (history),
+// a link (hashchange) or Back (popstate). A dashboard page with a match in the
+// admin app opens that page; the others open its home. It runs in Node.js, in
+// a context that stands for the browser, without URL: the script runs before
+// jellyfin-web's polyfills, on browsers that may lack it.
+func TestDashboardRoutesOpenTheAdminApp(t *testing.T) {
+	t.Parallel()
+	node, err := exec.LookPath("node")
+	if err != nil {
+		t.Skip("Node.js is not installed")
+	}
+	// The admin page each route opens, after /admin/; "-" for a route left alone.
+	routes := map[string]string{
+		"#/dashboard":       "",
+		"#/dashboard/users": "users",
+		"#/dashboard/users/profile?userId=0123456789ABCDEF0123456789abcdef":    "users/0123456789abcdef0123456789abcdef",
+		"#/dashboard/users/access?userId=01234567-89ab-cdef-0123-456789abcdef": "users/0123456789abcdef0123456789abcdef",
+		"#/dashboard/devices":           "users",
+		"#/dashboard/libraries/display": "libraries",
+		"#/dashboard/livetv":            "live-tv",
+		"#/dashboard/livetv/recordings": "settings/recordings",
+		"#/dashboard/livetv/tuner?id=0123456789ABCDEF0123456789abcdef&type=hdhomerun": "sources/shared/0123456789abcdef0123456789abcdef",
+		"#/dashboard/livetv/tuner?type=hdhomerun":                                     "sources?add=hdhomerun",
+		"#/dashboard/livetv/tuner?id=x":                                               "sources?add=hdhomerun",
+		"#/dashboard/playback/transcoding":                                            "settings/conversion",
+		"#/dashboard/playback/resume":                                                 "settings/content",
+		"#/dashboard/playback/trickplay":                                              "settings/thumbnails",
+		"#/dashboard/playback/streaming":                                              "settings/playback",
+		"#/dashboard/branding":                                                        "settings/web-player",
+		"#/dashboard/settings":                                                        "settings/general",
+		"#/dashboard/backups":                                                         "settings/backups",
+		"#/dashboard/logs":                                                            "system/logs",
+		"#/dashboard/keys":                                                            "system/api-keys",
+		"#/dashboard/plugins/0123/settings":                                           "",
+		"#/Dashboard/Tasks":                                                           "system/schedule",
+		"#/dashboard/tasks/edit?id=3":                                                 "system/schedule",
+		"#/dashboard/activity":                                                        "",
+		"#/dashboard?tab=1":                                                           "",
+		"#!/dashboard":                                                                "",
+		"#!/dashboard/logs":                                                           "system/logs",
+		"#/metadata":                                                                  "",
+		"#/configurationpage?name=Plugin":                                             "",
+		"#/wizard/start":                                                              "",
+		"":                                                                            "-",
+		"#/home":                                                                      "-",
+		"#/dashboards":                                                                "-",
+		"#/metadatas":                                                                 "-",
+		"#/details?id=dashboard":                                                      "-",
+		"#/search?query=dashboard":                                                    "-",
+		"#/mypreferencesmenu":                                                         "-",
+		"#/livetv":                                                                    "-",
+		"#/list?parentId=0123&serverId=dashboard":                                     "-",
+		"#/userprofile?userId=0123&from=dashboard":                                    "-",
+	}
+	const harness = scriptRunner + `
+const { script, routes } = JSON.parse(require('node:fs').readFileSync(0, 'utf8'))
+const results = {}
+for (const route of routes) {
+  for (const way of ['load', 'pushState', 'replaceState', 'hashchange', 'popstate']) {
+    for (const page of ['http://mira.test/web/', 'http://mira.test/web/index.html']) {
+      let replaced = ''
+      const listeners = {}
+      const location = { replace: (url) => { replaced = url } }
+      const go = (url) => { const next = new URL(url, location.href); location.href = next.href; location.hash = next.hash }
+      location.href = page
+      go(way === 'load' ? route || page : '#/home')
+      const history = { pushState: (state, title, url) => go(url), replaceState: (state, title, url) => go(url) }
+      // The page's head takes the style the script adds.
+      const document = { head: { appendChild: () => {} }, createElement: () => ({}) }
+      runScript(script, { location, history, document, addEventListener: (type, listener) => { (listeners[type] ||= []).push(listener) } })
+      if (way === 'pushState' || way === 'replaceState') history[way](null, '', route || page)
+      if (way === 'hashchange' || way === 'popstate') { go(route || page); (listeners[way] || []).forEach((listener) => listener()) }
+      results[way + ' ' + page + route] = replaced
+    }
+  }
+}
+process.stdout.write(JSON.stringify(results))
+`
+	names := make([]string, 0, len(routes))
+	for route := range routes {
+		names = append(names, route)
+	}
+	input, _ := json.Marshal(map[string]any{"script": string(webScriptBody), "routes": names})
+	command := exec.CommandContext(t.Context(), node, "-e", harness)
+	command.Stdin = strings.NewReader(string(input))
+	output, err := command.Output()
+	if err != nil {
+		t.Fatalf("node: %v", err)
+	}
+	var results map[string]string
+	if err := json.Unmarshal(output, &results); err != nil {
+		t.Fatalf("node printed %q: %v", output, err)
+	}
+	if len(results) != len(routes)*5*2 {
+		t.Fatalf("%d results for %d routes", len(results), len(routes))
+	}
+	for key, replaced := range results {
+		route := ""
+		if at := strings.Index(key, "#"); at >= 0 {
+			route = key[at:]
+		}
+		want := ""
+		if page := routes[route]; page != "-" {
+			// Marked as opened from the web client.
+			want = "http://mira.test/admin/" + page + "?from=web"
+			if strings.Contains(page, "?") {
+				want = "http://mira.test/admin/" + page + "&from=web"
+			}
+		}
+		if replaced != want {
+			t.Errorf("%s: went to %q, want %q", key, replaced, want)
+		}
+	}
+}
+
+// The title of a collection library's "Recently Added" row on the home
+// page, which jellyfin-web opens on Suggestions (#/mixed?…&tab=1), opens the
+// library on the screen its user chose instead: the script drops the tab
+// from the link as it is pressed or clicked, on the link or on the title
+// within it, before jellyfin-web follows it. Other links keep theirs. It
+// runs in Node.js, in a context that stands for the browser.
+func TestRowTitlesOpenACollectionLibraryOnItsChosenScreen(t *testing.T) {
+	t.Parallel()
+	node, err := exec.LookPath("node")
+	if err != nil {
+		t.Skip("Node.js is not installed")
+	}
+	// The link each one becomes once pressed or clicked.
+	links := map[string]string{
+		"#/mixed?topParentId=0123&collectionType=mixed&tab=1":   "#/mixed?topParentId=0123&collectionType=mixed",
+		"#!/mixed?tab=1&topParentId=0123":                       "#!/mixed?topParentId=0123",
+		"#/mixed?topParentId=0123&tab=1&collectionType=mixed":   "#/mixed?topParentId=0123&collectionType=mixed",
+		"#/mixed?topParentId=0123&collectionType=mixed":         "#/mixed?topParentId=0123&collectionType=mixed",
+		"#/mixed?topParentId=0123&tab=3":                        "#/mixed?topParentId=0123&tab=3",
+		"#/mixed?topParentId=0123&tab=12":                       "#/mixed?topParentId=0123&tab=12",
+		"#/movies?topParentId=0123&collectionType=movies&tab=1": "#/movies?topParentId=0123&collectionType=movies&tab=1",
+		"#/tv?topParentId=0123&collectionType=tvshows&tab=1":    "#/tv?topParentId=0123&collectionType=tvshows&tab=1",
+		"#/details?id=0123&tab=1":                               "#/details?id=0123&tab=1",
+	}
+	const harness = scriptRunner + `
+const { script, links } = JSON.parse(require('node:fs').readFileSync(0, 'utf8'))
+const results = {}
+const node = (parentNode, matches) => ({ parentNode, matches, closest(selector) { for (let e = this; e; e = e.parentNode) if (e.matches(selector)) return e; return null } })
+for (const href of links) {
+  for (const type of ['mousedown', 'click']) {
+    for (const on of ['link', 'title']) {
+      const listeners = {}
+      const location = { href: 'http://mira.test/web/#/home', hash: '#/home', replace: () => {} }
+      const history = { pushState: () => {}, replaceState: () => {} }
+      const document = { head: { appendChild: () => {} }, createElement: () => ({}) }
+      runScript(script, { location, history, URL, document, addEventListener: (type, listener) => { (listeners[type] ||= []).push(listener) } })
+      const attributes = { href }
+      const link = node(null, (selector) => selector === 'a[href]')
+      link.getAttribute = (name) => attributes[name] ?? null
+      link.setAttribute = (name, value) => { attributes[name] = String(value) }
+      const title = node(link, () => false)
+      for (const listener of listeners[type] || []) listener({ type, target: on === 'link' ? link : title })
+      results[type + ' ' + on + ' ' + href] = attributes.href
+    }
+  }
+}
+// Elsewhere than on a link, nothing happens and nothing fails.
+const listeners = {}
+runScript(script, { location: { href: 'http://mira.test/web/#/home', hash: '#/home', replace: () => {} }, history: { pushState: () => {}, replaceState: () => {} }, URL, document: { head: { appendChild: () => {} }, createElement: () => ({}) }, addEventListener: (type, listener) => { (listeners[type] ||= []).push(listener) } })
+for (const target of [node(null, () => false), {}, null]) for (const listener of listeners.click || []) listener({ type: 'click', target })
+process.stdout.write(JSON.stringify(results))
+`
+	hrefs := make([]string, 0, len(links))
+	for href := range links {
+		hrefs = append(hrefs, href)
+	}
+	input, _ := json.Marshal(map[string]any{"script": string(webScriptBody), "links": hrefs})
+	command := exec.CommandContext(t.Context(), node, "-e", harness)
+	command.Stdin = strings.NewReader(string(input))
+	output, err := command.Output()
+	if err != nil {
+		t.Fatalf("node: %v", err)
+	}
+	var results map[string]string
+	if err := json.Unmarshal(output, &results); err != nil {
+		t.Fatalf("node printed %q: %v", output, err)
+	}
+	if len(results) != len(links)*2*2 {
+		t.Fatalf("%d results for %d links", len(results), len(links))
+	}
+	for key, got := range results {
+		href := key[strings.Index(key, "#"):]
+		if want := links[href]; got != want {
+			t.Errorf("%s: became %q, want %q", key, got, want)
+		}
+	}
+}
+
+// When jellyfin-web refuses a playback for a PlaybackInfo's ErrorCode, it
+// shows the code's alert, then its generic error alert over it, with the
+// same title. The script hides the second at once, with its backdrop, and
+// closes it with its button once it is open, or 2 seconds later. It leaves
+// alone a lone alert, alerts of other titles, one shown more than a second
+// later or after the first was closed, and dialogs that are not alerts. It
+// runs in Node.js, in a context that stands for the browser: dialog
+// containers added to the body, as jellyfin-web adds them.
+func TestTheGenericErrorOverARefusedPlaybackIsClosed(t *testing.T) {
+	t.Parallel()
+	node, err := exec.LookPath("node")
+	if err != nil {
+		t.Skip("Node.js is not installed")
+	}
+	// What became of the first and the second dialog: "-" untouched,
+	// "closed" hidden at once then closed once open, "closed late" hidden
+	// then closed without opening.
+	scenarios := map[string]string{
+		"the refusal's two alerts":                      "- closed",
+		"the refusal's two alerts, the body after load": "- closed",
+		"a lone alert":                                  "-",
+		"alerts of other titles":                        "- -",
+		"a second alert, a second later":                "- -",
+		"a second alert, the first closed":              "- -",
+		"a dialog that is not an alert":                 "- -",
+		"the second alert never opening":                "- closed late",
+	}
+	const harness = scriptRunner + `
+const { script, scenarios } = JSON.parse(require('node:fs').readFileSync(0, 'utf8'))
+const results = {}
+for (const name of scenarios) {
+  let now = 0
+  const timers = []
+  const listeners = {}
+  const advance = (ms) => {
+    const until = now + ms
+    for (;;) {
+      timers.sort((a, b) => a.at - b.at)
+      const next = timers[0]
+      if (!next || next.at > until) break
+      timers.shift()
+      now = next.at
+      next.run()
+    }
+    now = until
+  }
+  // The observers of the body's children, every block's that follows
+  // them; the one of its whole subtree follows the menus.
+  const observers = []
+  class MutationObserver {
+    constructor(callback) { this.callback = callback }
+    observe(target, options) { if (target !== body) throw new Error('not the body'); if (!options.subtree) observers.push(this) }
+    disconnect() {}
+  }
+  // A dialog as jellyfin-web's dialog helper adds it: a container after
+  // its backdrop, holding a dialog with a title and its buttons.
+  const dialog = (title, buttons) => {
+    const backdrop = { classList: { contains: (c) => c === 'dialogBackdrop' }, style: {} }
+    const inner = { opened: false, classList: { contains: (c) => c === 'opened' && inner.opened } }
+    const container = {
+      isConnected: true, style: {}, previousElementSibling: backdrop, backdrop, inner, clicks: 0, clicksBeforeOpen: 0,
+      classList: { contains: (c) => c === 'dialogContainer' },
+      querySelector: (s) => (s === '.dialog' ? inner : null),
+    }
+    const list = Array.from({ length: buttons }, () => ({ click: () => { container.clicks++; if (!inner.opened) container.clicksBeforeOpen++; container.isConnected = false } }))
+    inner.querySelector = (s) => (s === '.formDialogHeaderTitle' && title ? { textContent: title } : null)
+    inner.querySelectorAll = (s) => (s === '.btnOption' ? list : [])
+    return container
+  }
+  const add = (container) => observers.forEach((observer) => observer.callback([{ addedNodes: [container.backdrop] }, { addedNodes: [container] }]))
+  // jellyfin-web opens a dialog with an animation.
+  const open = (container) => { timers.push({ at: now + 150, run: () => { container.inner.opened = true } }) }
+  const body = {}
+  const document = { head: { appendChild: () => {} }, createElement: () => ({}), body: name.includes('after load') ? undefined : body }
+  const location = { href: 'http://mira.test/web/#/details?id=x', hash: '#/details?id=x', replace: () => {} }
+  runScript(script, {
+    location, history: { pushState: () => {}, replaceState: () => {} }, URL, document, MutationObserver,
+    Date: { now: () => now }, setTimeout: (run, delay) => timers.push({ at: now + delay, run }), clearTimeout: () => {},
+    addEventListener: (type, listener) => { (listeners[type] ||= []).push(listener) },
+  })
+  if (!document.body) { document.body = body; for (const listener of listeners.DOMContentLoaded || []) listener() }
+  const title = 'Playback Error'
+  const first = dialog(title, 1)
+  add(first); open(first)
+  let second = null
+  switch (name) {
+    case 'a lone alert': break
+    case 'alerts of other titles': advance(2); second = dialog('Something else', 1); break
+    case 'a second alert, a second later': advance(1200); second = dialog(title, 1); break
+    case 'a second alert, the first closed': advance(2); first.isConnected = false; second = dialog(title, 1); break
+    case 'a dialog that is not an alert': advance(2); second = dialog(title, 2); break
+    default: advance(2); second = dialog(title, 1)
+  }
+  if (second) {
+    add(second)
+    if (!name.includes('never opening')) open(second)
+  }
+  advance(3000)
+  const fate = (c) => {
+    if (!c.style.visibility && !c.clicks) return '-'
+    if (c.style.visibility !== 'hidden' || c.backdrop.style.visibility !== 'hidden' || c.clicks !== 1) return 'wrong: ' + JSON.stringify({ hidden: c.style.visibility, backdrop: c.backdrop.style.visibility, clicks: c.clicks })
+    return c.clicksBeforeOpen ? 'closed late' : 'closed'
+  }
+  results[name] = [first, second].filter(Boolean).map(fate).join(' ')
+}
+process.stdout.write(JSON.stringify(results))
+`
+	names := make([]string, 0, len(scenarios))
+	for name := range scenarios {
+		names = append(names, name)
+	}
+	input, _ := json.Marshal(map[string]any{"script": string(webScriptBody), "scenarios": names})
+	command := exec.CommandContext(t.Context(), node, "-e", harness)
+	command.Stdin = strings.NewReader(string(input))
+	output, err := command.Output()
+	if err != nil {
+		t.Fatalf("node: %v", err)
+	}
+	var results map[string]string
+	if err := json.Unmarshal(output, &results); err != nil {
+		t.Fatalf("node printed %q: %v", output, err)
+	}
+	for name, want := range scenarios {
+		if got := results[name]; got != want {
+			t.Errorf("%s: %q, want %q", name, got, want)
+		}
+	}
+}
+
+// On a title's page, the script asks Mira for the title's versions at
+// once, then every second while addons are pending. When the page lists
+// fewer versions than there are, or a different number once none is
+// pending, it asks for the title's details and lists their versions in the
+// version menu, in place, keeping the version picked; it reloads the page
+// as jellyfin-web reloads a page shown again when the version picked is gone
+// or no longer the same.
+// It runs in Node.js, in a context that stands for the browser and
+// jellyfin-web: a title page whose version menu lists what the details gave
+// when it was last loaded, a clock and timers the harness moves on.
+func TestTitlePagesAddVersionsAsAddonsAnswer(t *testing.T) {
+	t.Parallel()
+	node, err := exec.LookPath("node")
+	if err != nil {
+		t.Skip("Node.js is not installed")
+	}
+	const (
+		id      = "0123456789abcdef0123456789abcdef"
+		title   = "#/details?id=" + id + "&serverId=fedcba9876543210fedcba9876543210"
+		ask     = "ask http://mira.test/Mira/Items/" + id + "/Versions"
+		details = "details t"
+	)
+	// A source is a version as the title's details list it. An Id may end
+	// with "=" and the source's ETag, which Mira gives each source: the
+	// version's own identifier, the first source's included.
+	type source struct {
+		Id, Name string
+		Size     int64 `json:",omitempty"`
+	}
+	// Without Sources, an answer's details list Count versions as Mira
+	// names them: the first under the title's own identifier, then v1, v2…,
+	// named "Version 0", "Version 1"…
+	type answer struct {
+		Pending, Count int
+		Sources        []source `json:",omitempty"`
+	}
+	type scenario struct {
+		// The menu lists the first listed versions, or options, with picked
+		// picked, the first by default. jellyfin-web hides it with one
+		// version, and empties it for an item it cannot play (unplayable).
+		listed     int
+		options    []source
+		picked     string
+		unplayable bool
+		noMenu     bool
+		video      bool
+		// answers are Mira's, in order; then it fails, unless forever
+		// keeps the last. With off, they and the pushes say that Mira
+		// adds no version to an open page.
+		answers []answer
+		forever bool
+		off     bool
+		// With held, jellyfin-web fills the menu of a reloaded page only at
+		// the step "render", as when its details come late.
+		held bool
+		// Pushes come as jellyfin-web 12.4 gives its socket's messages,
+		// through ApiClient.subscribe; with legacy, as jellyfin-web before
+		// 12.0 did, through ApiClient's message event, without subscribe.
+		legacy bool
+		// steps: a route the router moves to; "tick" runs the next timer,
+		// logging "idle" when there is none; "focus" and "blur" move focus
+		// to and from the version menu; "pick <id>" picks a version as a
+		// user does, which jellyfin-web answers with the version's tracks
+		// ("tracks <id>"), or an error for a version missing from its own
+		// copy of the versions; "menu" logs the menu: its versions, "*"
+		// before the one picked, then whether it is shown; "push <pending>
+		// <count>" has Mira push the title's progress on the socket,
+		// details then listing count versions, and "push other" another
+		// title's; "clock" logs the time, in seconds. The title's own
+		// identifier is written "t".
+		steps []string
+		want  []string
+	}
+	reloads := []string{"viewbeforehide", "viewshow false"}
+	ticks := func(n int) []string { return slices.Repeat([]string{"tick"}, n) }
+	// The route asks at once; each tick after it runs the next timer.
+	steps := func(n int, more ...string) []string { return slices.Concat([]string{title}, ticks(n-1), more) }
+	versions := func(sizes ...int64) []source {
+		list := make([]source, len(sizes))
+		for i, size := range sizes {
+			list[i] = source{"v" + strconv.Itoa(i), "Version " + strconv.Itoa(i), size}
+		}
+		list[0].Id = id
+		return list
+	}
+	sized := versions(100, 200, 300)
+	grown := append(versions(100, 250, 300), source{"v3", "Version 3", 0})
+	// A version comes first: it takes the title's identifier, and the
+	// former first version one of its own.
+	ahead := []source{{id, "Version 9", 0}, {"v0", "Version 0", 0}, {"v1", "Version 1", 0}}
+	scenarios := map[string]scenario{
+		// From the one version a hidden menu lists, the menu shows them all.
+		"versions come as addons answer": {listed: 1, answers: []answer{{2, 1, nil}, {1, 2, nil}, {0, 4, nil}},
+			steps: steps(4, "menu"),
+			want:  []string{ask, ask, details, ask, details, "idle", "menu *t v1 v2 v3 shown"}},
+		// An addon asked again lists more: they join the versions listed,
+		// the one picked staying picked. jellyfin-web plays a version added
+		// once it has reloaded the page's details, and plays the others as
+		// it did.
+		"a follow-up adds versions": {listed: 2, picked: "v1", answers: []answer{{1, 2, nil}, {1, 2, nil}, {1, 4, nil}, {0, 4, nil}},
+			steps: steps(5, "menu", "pick v3", "pick t"),
+			want: slices.Concat([]string{ask, ask, ask, details, ask, "idle", "menu t *v1 v2 v3 shown"},
+				reloads, []string{"tracks v3", "tracks t"})},
+		"a known title is asked three times": {listed: 2, answers: []answer{{0, 2, nil}, {0, 2, nil}, {0, 2, nil}},
+			steps: steps(4), want: []string{ask, ask, ask, "idle"}},
+		"leaving the page stops": {listed: 1, answers: []answer{{2, 1, nil}, {2, 1, nil}},
+			steps: []string{title, "#/home", "tick"}, want: []string{ask, "idle"}},
+		"other routes ask nothing": {listed: 1, answers: []answer{{2, 3, nil}},
+			steps: []string{"#/details?id=dashboard", "#/home", "#/list?parentId=" + id, "tick"}, want: []string{"idle"}},
+		"never during a video": {listed: 1, video: true, answers: []answer{{1, 1, nil}, {1, 3, nil}, {0, 3, nil}},
+			steps: steps(4), want: []string{ask, ask, ask, "idle"}},
+		// A menu that cannot list the versions is reloaded once for each
+		// count, not every second.
+		"an empty menu counts one": {unplayable: true, answers: []answer{{1, 1, nil}, {1, 2, nil}, {0, 2, nil}},
+			steps: steps(4), want: slices.Concat([]string{ask, ask, details}, reloads, []string{ask, "idle"})},
+		"a page without a version menu is reloaded": {noMenu: true, answers: []answer{{1, 2, nil}, {0, 2, nil}, {0, 2, nil}},
+			steps: steps(4), want: slices.Concat([]string{ask}, reloads, []string{ask, ask, "idle"})},
+		"an error stops": {listed: 1, steps: steps(2), want: []string{ask, "idle"}},
+		// The track menus describe the version picked: when it is gone, the
+		// page is reloaded, and jellyfin-web picks the first version.
+		"the version picked is gone": {listed: 2, picked: "v1",
+			answers: []answer{{0, 3, []source{{id, "Version 0", 0}, {"v2", "Version 2", 0}, {"v3", "Version 3", 0}}}}, forever: true,
+			steps: steps(4, "menu"),
+			want:  slices.Concat([]string{ask, details}, reloads, []string{ask, ask, "idle", "menu *t v2 v3 shown"})},
+		// The title's own identifier now names another version.
+		"the version picked is renamed": {listed: 2,
+			answers: []answer{{0, 3, []source{{id, "Version 9", 0}, {"v1", "Version 1", 0}, {"v2", "Version 2", 0}}}}, forever: true,
+			steps: steps(4, "menu"),
+			want:  slices.Concat([]string{ask, details}, reloads, []string{ask, ask, "idle", "menu *t v1 v2 shown"})},
+		// Until a version is known, details list a placeholder named after
+		// the title under its own identifier, which the first version takes.
+		"the placeholder gives way to the first version": {options: []source{{id, "Movie", 0}},
+			answers: []answer{{1, 1, []source{{id, "Movie", 0}}}, {1, 3, nil}, {0, 3, nil}},
+			steps:   steps(4, "menu"),
+			want:    slices.Concat([]string{ask, ask, details}, reloads, []string{ask, "idle", "menu *t v1 v2 shown"})},
+		// The version picked, listed by the script, has another size now:
+		// the title's identifier names another version under the same name.
+		"the version picked changes size": {listed: 2, picked: "v1",
+			answers: []answer{{1, 3, sized}, {1, 4, grown}, {0, 4, grown}},
+			steps:   steps(4),
+			want:    slices.Concat([]string{ask, details, ask, details}, reloads, []string{ask, "idle"})},
+		// The menu may be open while it has focus: the versions wait for it
+		// to lose focus, even once Mira is no longer asked.
+		"not while the menu has focus": {listed: 2, picked: "v1", answers: []answer{{1, 3, nil}, {0, 3, nil}, {0, 3, nil}},
+			steps: slices.Concat([]string{"focus", title}, ticks(3), []string{"menu", "blur", "menu", "tick"}),
+			want:  []string{ask, ask, ask, "idle", "menu t *v1 shown", details, "menu t *v1 v2 shown", "idle"}},
+		// Once no addon is pending, the menu lists the versions details
+		// list, even fewer.
+		"no addon pending with another count": {listed: 3, answers: []answer{{1, 2, nil}, {0, 2, nil}, {0, 2, nil}},
+			steps: steps(4, "menu"),
+			want:  []string{ask, ask, details, ask, "idle", "menu *t v1 shown"}},
+		// A push is taken as an answer at once; the script then asks only
+		// every 10 seconds, as long as addons are pending.
+		"pushed versions come at once": {listed: 1, answers: []answer{{1, 1, nil}, {1, 3, nil}, {0, 3, nil}},
+			steps: []string{title, "push 1 3", "menu", "tick", "clock", "tick", "clock", "tick"},
+			want:  []string{ask, details, "menu *t v1 v2 shown", ask, "clock 1", ask, "clock 11", "idle"}},
+		"a push for another title changes nothing": {listed: 1, answers: []answer{{1, 1, nil}, {1, 1, nil}, {0, 1, nil}},
+			steps: []string{title, "push other", "tick", "tick", "clock", "tick", "menu"},
+			want:  []string{ask, ask, ask, "clock 2", "idle", "menu *t hidden"}},
+		// Pushes still come once the script no longer asks.
+		"a push after the last answer": {listed: 2, answers: []answer{{0, 2, nil}, {0, 2, nil}, {0, 2, nil}},
+			steps: []string{title, "tick", "tick", "tick", "push 0 3", "menu"},
+			want:  []string{ask, ask, ask, "idle", details, "menu *t v1 v2 shown"}},
+		"a push through the message event, without subscribe": {listed: 1, answers: []answer{{1, 1, nil}, {1, 3, nil}, {0, 3, nil}}, legacy: true,
+			steps: []string{title, "push 1 3", "menu", "tick", "clock", "tick", "clock", "tick"},
+			want:  []string{ask, details, "menu *t v1 v2 shown", ask, "clock 1", ask, "clock 11", "idle"}},
+		// A version listed first takes the title's identifier, and the
+		// former first one an identifier of its own: the version picked by
+		// jellyfin-web stays picked, under that identifier.
+		"the version picked stays picked when another comes first": {listed: 2, answers: []answer{{0, 3, ahead}}, forever: true,
+			steps: steps(4, "menu"),
+			want:  slices.Concat([]string{ask, details}, reloads, []string{ask, ask, "idle", "menu t *v0 v1 shown"})},
+		"a version picked while first stays picked": {listed: 2, answers: []answer{{1, 2, nil}, {0, 3, ahead}}, forever: true,
+			steps: []string{title, "pick v1", "pick t", "tick", "tick", "tick", "menu"},
+			want: slices.Concat([]string{ask, "tracks v1", "tracks t", ask, details}, reloads,
+				[]string{ask, "idle", "menu t *v0 v1 shown"})},
+		"a version picked after the first stays as it is": {listed: 2, picked: "v1", answers: []answer{{0, 3, ahead}}, forever: true,
+			steps: steps(4, "menu"),
+			want:  []string{ask, details, ask, ask, "idle", "menu t v0 *v1 shown"}},
+		// Of the versions with the name of the one picked, the one with its
+		// size, once the script listed it.
+		"the size tells the version picked among the same names": {options: []source{{id, "Same", 100}, {"v1", "Other", 0}},
+			answers: []answer{
+				{1, 3, []source{{id, "Same", 100}, {"v1", "Other", 0}, {"v2", "Other", 5}}},
+				{0, 5, []source{{id, "New", 0}, {"v3", "Same", 50}, {"v0", "Same", 100}, {"v1", "Other", 0}, {"v2", "Other", 5}}},
+			}, forever: true,
+			steps: steps(4, "menu"),
+			want:  slices.Concat([]string{ask, details, ask, details}, reloads, []string{ask, "idle", "menu t v3 *v0 v1 v2 shown"})},
+		// A version added under the title's identifier is picked; before
+		// jellyfin-web lists it, another comes first: the pick is made
+		// under the version's new identifier.
+		"a version added and picked stays picked when another comes first": {listed: 2, picked: "v1", held: true,
+			answers: []answer{
+				{1, 3, []source{{id, "Version 5", 0}, {"v0", "Version 0", 0}, {"v1", "Version 1", 0}}},
+				{0, 4, []source{{id, "Version 6", 0}, {"v5", "Version 5", 0}, {"v0", "Version 0", 0}, {"v1", "Version 1", 0}}},
+			}, forever: true,
+			steps: []string{title, "menu", "pick t", "tick", "render", "menu", "tick", "tick"},
+			want: slices.Concat([]string{ask, details, "menu t v0 *v1 shown"}, reloads, []string{ask, details}, reloads,
+				[]string{"tracks v5", "menu t *v5 v0 v1 shown", ask, "idle"})},
+		// Mira names a version otherwise in a later answer, as when its
+		// link changed or its size became known: the version picked is the
+		// one source with its name, and its size when both are known.
+		"a version picked whose link changed stays picked": {options: []source{{id, "Version 0", 0}, {"u1", "Version 1", 0}}, picked: "u1",
+			answers: []answer{{0, 3, []source{{id, "Version 0", 0}, {"u2", "Version 1", 0}, {"v2", "Version 2", 0}}}}, forever: true,
+			steps: steps(4, "menu"),
+			want:  slices.Concat([]string{ask, details}, reloads, []string{ask, ask, "idle", "menu t *u2 v2 shown"})},
+		"a version picked whose size became known stays picked": {options: []source{{id, "Version 0", 0}, {"u1", "Version 1", 0}}, picked: "u1",
+			answers: []answer{
+				{1, 3, []source{{id, "Version 0", 0}, {"u1", "Version 1", 0}, {"v2", "Version 2", 0}}},
+				{0, 4, []source{{id, "Version 0", 0}, {"f1", "Version 1", 700}, {"v2", "Version 2", 0}, {"v3", "Version 3", 0}}},
+			}, forever: true,
+			steps: steps(4, "menu"),
+			want:  slices.Concat([]string{ask, details, ask, details}, reloads, []string{ask, "idle", "menu t *f1 v2 v3 shown"})},
+		"a version picked whose name others share is not guessed": {options: []source{{id, "Version 0", 0}, {"u1", "Same", 0}}, picked: "u1",
+			answers: []answer{{0, 3, []source{{id, "Version 0", 0}, {"u2", "Same", 0}, {"u3", "Same", 0}}}}, forever: true,
+			steps: steps(4, "menu"),
+			want:  slices.Concat([]string{ask, details}, reloads, []string{ask, ask, "idle", "menu *t u2 u3 shown"})},
+		// The version shown first is followed by its ETag, once the script
+		// listed it: another version comes first while it is renamed, and
+		// it stays selected under its own identifier.
+		"the version shown first stays selected when another comes first as it is renamed": {listed: 2,
+			answers: []answer{
+				{1, 3, []source{{id + "=v0", "Version 0", 0}, {"v1=v1", "Version 1", 0}, {"v2=v2", "Version 2", 0}}},
+				{0, 4, []source{{id + "=v9", "Version 9", 0}, {"v0=v0", "Version 0 · 2 GB", 2000}, {"v1=v1", "Version 1", 0}, {"v2=v2", "Version 2", 0}}},
+			}, forever: true,
+			steps: steps(4, "menu"),
+			want:  slices.Concat([]string{ask, details, ask, details}, reloads, []string{ask, "idle", "menu t *v0 v1 v2 shown"})},
+		// The placeholder gave way, the page reloaded: jellyfin-web's options
+		// stand for the sources the script was last given under their
+		// names, ETags included.
+		"the version shown first after the placeholder stays selected when another comes first as it is renamed": {options: []source{{id, "Movie", 0}},
+			answers: []answer{
+				{1, 3, []source{{id + "=v0", "Version 0", 0}, {"v1=v1", "Version 1", 0}, {"v2=v2", "Version 2", 0}}},
+				{0, 4, []source{{id + "=v9", "Version 9", 0}, {"v0=v0", "Version 0 · 2 GB", 2000}, {"v1=v1", "Version 1", 0}, {"v2=v2", "Version 2", 0}}},
+			}, forever: true,
+			steps: steps(4, "menu"),
+			want:  slices.Concat([]string{ask, details}, reloads, []string{ask, details}, reloads, []string{ask, "idle", "menu t *v0 v1 v2 shown"})},
+		// A version keeps its ETag as its name and size change: it stays
+		// picked as it is, the page not reloaded.
+		"a version picked stays picked as it is renamed": {listed: 2, picked: "v1",
+			answers: []answer{
+				{1, 3, []source{{id + "=v0", "Version 0", 0}, {"v1=v1", "Version 1", 0}, {"v2=v2", "Version 2", 0}}},
+				{0, 4, []source{{id + "=v9", "Version 9", 0}, {"v0=v0", "Version 0", 0}, {"v1=v1", "Version 1 · 2 GB", 2000}, {"v2=v2", "Version 2", 0}}},
+			}, forever: true,
+			steps: steps(4, "menu"),
+			want:  []string{ask, details, ask, details, ask, "idle", "menu t v0 *v1 v2 shown"}},
+		// Adding no version to an open page, Mira still has the
+		// placeholder give way, once; a page that lists versions keeps them.
+		"off, the placeholder still gives way": {off: true, options: []source{{id, "Movie", 0}},
+			answers: []answer{{1, 1, []source{{id, "Movie", 0}}}, {1, 3, nil}, {1, 4, nil}, {0, 5, nil}},
+			steps:   steps(5, "menu"),
+			want:    slices.Concat([]string{ask, ask, details}, reloads, []string{ask, ask, "idle", "menu *t v1 v2 shown"})},
+		"off, a version stays alone": {off: true, listed: 1, answers: []answer{{1, 1, nil}, {1, 3, nil}, {0, 3, nil}},
+			steps: steps(4, "menu"),
+			want:  []string{ask, ask, details, ask, "idle", "menu *t hidden"}},
+		"off, versions stay as listed": {off: true, listed: 2, answers: []answer{{1, 2, nil}, {1, 3, nil}, {0, 4, nil}},
+			steps: slices.Concat(steps(4), []string{"push 0 5", "menu"}),
+			want:  []string{ask, ask, ask, "idle", "menu *t v1 shown"}},
+	}
+	asks := slices.Repeat([]string{ask}, 150)
+	scenarios["150 seconds at most"] = scenario{listed: 1, answers: []answer{{1, 1, nil}}, forever: true,
+		// Asked at 0 to 149 seconds; the 150th asks nothing, and the
+		// polling ends.
+		steps: append([]string{title}, ticks(151)...), want: append(asks, "idle")}
+
+	const harness = scriptRunner + `
+const { script, scenarios } = JSON.parse(require('node:fs').readFileSync(0, 'utf8'))
+const flush = () => new Promise((resolve) => setImmediate(resolve))
+const TITLE = '0123456789abcdef0123456789abcdef'
+const short = (id) => (id === TITLE ? 't' : id)
+const versions = (n) => Array.from({ length: n }, (_, i) => ({ Id: i ? 'v' + i : TITLE, Name: 'Version ' + i }))
+async function run(scenario) {
+  const log = []
+  let now = 0
+  const timers = []
+  const listeners = {}
+  const location = { href: 'http://mira.test/web/', hash: '', replace: (url) => log.push('replace ' + url) }
+  const go = (hash) => { location.hash = hash; location.href = 'http://mira.test/web/' + hash }
+  const history = { pushState: (state, title, url) => go(url), replaceState: (state, title, url) => go(url) }
+  class CustomEvent { constructor(type, init) { this.type = type; this.detail = init && init.detail } }
+  class Event { constructor(type) { this.type = type } stopPropagation() { this.stopped = true } }
+  // Changes to the menu's options reach its observers once the code that
+  // made them is done.
+  const observers = new Set()
+  let pending = false
+  const changed = () => {
+    if (pending) return
+    pending = true
+    queueMicrotask(() => {
+      pending = false
+      for (const observer of [...observers]) if (observers.has(observer)) observer.callback([])
+    })
+  }
+  class MutationObserver {
+    constructor(callback) { this.callback = callback }
+    observe() { observers.add(this) }
+    disconnect() { observers.delete(this) }
+  }
+  // A source's ETag follows its Id after "=".
+  const tagged = (list) => list.map((source) => {
+    const [Id, ETag] = source.Id.split('=')
+    return ETag ? { ...source, Id, ETag } : source
+  })
+  // What the title's details list now, and jellyfin-web's own copy of the
+  // versions it listed last.
+  let sources = tagged(scenario.options || versions(scenario.listed))
+  let copy = []
+  let focused = null
+  const container = { hidden: false, classList: { toggle: (name, force) => { if (name === 'hide') container.hidden = force } } }
+  const menu = {
+    children: [],
+    get options() { return this.children },
+    get selectedIndex() { return this.children.findIndex((option) => option.selected) },
+    get value() { const option = this.children.find((option) => option.selected); return option ? option.value : '' },
+    set value(value) { for (const option of this.children) option.selected = option.value === value },
+    matches: (selector) => selector === '.selectSource',
+    closest: (selector) => {
+      if (selector === '.hide') return scenario.unplayable || container.hidden ? {} : null
+      if (selector === '.selectSourceContainer') return container
+      return selector === '.itemDetailPage' ? page : null
+    },
+    insertBefore(option, before) {
+      if (this.children.includes(option)) this.children.splice(this.children.indexOf(option), 1)
+      this.children.splice(before ? this.children.indexOf(before) : this.children.length, 0, option)
+      changed()
+    },
+    removeChild(option) { this.children.splice(this.children.indexOf(option), 1); changed() },
+    dispatchEvent: (event) => dispatch(event),
+  }
+  // jellyfin-web fills the menu from the details, keeping the version picked
+  // if listed, else the first; it hides it with one version and lists none
+  // for an item it cannot play.
+  function fill(picked) {
+    copy = scenario.unplayable ? [] : sources
+    menu.children = copy.map((source) => ({ value: source.Id, textContent: source.Name, selected: false }))
+    menu.value = copy.some((source) => source.Id === picked) ? picked : copy.length ? copy[0].Id : ''
+    container.hidden = copy.length < 2
+    changed()
+  }
+  fill(scenario.picked || (sources[0] || {}).Id)
+  // Events on the menu reach the window's capturing listeners first, then
+  // jellyfin-web's, which fills the track menus from its own copy.
+  function dispatch(event) {
+    event.target = menu
+    for (const listener of listeners[event.type] || []) listener(event)
+    if (event.stopped || event.type !== 'change') return
+    log.push(copy.some((source) => source.Id === menu.value) ? 'tracks ' + short(menu.value) : 'error')
+  }
+  const page = {
+    querySelector: (selector) => (selector === '.selectSource' && !scenario.noMenu ? menu : null),
+    dispatchEvent: (event) => {
+      log.push(event.type + (event.detail && 'isRestored' in event.detail ? ' ' + event.detail.isRestored : ''))
+      // Reloaded, the page lists what the details give now, or at the
+      // step "render" with held.
+      if (event.type === 'viewshow' && !scenario.held) fill(menu.value)
+    },
+  }
+  const document = {
+    get activeElement() { return focused },
+    head: { appendChild: () => {} },
+    createElement: (tag) => (tag === 'option' ? { value: '', textContent: '', selected: false } : tag === 'style' ? {} : null),
+    querySelector: (selector) => {
+      if (selector === '.videoPlayerContainer') return scenario.video ? {} : null
+      return selector === '.page.itemDetailPage:not(.hide)' ? page : null
+    },
+  }
+  const answers = (scenario.answers || []).slice()
+  // What the script subscribed to, by message type.
+  const subscribers = {}
+  const ApiClient = {
+    getUrl: (path) => 'http://mira.test/' + path,
+    getCurrentUserId: () => 'user',
+    getJSON: (url) => {
+      // Mira answers the user's views too, which hide nothing here.
+      if (url === 'http://mira.test/Mira/UserViews') return Promise.resolve({ Items: [] })
+      log.push('ask ' + url)
+      const answer = scenario.forever && answers.length === 1 ? answers[0] : answers.shift()
+      if (!answer) return Promise.reject(new Error('down'))
+      sources = tagged(answer.Sources || versions(answer.Count))
+      return Promise.resolve({ Pending: answer.Pending, Count: answer.Count, AddVersions: !scenario.off })
+    },
+    getItem: (user, id) => {
+      log.push('details ' + short(id) + (user === 'user' ? '' : ' for ' + user))
+      return Promise.resolve({ Id: id, Name: 'Movie', MediaSources: sources.map((source) => ({ ...source })) })
+    },
+  }
+  if (!scenario.legacy) {
+    ApiClient.subscribe = (types, callback) => {
+      for (const type of types) (subscribers[type] ||= []).push(callback)
+      return () => {}
+    }
+  }
+  runScript(script, {
+    location, history, URL, document, CustomEvent, Event, MutationObserver, window: { ApiClient },
+    Date: { now: () => now },
+    setTimeout: (run, delay) => timers.push({ run, at: now + delay }),
+    clearTimeout: (id) => { if (id) timers[id - 1] = null },
+    addEventListener: (type, listener) => { (listeners[type] ||= []).push(listener) },
+  })
+  for (const step of scenario.steps) {
+    if (step === 'focus') focused = menu
+    else if (step === 'blur') {
+      focused = null
+      dispatch(new Event('blur'))
+    } else if (step.startsWith('pick ')) {
+      const id = step.slice(5)
+      menu.value = id === 't' ? TITLE : id
+      dispatch(new Event('change'))
+    } else if (step === 'menu') {
+      const options = menu.children.map((option) => (option.selected ? '*' : '') + short(option.value))
+      log.push(['menu', ...options, container.hidden ? 'hidden' : 'shown'].join(' '))
+    } else if (step === 'clock') log.push('clock ' + now / 1000)
+    else if (step === 'render') fill(menu.value)
+    else if (step.startsWith('push ')) {
+      // As jellyfin-web 12.4 gives its socket's messages to subscribers,
+      // or, with legacy, as its events trigger ApiClient's message event.
+      const [, pending, count] = step.split(' ')
+      const data = pending === 'other' ? { ItemId: 'f'.repeat(32), Pending: 0, Count: 5 } : { ItemId: TITLE.toUpperCase(), Pending: +pending, Count: +count, AddVersions: !scenario.off }
+      if (pending !== 'other') sources = versions(+count)
+      const message = { MessageType: 'MiraVersions', MessageId: 'm', Data: data }
+      if (scenario.legacy) {
+        for (const callback of ((ApiClient._callbacks || {}).message || []).slice()) callback.apply(ApiClient, [{ type: 'message' }, message])
+      } else {
+        for (const callback of (subscribers.MiraVersions || []).slice()) callback(message)
+      }
+    } else if (step !== 'tick') history.pushState(null, '', step)
+    else {
+      let next = -1
+      timers.forEach((timer, i) => { if (timer && (next < 0 || timer.at < timers[next].at)) next = i })
+      if (next < 0) log.push('idle')
+      else {
+        const timer = timers[next]
+        timers[next] = null
+        now = timer.at
+        timer.run()
+      }
+    }
+    await flush()
+  }
+  return log
+}
+;(async () => {
+  const results = {}
+  for (const [name, scenario] of Object.entries(scenarios)) results[name] = await run(scenario)
+  process.stdout.write(JSON.stringify(results))
+})()
+`
+	type input struct {
+		Listed     int      `json:"listed"`
+		Options    []source `json:"options,omitempty"`
+		Picked     string   `json:"picked,omitempty"`
+		Unplayable bool     `json:"unplayable"`
+		NoMenu     bool     `json:"noMenu"`
+		Video      bool     `json:"video"`
+		Answers    []answer `json:"answers"`
+		Forever    bool     `json:"forever"`
+		Off        bool     `json:"off"`
+		Held       bool     `json:"held"`
+		Legacy     bool     `json:"legacy"`
+		Steps      []string `json:"steps"`
+	}
+	inputs := map[string]input{}
+	for name, s := range scenarios {
+		inputs[name] = input{s.listed, s.options, s.picked, s.unplayable, s.noMenu, s.video, s.answers, s.forever, s.off, s.held, s.legacy, s.steps}
+	}
+	data, _ := json.Marshal(map[string]any{"script": string(webScriptBody), "scenarios": inputs})
+	command := exec.CommandContext(t.Context(), node, "-e", harness)
+	command.Stdin = strings.NewReader(string(data))
+	output, err := command.Output()
+	if err != nil {
+		t.Fatalf("node: %v", err)
+	}
+	var results map[string][]string
+	if err := json.Unmarshal(output, &results); err != nil {
+		t.Fatalf("node printed %q: %v", output, err)
+	}
+	for name, s := range scenarios {
+		if got := results[name]; !slices.Equal(got, s.want) {
+			t.Errorf("%s:\n got  %q\n want %q", name, got, s.want)
+		}
+	}
+}
+
+// On a movie's or an episode's page, the play buttons wait for a source:
+// while no version is known and addons are searched, they are disabled with
+// a tooltip, greyed, with a spinner; once a version is known, by an answer
+// or a push, they are as jellyfin-web made them; once no addon is left to
+// search, a line under them says no source is available, with a button that
+// has Mira search again. The first answer, asked as the route changes,
+// never says no source; before it, the buttons wait only when the version
+// menu lists the placeholder alone. jellyfin-web's renders find them held
+// again; a video is never touched, and leaving the page gives everything
+// back. It runs in Node.js, in a context that stands for the browser: a
+// small document holding the title page, whose buttons jellyfin-web titled
+// "Resume" and "Play", a clock and timers the harness moves on.
+func TestPlayButtonsWaitForASource(t *testing.T) {
+	t.Parallel()
+	node, err := exec.LookPath("node")
+	if err != nil {
+		t.Skip("Node.js is not installed")
+	}
+	const (
+		id     = "0123456789abcdef0123456789abcdef"
+		title  = "#/details?id=" + id + "&serverId=fedcba9876543210fedcba9876543210"
+		ask    = "ask http://mira.test/Mira/Items/" + id + "/Versions"
+		search = "search http://mira.test/Mira/Items/" + id + "/Versions/Search"
+	)
+	type progress struct{ Pending, Count, Known int }
+	// A search answers a progress, or asks to wait RetryAfter seconds.
+	type searchAnswer struct {
+		progress
+		RetryAfter int `json:",omitempty"`
+	}
+	type scenario struct {
+		// lang is jellyfin-web's language, "en-US" by default.
+		lang     string
+		answers  []progress
+		searches []searchAnswer
+		// deferred answers wait for an "answer" step.
+		deferred bool
+		// menu lists the version menu's options at first, "t" standing for
+		// the title's own identifier; none without it.
+		menu []string
+		// steps: a route the router moves to; "tick" runs the next timer,
+		// logging "idle" when there is none; "answer" gives the oldest
+		// deferred answer; "push <pending> <count> <known>" has Mira push
+		// the title's progress; "show" logs the buttons, each "free" or
+		// "held", "+spin" with a spinner, then its tooltip, and the line
+		// under them, "+wait" when its button waits; "render" has
+		// jellyfin-web title the buttons again, as it does when it shows the
+		// page, and "rebuild" replace them; "list <option>…" has it list the
+		// version menu's options; "again" clicks the line's button; "video"
+		// and "end video" start and end a video.
+		steps []string
+		want  []string
+	}
+	const (
+		searching   = `show play held+spin "Looking for sources…" replay held+spin "Looking for sources…"`
+		none        = `show play held "No source is available for this title." replay held "No source is available for this title." note "No source is available for this title." "Try again"`
+		free        = `show play free "Resume" replay free "Play"`
+		frSearching = `show play held+spin "Recherche des sources…" replay held+spin "Recherche des sources…"`
+		frNone      = `show play held "Aucune source disponible pour ce titre." replay held "Aucune source disponible pour ce titre." note "Aucune source disponible pour ce titre." "Réessayer"`
+		ptSearching = `show play held+spin "Procurando fontes…" replay held+spin "Procurando fontes…"`
+	)
+	looking, found, empty := progress{1, 1, 0}, progress{0, 1, 1}, progress{0, 1, 0}
+	scenarios := map[string]scenario{
+		"searching, then a version by an answer": {answers: []progress{looking, found, found},
+			steps: []string{title, "show", "tick", "show", "tick", "tick"},
+			want:  []string{ask, searching, ask, free, ask, "idle"}},
+		"a pushed version frees them at once": {answers: []progress{looking, looking},
+			steps: []string{title, "show", "push 1 1 0", "show", "push 0 2 2", "show"},
+			want:  []string{ask, searching, searching, "reload", free}},
+		// The first answer may come before the details asked any addon:
+		// the next one tells that no source is available.
+		"no source, then searching again": {answers: []progress{empty, empty, empty, looking, {0, 3, 3}, {0, 3, 3}},
+			searches: []searchAnswer{{progress: looking}},
+			steps:    []string{title, "show", "tick", "show", "tick", "tick", "again", "show", "tick", "show", "tick", "show", "tick", "tick"},
+			want:     []string{ask, searching, ask, none, ask, "idle", search, searching, ask, searching, ask, "reload", free, ask, "idle"}},
+		"searching again too soon waits": {answers: []progress{empty, empty, empty},
+			searches: []searchAnswer{{RetryAfter: 7}, {progress: looking}},
+			steps:    []string{title, "tick", "tick", "tick", "again", "show", "again", "tick", "show", "again", "show"},
+			want:     []string{ask, ask, ask, "idle", search, none + " +wait", none, search, searching}},
+		"jellyfin-web's renders find them held": {answers: []progress{looking, empty},
+			steps: []string{title, "render", "show", "rebuild", "show", "tick", "rebuild", "show", "render", "show", "push 0 1 1", "show"},
+			want: []string{ask, searching, searching, ask, none, none,
+				// A render titled the play button anew: it keeps that title.
+				`show play free "Play" replay free "Play"`}},
+		"never during a video": {answers: []progress{looking, looking, looking},
+			steps: []string{"video", title, "show", "end video", "tick", "show", "video", "push 0 1 1", "show", "end video", "push 0 1 1", "show"},
+			want:  []string{ask, free, ask, searching, searching, free}},
+		"leaving gives everything back": {answers: []progress{empty, empty},
+			steps: []string{title, "tick", "show", "#/home", "show", "tick"},
+			want:  []string{ask, ask, none, free, "idle"}},
+		"leaving while searching": {answers: []progress{looking, looking},
+			steps: []string{title, "#/home", "show", "tick"},
+			want:  []string{ask, free, "idle"}},
+		"other items are left alone": {answers: []progress{{0, 0, 0}, {0, 0, 0}, {0, 0, 0}},
+			steps: []string{title, "show"},
+			want:  []string{ask, free}},
+		"in French": {lang: "fr-FR", answers: []progress{looking, empty, empty},
+			steps: []string{title, "show", "tick", "show"},
+			want:  []string{ask, frSearching, ask, frNone}},
+		"in Brazilian Portuguese": {lang: "pt-BR", answers: []progress{looking},
+			steps: []string{title, "show"},
+			want:  []string{ask, ptSearching}},
+		"in another language, English": {lang: "nl", answers: []progress{looking},
+			steps: []string{title, "show"},
+			want:  []string{ask, searching}},
+		// Before the first answer: item details list the placeholder alone,
+		// a single source under the title's own identifier, while no
+		// version is known.
+		"held from the start with only the placeholder": {deferred: true, menu: []string{"t"}, answers: []progress{found},
+			steps: []string{title, "show", "answer", "show"},
+			want:  []string{ask, searching, free}},
+		"held as the page lists only the placeholder": {deferred: true, answers: []progress{looking},
+			steps: []string{title, "show", "list t", "show", "answer", "show"},
+			want:  []string{ask, free, searching, searching}},
+		"untouched while real versions are listed": {deferred: true, menu: []string{"t", "v1"}, answers: []progress{found},
+			steps: []string{title, "show", "list v1", "show", "answer", "show"},
+			want:  []string{ask, free, free, free}},
+	}
+
+	const harness = scriptRunner + `
+const { script, scenarios } = JSON.parse(require('node:fs').readFileSync(0, 'utf8'))
+const flush = () => new Promise((resolve) => setImmediate(resolve))
+const TITLE = '0123456789abcdef0123456789abcdef'
+async function run(scenario) {
+  const log = []
+  let now = 0
+  let video = false
+  const timers = []
+  const listeners = {}
+  const location = { href: 'http://mira.test/web/', hash: '', replace: (url) => log.push('replace ' + url) }
+  const go = (hash) => { location.hash = hash; location.href = 'http://mira.test/web/' + hash }
+  const history = { pushState: (state, title, url) => go(url), replaceState: (state, title, url) => go(url) }
+  class CustomEvent { constructor(type, init) { this.type = type; this.detail = init && init.detail } }
+  // Observers hear the changes within what they observe once the code that
+  // made them is done: within its subtree, or of the element itself.
+  const observers = new Set()
+  const queued = new Set()
+  const changed = (element) => {
+    for (const observer of observers) {
+      const heard = observer.options.subtree ? observer.target.contains(element) : observer.target === element
+      if (!heard || queued.has(observer)) continue
+      queued.add(observer)
+      queueMicrotask(() => { queued.delete(observer); if (observers.has(observer)) observer.callback([]) })
+    }
+  }
+  class MutationObserver {
+    constructor(callback) { this.callback = callback }
+    observe(target, options) { this.target = target; this.options = options; observers.add(this) }
+    disconnect() { observers.delete(this) }
+  }
+  // A small document: elements with attributes, classes, children and text,
+  // found by their classes.
+  class Element {
+    constructor(tag) { this.tagName = tag; this.attributes = {}; this.children = []; this.parentNode = null; this.text = ''; this.listeners = {} }
+    getAttribute(name) { return name in this.attributes ? this.attributes[name] : null }
+    hasAttribute(name) { return name in this.attributes }
+    setAttribute(name, value) { this.attributes[name] = String(value); changed(this) }
+    removeAttribute(name) { if (name in this.attributes) { delete this.attributes[name]; changed(this) } }
+    get className() { return this.getAttribute('class') || '' }
+    set className(value) { this.setAttribute('class', value) }
+    get id() { return this.getAttribute('id') || '' }
+    set id(value) { this.setAttribute('id', value) }
+    get classList() {
+      const names = () => this.className.split(' ').filter(Boolean)
+      return {
+        contains: (name) => names().includes(name),
+        add: (name) => { if (!names().includes(name)) this.className = names().concat(name).join(' ') },
+        remove: (name) => { if (names().includes(name)) this.className = names().filter((n) => n !== name).join(' ') },
+        toggle: (name, force) => { if (force ?? !names().includes(name)) this.classList.add(name); else this.classList.remove(name) },
+      }
+    }
+    get textContent() { return this.text + this.children.map((child) => child.textContent).join('') }
+    set textContent(value) { this.children = []; this.text = value; changed(this) }
+    get firstChild() { return this.children[0] || null }
+    get lastChild() { return this.children[this.children.length - 1] || null }
+    get nextSibling() { const siblings = this.parentNode ? this.parentNode.children : []; return siblings[siblings.indexOf(this) + 1] || null }
+    contains(element) { for (let e = element; e; e = e.parentNode) if (e === this) return true; return false }
+    insertBefore(child, before) {
+      if (child.parentNode) child.remove()
+      child.parentNode = this
+      this.children.splice(before ? this.children.indexOf(before) : this.children.length, 0, child)
+      changed(this)
+      return child
+    }
+    appendChild(child) { return this.insertBefore(child, null) }
+    remove() { const parent = this.parentNode; if (!parent) return; parent.children.splice(parent.children.indexOf(this), 1); this.parentNode = null; changed(parent) }
+    matches(selector) {
+      return selector.split(',').some((one) => {
+        const [classes, not] = one.trim().split(':not(')
+        const names = classes.split('.').filter(Boolean)
+        if (names.some((name) => !this.classList.contains(name))) return false
+        return !not || !this.classList.contains(not.replace(/^\.|\)$/g, ''))
+      })
+    }
+    querySelectorAll(selector) {
+      const found = []
+      const walk = (element) => element.children.forEach((child) => { if (child.matches(selector)) found.push(child); walk(child) })
+      walk(this)
+      return found
+    }
+    querySelector(selector) { return this.querySelectorAll(selector)[0] || null }
+    closest(selector) { for (let e = this; e; e = e.parentNode) if (e.matches && e.matches(selector)) return e; return null }
+    addEventListener(type, listener) { (this.listeners[type] ||= []).push(listener) }
+    dispatchEvent(event) {
+      if (event.type === 'viewshow') log.push('reload')
+      for (const listener of this.listeners[event.type] || []) listener(event)
+    }
+    click() { if (!this.hasAttribute('disabled')) this.dispatchEvent({ type: 'click' }) }
+    get options() { return this.children }
+    get value() { return this.getAttribute('value') || '' }
+  }
+  const element = (tag, className, parent) => { const e = new Element(tag); e.className = className; if (parent) parent.appendChild(e); return e }
+  const root = element('html', '')
+  root.lang = scenario.lang || 'en-US'
+  const head = element('head', '', root)
+  const body = element('body', '', root)
+  const page = element('div', 'page itemDetailPage', body)
+  const detail = element('div', 'detailPagePrimaryContainer', page)
+  // The buttons share the ribbon with the title's name; the line goes
+  // under the ribbon.
+  const ribbon = element('div', 'detailRibbon padded-left padded-right', detail)
+  element('div', 'infoWrapper', ribbon)
+  let row
+  // jellyfin-web's buttons, as its details template has them: resuming,
+  // the play button is titled Resume, and the replay button is shown.
+  function build() {
+    if (row) row.remove()
+    row = element('div', 'mainDetailButtons focuscontainer-x', ribbon)
+    for (const [name, tooltip] of [['btnPlay', 'Resume'], ['btnReplay', 'Play'], ['btnDownload', 'Download']]) {
+      const button = element('button', 'button-flat ' + name + ' detailButton', row)
+      button.setAttribute('title', tooltip)
+      element('div', 'detailButton-content', button)
+    }
+  }
+  build()
+  element('div', 'overview', detail)
+  // jellyfin-web's version menu, which lists the sources of the details.
+  let menu = null
+  function list(values) {
+    if (menu) menu.remove()
+    menu = element('select', 'selectSource', detail)
+    for (const value of values) element('option', '', menu).setAttribute('value', value === 't' ? TITLE : value)
+  }
+  if (scenario.menu) list(scenario.menu)
+  const document = {
+    documentElement: root,
+    head,
+    body,
+    createElement: (tag) => new Element(tag),
+    getElementById: (id) => [root, ...root.querySelectorAll('*')].find((e) => e.id === id) || null,
+    querySelector: (selector) => {
+      if (selector === '.videoPlayerContainer') return video ? {} : null
+      return body.querySelector(selector)
+    },
+  }
+  root.querySelectorAll = (function (original) {
+    return function (selector) {
+      if (selector !== '*') return original.call(this, selector)
+      const all = []
+      const walk = (e) => e.children.forEach((child) => { all.push(child); walk(child) })
+      walk(this)
+      return all
+    }
+  })(root.querySelectorAll)
+  function describe(button) {
+    const held = button.hasAttribute('disabled') && button.getAttribute('aria-disabled') === 'true' && button.classList.contains('miraHeld')
+    const free = !button.hasAttribute('disabled') && !button.hasAttribute('aria-disabled') && !button.classList.contains('miraHeld')
+    const spinner = button.querySelector('.miraSpinner')
+    const state = held ? 'held' + (spinner ? '+spin' : '') : free && !spinner ? 'free' : 'broken'
+    return state + ' "' + button.getAttribute('title') + '"'
+  }
+  function show() {
+    const words = ['show', 'play', describe(page.querySelector('.btnPlay')), 'replay', describe(page.querySelector('.btnReplay'))]
+    const notes = body.querySelectorAll('.miraNoSource')
+    if (notes.length > 1 || (notes.length && ribbon.nextSibling !== notes[0])) words.push('misplaced')
+    if (notes.length === 1) {
+      const [text, again] = notes[0].children
+      words.push('note', '"' + text.textContent + '"', '"' + again.textContent + '"')
+      if (again.hasAttribute('disabled')) words.push('+wait')
+    }
+    log.push(words.join(' '))
+  }
+  const answers = scenario.answers.slice()
+  const searches = (scenario.searches || []).slice()
+  const deferred = []
+  const ApiClient = {
+    getUrl: (path) => 'http://mira.test/' + path,
+    getCurrentUserId: () => 'user',
+    getJSON: (url) => {
+      // Mira answers the user's views too, which hide nothing here.
+      if (url === 'http://mira.test/Mira/UserViews') return Promise.resolve({ Items: [] })
+      log.push('ask ' + url)
+      const answer = answers.shift()
+      if (!answer) return Promise.reject(new Error('down'))
+      if (scenario.deferred) return new Promise((resolve) => deferred.push(() => resolve({ ...answer })))
+      return Promise.resolve({ ...answer })
+    },
+    ajax: (request) => {
+      log.push('search ' + request.url + (request.type === 'POST' ? '' : ' with ' + request.type))
+      const answer = searches.shift()
+      if (!answer) return Promise.reject(new Error('down'))
+      if (answer.RetryAfter) return Promise.reject({ status: 429, headers: { get: (name) => (name === 'Retry-After' ? String(answer.RetryAfter) : null) } })
+      return Promise.resolve({ Pending: answer.Pending, Count: answer.Count, Known: answer.Known })
+    },
+    getItem: (user, id) => {
+      log.push('details')
+      return Promise.resolve({ Id: id, MediaSources: [] })
+    },
+  }
+  runScript(script, {
+    location, history, URL, document, CustomEvent, MutationObserver, window: { ApiClient },
+    Date: { now: () => now },
+    setTimeout: (run, delay) => timers.push({ run, at: now + delay }),
+    clearTimeout: (id) => { if (id) timers[id - 1] = null },
+    addEventListener: (type, listener) => { (listeners[type] ||= []).push(listener) },
+  })
+  for (const step of scenario.steps) {
+    if (step === 'show') show()
+    else if (step === 'answer') {
+      const give = deferred.shift()
+      if (give) give()
+      else log.push('no answer')
+    } else if (step.startsWith('list ')) list(step.split(' ').slice(1))
+    else if (step === 'video') video = true
+    else if (step === 'end video') video = false
+    else if (step === 'render') {
+      // As jellyfin-web titles the play button when it shows the page.
+      page.querySelector('.btnPlay').setAttribute('title', 'Play')
+      page.querySelector('.btnReplay').classList.toggle('hide', false)
+    } else if (step === 'rebuild') build()
+    else if (step === 'again') {
+      const again = body.querySelector('.miraAgain')
+      if (again) again.click()
+      else log.push('no button')
+    } else if (step.startsWith('push ')) {
+      const [, pending, count, known] = step.split(' ').map(Number)
+      const message = { MessageType: 'MiraVersions', MessageId: 'm', Data: { ItemId: TITLE.toUpperCase(), Pending: pending, Count: count, Known: known } }
+      for (const callback of ((ApiClient._callbacks || {}).message || []).slice()) callback.apply(ApiClient, [{ type: 'message' }, message])
+    } else if (step !== 'tick') history.pushState(null, '', step)
+    else {
+      let next = -1
+      timers.forEach((timer, i) => { if (timer && (next < 0 || timer.at < timers[next].at)) next = i })
+      if (next < 0) log.push('idle')
+      else {
+        const timer = timers[next]
+        timers[next] = null
+        now = timer.at
+        timer.run()
+      }
+    }
+    await flush()
+  }
+  return log
+}
+;(async () => {
+  const results = {}
+  for (const [name, scenario] of Object.entries(scenarios)) {
+    try {
+      results[name] = await run(scenario)
+    } catch (error) {
+      results[name] = ['harness: ' + error.stack]
+    }
+  }
+  process.stdout.write(JSON.stringify(results))
+})()
+`
+	type input struct {
+		Lang     string         `json:"lang,omitempty"`
+		Answers  []progress     `json:"answers"`
+		Searches []searchAnswer `json:"searches,omitempty"`
+		Deferred bool           `json:"deferred"`
+		Menu     []string       `json:"menu,omitempty"`
+		Steps    []string       `json:"steps"`
+	}
+	inputs := map[string]input{}
+	for name, s := range scenarios {
+		inputs[name] = input{s.lang, s.answers, s.searches, s.deferred, s.menu, s.steps}
+	}
+	data, _ := json.Marshal(map[string]any{"script": string(webScriptBody), "scenarios": inputs})
+	command := exec.CommandContext(t.Context(), node, "-e", harness)
+	command.Stdin = strings.NewReader(string(data))
+	output, err := command.Output()
+	if err != nil {
+		t.Fatalf("node: %v", err)
+	}
+	var results map[string][]string
+	if err := json.Unmarshal(output, &results); err != nil {
+		t.Fatalf("node printed %q: %v", output, err)
+	}
+	for name, s := range scenarios {
+		if got := results[name]; !slices.Equal(got, s.want) {
+			t.Errorf("%s:\n got  %q\n want %q", name, got, s.want)
+		}
+	}
+}
+
+// The libraries a user hides from the web player's menus leave them: once a
+// user is signed in, the script asks Mira for the user's views and hides
+// the links of those marked in the top bar, its More menu, the side menu of
+// that layout and the legacy layout's side menu, never another link to them,
+// and hides the More button at the widths where it would list only such
+// views. It asks again when the user changes, looks for a user restored
+// after the first route for 30 seconds, and drops an answer for the user
+// before. It keeps the last answer in the browser's storage and hides its
+// views as it starts, before any answer, until the user signed in is known
+// to be another; storage that fails or holds anything else counts as none.
+// It runs in Node.js, in a context that stands for the browser: the style
+// the script keeps is read back and its rules are tried on the links
+// jellyfin-web 12.2 renders in each place, at widths around MUI's lg and xl
+// breakpoints, with storage, a clock and timers the harness moves on.
+func TestHiddenLibrariesLeaveTheWebPlayerMenus(t *testing.T) {
+	t.Parallel()
+	node, err := exec.LookPath("node")
+	if err != nil {
+		t.Skip("Node.js is not installed")
+	}
+	const (
+		title = "0123456789abcdef0123456789abcdef"
+		// savedKey is where the script keeps the last answer, from one load
+		// of the web player to the next.
+		savedKey = "miraUserViews"
+	)
+	type view struct {
+		Id          string
+		HideInMenus bool
+	}
+	type scenario struct {
+		// user is signed in as the script loads; empty for none.
+		user string
+		// views are Mira's answers by user: the user's views in order,
+		// each named by one character that its identifier repeats, a "*"
+		// after those hidden from the menus. A user without views gets an
+		// error.
+		views map[string]string
+		// deferred holds each answer until an "answer <user>" step gives it.
+		deferred bool
+		// stored is what storage holds under savedKey as the script loads;
+		// storage is "off" when using it throws, "full" when saving throws.
+		stored, storage string
+		// steps: a route the router moves to; "signin <user>" and "signout"
+		// change the user jellyfin-web's client has, without a route; "tick"
+		// runs the next timer, logging "idle" when there is none; "clock"
+		// logs the time, in seconds; "show" logs, for each place, the views
+		// whose link the style hides there at every width ("bar", "more",
+		// "drawer", "legacy"), those with another link hidden ("other"), and
+		// the widths at which the More button is hidden ("button"); "storage"
+		// logs what storage holds under savedKey, as "saved <user> <views>".
+		steps []string
+		want  []string
+	}
+	asks := func(user string) string { return "views for " + user }
+	// parse writes views as Mira answers them.
+	parse := func(list string) []view {
+		views := []view{}
+		for _, name := range strings.Fields(list) {
+			views = append(views, view{strings.Repeat(strings.TrimSuffix(name, "*"), 32), strings.HasSuffix(name, "*")})
+		}
+		return views
+	}
+	// savedAs is an answer for user kept by an earlier load.
+	savedAs := func(user, views string) string {
+		data, _ := json.Marshal(map[string]any{"user": user, "items": parse(views)})
+		return string(data)
+	}
+	// hidden is what "show" logs when the style hides views in the four
+	// places, and the More button at widths.
+	hidden := func(views, widths string) []string {
+		var lines []string
+		for _, place := range []string{"bar", "more", "drawer", "legacy"} {
+			lines = append(lines, strings.TrimSpace(place+" "+views))
+		}
+		return append(lines, "other", strings.TrimSpace("button "+widths))
+	}
+	nothing := hidden("", "")
+	scenarios := map[string]scenario{
+		"hidden views leave the four places": {user: "u1", views: map[string]string{"u1": "a* b c*"},
+			steps: []string{"show"}, want: slices.Concat([]string{asks("u1")}, hidden("a c", ""))},
+		// The top bar shows 3 views below 1200 pixels, 5 below 1536, 8 from
+		// there, or all of them when only one more would go under More.
+		"more lists hidden views only below 1200 pixels": {user: "u1", views: map[string]string{"u1": "1 2 3 4* 5* 6*"},
+			steps: []string{"show"}, want: slices.Concat([]string{asks("u1")}, hidden("4 5 6", "600 1199"))},
+		"more lists hidden views only from 1200 pixels": {user: "u1", views: map[string]string{"u1": "1 2 3 4 5 6* 7* 8* 9* 0*"},
+			steps: []string{"show"}, want: slices.Concat([]string{asks("u1")}, hidden("6 7 8 9 0", "1200 1535 1536 1920"))},
+		"nine views have no more from 1536 pixels": {user: "u1", views: map[string]string{"u1": "1 2 3 4 5 6 7 8 9*"},
+			steps: []string{"show"}, want: slices.Concat([]string{asks("u1")}, hidden("9", ""))},
+		// jellyfin-web may sign its user in again after the first route.
+		"a user restored after the first route": {views: map[string]string{"u1": "a*"},
+			steps: []string{"tick", "tick", "tick", "tick", "signin u1", "tick", "clock", "show"},
+			want:  slices.Concat([]string{asks("u1"), "clock 5"}, hidden("a", ""))},
+		"a user later than 30 seconds waits for a route": {views: map[string]string{"u1": "a*"},
+			steps: slices.Concat(slices.Repeat([]string{"tick"}, 30), []string{"clock", "tick", "signin u1", "tick", "show", "#/home", "show"}),
+			want:  slices.Concat([]string{"clock 30", "idle", "idle"}, nothing, []string{asks("u1")}, hidden("a", ""))},
+		"the same user is asked once": {user: "u1", views: map[string]string{"u1": "a*"},
+			steps: []string{"#/home", "#/movies?topParentId=" + strings.Repeat("a", 32), "tick", "show"},
+			want:  slices.Concat([]string{asks("u1"), "idle"}, hidden("a", ""))},
+		"another user is asked": {user: "u1", views: map[string]string{"u1": "a* b", "u2": "a b*"},
+			steps: []string{"show", "signin u2", "#/home", "show"},
+			want:  slices.Concat([]string{asks("u1")}, hidden("a", ""), []string{asks("u2")}, hidden("b", ""))},
+		"an answer for the user before is dropped": {user: "u1", views: map[string]string{"u1": "a* b", "u2": "a b*"}, deferred: true,
+			steps: []string{"signin u2", "#/home", "answer u1", "show", "answer u2", "show"},
+			want:  slices.Concat([]string{asks("u1"), asks("u2")}, nothing, hidden("b", ""))},
+		// A title's page still asks for its versions.
+		"a failed answer hides nothing": {user: "u1", views: map[string]string{"u2": "a*"},
+			steps: []string{"show", "#/details?id=" + title, "tick", "show"},
+			want: slices.Concat([]string{asks("u1")}, nothing,
+				[]string{"ask http://mira.test/Mira/Items/" + title + "/Versions", "idle"}, nothing)},
+		// jellyfin-web, whose scripts run after this one, signs its user in
+		// after the script started.
+		"a saved answer hides at once": {stored: savedAs("u1", "a* b"), views: map[string]string{"u1": "a b*"}, deferred: true,
+			steps: []string{"show", "signin u1", "tick", "show", "answer u1", "show", "storage"},
+			want:  slices.Concat(hidden("a", ""), []string{asks("u1")}, hidden("a", ""), hidden("b", ""), []string{"saved u1 a b*"})},
+		"a saved answer for another user is dropped": {stored: savedAs("u2", "a*"), views: map[string]string{"u1": "a b*"}, deferred: true,
+			steps: []string{"show", "signin u1", "tick", "show", "answer u1", "show", "storage"},
+			want:  slices.Concat(hidden("a", ""), []string{asks("u1")}, nothing, hidden("b", ""), []string{"saved u1 a b*"})},
+		// Signing out drops the rules, not the answer kept.
+		"an answer is kept for the next load": {user: "u1", views: map[string]string{"u1": "a* b"},
+			steps: []string{"storage", "signout", "#/home", "show", "storage"},
+			want:  slices.Concat([]string{asks("u1"), "saved u1 a* b"}, nothing, []string{"saved u1 a* b"})},
+		"storage that is off changes nothing else": {storage: "off", user: "u1", views: map[string]string{"u1": "a*"},
+			steps: []string{"show", "#/details?id=" + title, "tick", "show", "storage"},
+			want: slices.Concat([]string{asks("u1")}, hidden("a", ""),
+				[]string{"ask http://mira.test/Mira/Items/" + title + "/Versions", "idle"}, hidden("a", ""), []string{"saved nothing"})},
+		"full storage keeps the answer before": {storage: "full", stored: savedAs("u1", "a*"), user: "u1", views: map[string]string{"u1": "b*"},
+			steps: []string{"show", "storage"},
+			want:  slices.Concat([]string{asks("u1")}, hidden("b", ""), []string{"saved u1 a*"})},
+		"a bad saved answer counts as none": {stored: `{"user":"u1",`, views: map[string]string{"u1": "a*"}, deferred: true,
+			steps: []string{"show", "signin u1", "tick", "answer u1", "show", "storage"},
+			want:  slices.Concat(nothing, []string{asks("u1")}, hidden("a", ""), []string{"saved u1 a*"})},
+		"a saved answer for no user counts as none": {stored: savedAs("", "a*"), views: map[string]string{"u1": "a*"}, deferred: true,
+			steps: []string{"show", "signin u1", "tick", "answer u1", "show"},
+			want:  slices.Concat(nothing, []string{asks("u1")}, hidden("a", ""))},
+	}
+
+	const harness = scriptRunner + `
+const { script, key, scenarios } = JSON.parse(require('node:fs').readFileSync(0, 'utf8'))
+const flush = () => new Promise((resolve) => setImmediate(resolve))
+const short = (id) => (id === id[0].repeat(32) ? id[0] : id)
+// The widths the style is tried at: around MUI's lg (1200) and xl (1536).
+const WIDTHS = [600, 1199, 1200, 1535, 1536, 1920]
+// The rules of a style that hide what they select, each with its media
+// query, or '' for none.
+function hiding(text) {
+  const found = []
+  let i = 0
+  // until reads up to one of stop, outside quotes.
+  const until = (stop) => {
+    const start = i
+    for (let quote = null; i < text.length; i++) {
+      const c = text[i]
+      if (quote) { if (c === '\\') i++; else if (c === quote) quote = null }
+      else if (c === '"' || c === "'") quote = c
+      else if (stop.includes(c)) break
+    }
+    return text.slice(start, i)
+  }
+  const block = (media) => {
+    while (i < text.length) {
+      const head = until('{}').trim()
+      if (i >= text.length) throw new Error('unclosed ' + head)
+      if (text[i++] === '}') return
+      if (head.startsWith('@media')) { block(head.slice(6).trim()); continue }
+      const body = until('}')
+      i++
+      if (/display\s*:\s*none/.test(body)) found.push({ media, selectors: list(head) })
+    }
+  }
+  block('')
+  return found
+}
+// list splits a selector list at its commas, outside quotes and brackets.
+function list(text) {
+  const selectors = []
+  let start = 0, depth = 0, quote = null
+  for (let i = 0; i < text.length; i++) {
+    const c = text[i]
+    if (quote) { if (c === '\\') i++; else if (c === quote) quote = null }
+    else if (c === '"' || c === "'") quote = c
+    else if (c === '[' || c === '(') depth++
+    else if (c === ']' || c === ')') depth--
+    else if (c === ',' && !depth) { selectors.push(text.slice(start, i).trim()); start = i + 1 }
+  }
+  return selectors.concat(text.slice(start).trim())
+}
+// compound reads a tag, ids, classes and attribute tests; null for anything else.
+function compound(text) {
+  const m = /^([a-z]*)((?:[.#][\w-]+|\[[\w-]+(?:[*^$]?=(?:"(?:[^"\\]|\\.)*"|[\w-]+))?\])*)$/i.exec(text)
+  if (!m) return null
+  const parts = { tag: m[1].toLowerCase(), ids: [], classes: [], attributes: [] }
+  for (const part of m[2].match(/[.#][\w-]+|\[[\w-]+(?:[*^$]?=(?:"(?:[^"\\]|\\.)*"|[\w-]+))?\]/g) || []) {
+    if (part[0] === '.') parts.classes.push(part.slice(1))
+    else if (part[0] === '#') parts.ids.push(part.slice(1))
+    else {
+      const [, name, op, value] = /^\[([\w-]+)(?:([*^$]?=)(.*))?\]$/.exec(part)
+      parts.attributes.push({ name, op, value: value && value[0] === '"' ? JSON.parse(value) : value })
+    }
+  }
+  return parts
+}
+function fits(parts, element) {
+  const value = (name) => (element.attributes || {})[name]
+  return (!parts.tag || parts.tag === element.tag) &&
+    parts.ids.every((id) => element.id === id) &&
+    parts.classes.every((name) => (element.classes || []).includes(name)) &&
+    parts.attributes.every(({ name, op, value: wanted }) => {
+      const v = value(name)
+      if (v === undefined) return false
+      return !op || (op === '=' ? v === wanted : op === '*=' ? v.includes(wanted) : op === '^=' ? v.startsWith(wanted) : v.endsWith(wanted))
+    })
+}
+// matches tells whether a selector of compounds and descendant combinators
+// selects the last element of a chain, from the root down.
+function matches(selector, chain) {
+  const parts = selector.split(/\s+/).map(compound)
+  if (parts.some((part) => !part)) throw new Error('selector not understood: ' + selector)
+  if (!fits(parts[parts.length - 1], chain[chain.length - 1])) return false
+  let at = chain.length - 2
+  for (let k = parts.length - 2; k >= 0; k--) {
+    while (at >= 0 && !fits(parts[k], chain[at])) at--
+    if (at < 0) return false
+    at--
+  }
+  return true
+}
+function atWidth(media, width) {
+  if (!media) return true
+  return media.split(/\s+and\s+/).every((feature) => {
+    const m = /^\((min|max)-width\s*:\s*([\d.]+)px\)$/.exec(feature.trim())
+    if (!m) throw new Error('media query not understood: ' + media)
+    return m[1] === 'min' ? width >= +m[2] : width <= +m[2]
+  })
+}
+// What jellyfin-web 12.2 renders, from the root down to a library's link:
+// its top bar's buttons, its More menu, the side menu of that layout, and
+// the legacy layout's side menu.
+const appBar = { tag: 'header', classes: ['MuiPaper-root', 'MuiAppBar-root', 'MuiAppBar-positionFixed'] }
+const toolbar = { tag: 'div', classes: ['MuiToolbar-root'] }
+const route = (id) => '#/movies?topParentId=' + id + '&collectionType=movies'
+const button = ['MuiButtonBase-root', 'MuiButton-root', 'MuiButton-text']
+const places = {
+  bar: (id) => [appBar, toolbar, { tag: 'div', classes: ['MuiStack-root'] }, { tag: 'a', classes: button, attributes: { href: route(id) } }],
+  more: (id) => [{ tag: 'div', id: 'user-view-overflow-menu', classes: ['MuiPopover-root', 'MuiMenu-root'] }, { tag: 'ul', classes: ['MuiList-root', 'MuiMenu-list'] },
+    { tag: 'a', classes: ['MuiButtonBase-root', 'MuiMenuItem-root'], attributes: { href: route(id) } }],
+  drawer: (id) => [{ tag: 'div', classes: ['MuiDrawer-root', 'MuiDrawer-docked'] }, { tag: 'ul', classes: ['MuiList-root'] }, { tag: 'li', classes: ['MuiListItem-root'] },
+    { tag: 'a', classes: ['MuiButtonBase-root', 'MuiListItemButton-root'], attributes: { href: route(id) } }],
+  legacy: (id) => [{ tag: 'div', classes: ['mainDrawer'] }, { tag: 'div', classes: ['libraryMenuOptions'] },
+    { tag: 'a', classes: ['lnkMediaFolder', 'navMenuOption'], attributes: { is: 'emby-linkbutton', 'data-itemid': id, href: route(id) } }],
+}
+// Other links to a library, which stay: its home row's title, and the
+// search button of its page, in the top bar.
+const others = (id) => [
+  [{ tag: 'div', classes: ['homeSectionsContainer'] }, { tag: 'div', classes: ['verticalSection'] },
+    { tag: 'a', classes: ['more', 'button-flat', 'sectionTitleTextButton'], attributes: { href: route(id) + '&tab=1' } }],
+  [appBar, toolbar, { tag: 'a', classes: ['MuiButtonBase-root', 'MuiIconButton-root'], attributes: { href: '#/search?parentId=' + id + '&collectionType=movies' } }],
+]
+const more = [appBar, toolbar, { tag: 'div', classes: ['MuiStack-root'] },
+  { tag: 'button', classes: button, attributes: { type: 'button', 'aria-controls': 'user-view-overflow-menu', 'aria-haspopup': 'true' } }]
+async function run(scenario) {
+  const log = []
+  let now = 0
+  let user = scenario.user
+  const timers = []
+  const listeners = {}
+  const sheets = []
+  const ids = [...new Set(Object.values(scenario.views).flat().map((view) => view.Id))]
+  const location = { href: 'http://mira.test/web/', hash: '', replace: (url) => log.push('replace ' + url) }
+  const go = (hash) => { location.hash = hash; location.href = 'http://mira.test/web/' + hash }
+  const history = { pushState: (state, title, url) => go(url), replaceState: (state, title, url) => go(url) }
+  class MutationObserver { observe() {} disconnect() {} }
+  const document = {
+    head: { appendChild: (element) => sheets.push(element) },
+    createElement: (tag) => (tag === 'style' ? { textContent: '' } : null),
+    getElementById: () => null,
+    querySelector: () => null,
+  }
+  // The browser's storage, which may be off or full.
+  const store = {}
+  if (scenario.stored) store[key] = scenario.stored
+  const localStorage = {
+    getItem: (name) => (name in store ? store[name] : null),
+    setItem: (name, value) => {
+      if (scenario.storage === 'full') throw new Error('QuotaExceededError')
+      store[name] = String(value)
+    },
+  }
+  const window = {
+    ApiClient: null,
+    get localStorage() {
+      if (scenario.storage === 'off') throw new Error('SecurityError')
+      return localStorage
+    },
+  }
+  function stored() {
+    if (!(key in store)) return log.push('saved nothing')
+    let saved
+    try {
+      saved = JSON.parse(store[key])
+    } catch (error) {
+      return log.push('saved ' + store[key])
+    }
+    log.push(['saved', saved.user, ...saved.items.map((view) => short(view.Id) + (view.HideInMenus ? '*' : ''))].join(' '))
+  }
+  const answers = {}
+  const ApiClient = {
+    getUrl: (path) => 'http://mira.test/' + path,
+    getCurrentUserId: () => user || undefined,
+    getJSON: (url) => {
+      if (url !== 'http://mira.test/Mira/UserViews') {
+        log.push('ask ' + url)
+        return Promise.reject(new Error('down'))
+      }
+      // Asked with the credentials of the user signed in then.
+      const views = scenario.views[user]
+      log.push('views for ' + user)
+      const answer = () => (views ? Promise.resolve({ Items: views.map((view) => ({ ...view })) }) : Promise.reject(new Error('down')))
+      if (!scenario.deferred) return answer()
+      return new Promise((resolve, reject) => (answers[user] ||= []).push(() => answer().then(resolve, reject)))
+    },
+  }
+  window.ApiClient = ApiClient
+  function show() {
+    const rules = hiding(sheets.map((sheet) => sheet.textContent).join(''))
+    const hides = (chain, width) => rules.some((rule) => atWidth(rule.media, width) && rule.selectors.some((selector) => matches(selector, chain)))
+    for (const [name, place] of Object.entries(places)) {
+      const shown = ids.flatMap((id) => {
+        const at = WIDTHS.filter((width) => hides(place(id), width)).length
+        return at === WIDTHS.length ? [short(id)] : at ? [short(id) + ' at some widths'] : []
+      })
+      log.push([name, ...shown].join(' '))
+    }
+    log.push(['other', ...ids.filter((id) => others(id).some((chain) => WIDTHS.some((width) => hides(chain, width)))).map(short)].join(' '))
+    log.push(['button', ...WIDTHS.filter((width) => hides(more, width))].join(' '))
+  }
+  runScript(script, {
+    location, history, URL, document, MutationObserver, window,
+    Date: { now: () => now },
+    setTimeout: (run, delay) => timers.push({ run, at: now + delay }),
+    clearTimeout: (id) => { if (id) timers[id - 1] = null },
+    addEventListener: (type, listener) => { (listeners[type] ||= []).push(listener) },
+  })
+  await flush()
+  for (const step of scenario.steps) {
+    if (step === 'show') show()
+    else if (step === 'storage') stored()
+    else if (step === 'clock') log.push('clock ' + now / 1000)
+    else if (step.startsWith('signin ')) user = step.slice(7)
+    else if (step === 'signout') user = ''
+    else if (step.startsWith('answer ')) {
+      const give = (answers[step.slice(7)] || []).shift()
+      if (give) give()
+      else log.push('no answer')
+    } else if (step !== 'tick') history.pushState(null, '', step)
+    else {
+      let next = -1
+      timers.forEach((timer, i) => { if (timer && (next < 0 || timer.at < timers[next].at)) next = i })
+      if (next < 0) log.push('idle')
+      else {
+        const timer = timers[next]
+        timers[next] = null
+        now = timer.at
+        timer.run()
+      }
+    }
+    await flush()
+  }
+  return log
+}
+;(async () => {
+  const results = {}
+  for (const [name, scenario] of Object.entries(scenarios)) {
+    try {
+      results[name] = await run(scenario)
+    } catch (error) {
+      results[name] = ['harness: ' + error.stack]
+    }
+  }
+  process.stdout.write(JSON.stringify(results))
+})()
+`
+	type input struct {
+		User     string            `json:"user"`
+		Views    map[string][]view `json:"views"`
+		Deferred bool              `json:"deferred"`
+		Stored   string            `json:"stored,omitempty"`
+		Storage  string            `json:"storage,omitempty"`
+		Steps    []string          `json:"steps"`
+	}
+	inputs := map[string]input{}
+	for name, s := range scenarios {
+		views := map[string][]view{}
+		for user, list := range s.views {
+			views[user] = parse(list)
+		}
+		inputs[name] = input{s.user, views, s.deferred, s.stored, s.storage, s.steps}
+	}
+	data, _ := json.Marshal(map[string]any{"script": string(webScriptBody), "key": savedKey, "scenarios": inputs})
+	command := exec.CommandContext(t.Context(), node, "-e", harness)
+	command.Stdin = strings.NewReader(string(data))
+	output, err := command.Output()
+	if err != nil {
+		t.Fatalf("node: %v", err)
+	}
+	var results map[string][]string
+	if err := json.Unmarshal(output, &results); err != nil {
+		t.Fatalf("node printed %q: %v", output, err)
+	}
+	for name, s := range scenarios {
+		if got := results[name]; !slices.Equal(got, s.want) {
+			t.Errorf("%s:\n got  %q\n want %q", name, got, s.want)
+		}
+	}
+}
+
+// A member, a user signed in who is not an administrator, gets a "Mira"
+// entry where jellyfin-web 12.2 shows administrators Dashboard: the default
+// layout's user menu, between dividers before Quick Connect; the settings
+// page, before its user section; the legacy layouts' side menu, first in
+// its user section.
+// It is a plain link to the admin app, never jellyfin-web's emby-linkbutton,
+// named "Mira". An administrator, or no user, gets none. It comes back
+// as jellyfin-web draws its menus anew, and goes when the user signs out or
+// another signs in. The last member is kept in the browser's storage, so
+// that the entry shows before jellyfin-web's client answers. It runs in
+// Node.js, in a context that stands for the browser, with a small document
+// whose menus the harness draws as jellyfin-web does.
+func TestMembersGetAMiraEntry(t *testing.T) {
+	t.Parallel()
+	node, err := exec.LookPath("node")
+	if err != nil {
+		t.Skip("Node.js is not installed")
+	}
+	// savedKey is where the script keeps the last member.
+	const savedKey = "miraMember"
+	type scenario struct {
+		// user is signed in as the script loads; empty for none.
+		user string
+		// administrators are the users jellyfin-web's client says are.
+		administrators []string
+		// apps draws the user menu as an app with client settings does.
+		apps bool
+		// deferred holds the client's answer about a user until an
+		// "answer <user>" step gives it.
+		deferred bool
+		// stored is what storage holds under savedKey as the script loads.
+		stored string
+		// steps: "draw" draws the three menus as jellyfin-web does for the
+		// user signed in, none without one; "signin <user>" and "signout"
+		// change the user, then move to the home route as jellyfin-web
+		// does; "show" logs each menu ("drawer", "settings", "menu") with
+		// its items, "Mira" standing for an entry that opens the admin
+		// app, "|" for a divider; "storage" logs what storage holds.
+		steps []string
+		want  []string
+	}
+	const (
+		memberDrawer   = "drawer libraries user: settings signout"
+		adminDrawer    = "drawer libraries admin user: settings signout"
+		memberSettings = "settings preferences user"
+		adminSettings  = "settings preferences admin user"
+		memberMenu     = "menu profile settings | quickconnect signout"
+		adminMenu      = "menu profile settings | dashboard metadata | quickconnect signout"
+	)
+	withEntry := []string{"drawer libraries user: Mira settings signout", "settings preferences Mira user", "menu profile settings | Mira | quickconnect signout"}
+	without := []string{memberDrawer, memberSettings, memberMenu}
+	scenarios := map[string]scenario{
+		"a member gets the entry in each menu": {user: "alice",
+			steps: []string{"draw", "show"}, want: withEntry},
+		"an administrator keeps Dashboard": {user: "root", administrators: []string{"root"},
+			steps: []string{"draw", "show"}, want: []string{adminDrawer, adminSettings, adminMenu}},
+		"no user gets none": {steps: []string{"draw", "signin alice", "show"},
+			want: []string{"drawer", "settings", "menu"}},
+		"an app's user menu has the entry before Quick Connect": {user: "alice", apps: true,
+			steps: []string{"draw", "show"},
+			want:  []string{withEntry[0], withEntry[1], "menu profile settings | clientsettings | Mira | quickconnect signout"}},
+		"menus drawn anew keep the entry": {user: "alice",
+			steps: []string{"draw", "draw", "show"}, want: withEntry},
+		"signing out takes it away": {user: "alice",
+			steps: []string{"draw", "signout", "show"}, want: without},
+		"an administrator signing in takes it away": {user: "alice", administrators: []string{"root"},
+			steps: []string{"draw", "signin root", "show", "draw", "show", "storage"},
+			want:  slices.Concat(without, []string{adminDrawer, adminSettings, adminMenu, "saved nothing"})},
+		"a member signing in after an administrator gets it": {user: "root", administrators: []string{"root"},
+			steps: []string{"draw", "signin alice", "draw", "show", "storage"},
+			want:  slices.Concat(withEntry, []string{"saved alice"})},
+		"the member kept shows it before the client answers": {user: "alice", deferred: true, stored: `{"user":"alice"}`,
+			steps: []string{"draw", "show", "answer alice", "show"}, want: slices.Concat(withEntry, withEntry)},
+		"a member waits for the client's answer": {user: "alice", deferred: true,
+			steps: []string{"draw", "show", "answer alice", "show", "storage"},
+			want:  slices.Concat(without, withEntry, []string{"saved alice"})},
+		"the member kept for another user shows nothing": {user: "bob", deferred: true, stored: `{"user":"alice"}`, administrators: []string{"bob"},
+			steps: []string{"draw", "show", "answer bob", "show", "storage"},
+			want:  []string{adminDrawer, adminSettings, adminMenu, adminDrawer, adminSettings, adminMenu, "saved nothing"}},
+		"the member kept who became an administrator keeps Dashboard": {user: "alice", deferred: true, stored: `{"user":"alice"}`, administrators: []string{"alice"},
+			steps: []string{"draw", "show"}, want: []string{adminDrawer, adminSettings, adminMenu}},
+		"an answer for the user before is dropped": {user: "alice", deferred: true, administrators: []string{"root"},
+			steps: []string{"signin root", "answer alice", "draw", "show"}, want: []string{adminDrawer, adminSettings, adminMenu}},
+	}
+
+	const harness = scriptRunner + `
+const { script, key, dashboardIcon, scenarios } = JSON.parse(require('node:fs').readFileSync(0, 'utf8'))
+const flush = () => new Promise((resolve) => setImmediate(resolve))
+async function run(scenario) {
+  const log = []
+  let user = scenario.user
+  // Observers hear the changes within what they observe once the code that
+  // made them is done.
+  const observers = new Set()
+  let queued = false
+  const changed = () => {
+    if (queued || !observers.size) return
+    queued = true
+    queueMicrotask(() => { queued = false; for (const observer of observers) observer.callback([]) })
+  }
+  class MutationObserver {
+    constructor(callback) { this.callback = callback }
+    observe(target, options) { if (!options.subtree) return; observers.add(this) }
+    disconnect() { observers.delete(this) }
+  }
+  // A small document: elements with attributes, classes, children and
+  // text, found by tag, identifier, classes, attributes and descendants.
+  class Element {
+    constructor(tag) { this.tagName = tag.toUpperCase(); this.attributes = {}; this.children = []; this.parentNode = null; this.text = '' }
+    getAttribute(name) { return name in this.attributes ? this.attributes[name] : null }
+    hasAttribute(name) { return name in this.attributes }
+    setAttribute(name, value) { this.attributes[name] = String(value); changed() }
+    removeAttribute(name) { delete this.attributes[name]; changed() }
+    get className() { return this.getAttribute('class') || '' }
+    set className(value) { this.setAttribute('class', value) }
+    get id() { return this.getAttribute('id') || '' }
+    get classList() {
+      const names = () => this.className.split(' ').filter(Boolean)
+      return {
+        contains: (name) => names().includes(name),
+        add: (...add) => { this.className = [...new Set(names().concat(add))].join(' ') },
+        remove: (...remove) => { this.className = names().filter((n) => !remove.includes(n)).join(' ') },
+      }
+    }
+    get textContent() { return this.text + this.children.map((child) => child.textContent).join('') }
+    set textContent(value) { this.children = []; this.text = value; changed() }
+    get previousElementSibling() { const siblings = this.parentNode ? this.parentNode.children : []; return siblings[siblings.indexOf(this) - 1] || null }
+    get nextSibling() { const siblings = this.parentNode ? this.parentNode.children : []; return siblings[siblings.indexOf(this) + 1] || null }
+    get nextElementSibling() { return this.nextSibling }
+    insertBefore(child, before) {
+      if (child.parentNode) child.remove()
+      child.parentNode = this
+      this.children.splice(before ? this.children.indexOf(before) : this.children.length, 0, child)
+      changed()
+      return child
+    }
+    appendChild(child) { return this.insertBefore(child, null) }
+    remove() { const parent = this.parentNode; if (!parent) return; parent.children.splice(parent.children.indexOf(this), 1); this.parentNode = null; changed() }
+    cloneNode(deep) {
+      const copy = new Element(this.tagName)
+      copy.attributes = { ...this.attributes }
+      copy.text = this.text
+      copy.name = this.name
+      if (deep) for (const child of this.children) { const c = child.cloneNode(true); c.parentNode = copy; copy.children.push(c) }
+      return copy
+    }
+    fits(compound) {
+      const m = /^([a-z][a-z0-9]*)?((?:[.#][\w-]+|\[[\w-]+="[^"]*"\])*)$/i.exec(compound)
+      if (!m) throw new Error('selector not understood: ' + compound)
+      if (m[1] && m[1].toUpperCase() !== this.tagName) return false
+      return (m[2].match(/[.#][\w-]+|\[[\w-]+="[^"]*"\]/g) || []).every((part) => {
+        if (part[0] === '.') return this.classList.contains(part.slice(1))
+        if (part[0] === '#') return this.id === part.slice(1)
+        const [, name, value] = /^\[([\w-]+)="([^"]*)"\]$/.exec(part)
+        return this.getAttribute(name) === value
+      })
+    }
+    matches(selector) {
+      const parts = selector.trim().split(/\s+/)
+      if (!this.fits(parts[parts.length - 1])) return false
+      let at = this.parentNode
+      for (let k = parts.length - 2; k >= 0; k--) {
+        while (at && !(at.fits && at.fits(parts[k]))) at = at.parentNode
+        if (!at) return false
+        at = at.parentNode
+      }
+      return true
+    }
+    querySelectorAll(selector) {
+      const found = []
+      const walk = (element) => element.children.forEach((child) => { if (child.matches(selector)) found.push(child); walk(child) })
+      walk(this)
+      return found
+    }
+    querySelector(selector) { return this.querySelectorAll(selector)[0] || null }
+    closest(selector) { for (let e = this; e && e.matches; e = e.parentNode) if (e.matches(selector)) return e; return null }
+  }
+  const element = (tag, className, attributes, children, name) => {
+    const e = new Element(tag)
+    e.attributes = { ...(attributes || {}) }
+    if (className) e.attributes.class = className
+    for (const child of children || []) { child.parentNode = e; e.children.push(child) }
+    e.name = name
+    return e
+  }
+  const root = element('html', '')
+  const head = element('head', '')
+  const body = element('body', '')
+  root.appendChild(head)
+  root.appendChild(body)
+  const document = { head, body, createElement: (tag) => new Element(tag), querySelectorAll: (s) => root.querySelectorAll(s), querySelector: (s) => root.querySelector(s) }
+  // The three menus jellyfin-web 12.2 draws, as for user.
+  const link = (href, name) => element('a', 'navMenuOption lnkMediaFolder emby-button', { is: 'emby-linkbutton', href }, [], name)
+  const muiItem = (href, name, icon, text) => element(href ? 'a' : 'li', 'MuiButtonBase-root MuiMenuItem-root', href ? { href, tabindex: '-1', role: 'menuitem' } : { role: 'menuitem' }, [
+    element('div', 'MuiListItemIcon-root', {}, [element('svg', 'MuiSvgIcon-root', { 'data-testid': icon }, [element('path', '', { d: icon + ' path' })])]),
+    element('div', 'MuiListItemText-root', {}, [Object.assign(element('span', 'MuiTypography-root MuiListItemText-primary'), { text })]),
+    element('span', 'MuiTouchRipple-root', {}, [element('span', 'ripple')]),
+  ], name)
+  const divider = () => element('hr', 'MuiDivider-root', {}, [], '|')
+  function draw() {
+    for (const old of body.children.slice()) old.remove()
+    if (!user) return
+    const admin = scenario.administrators.includes(user)
+    body.appendChild(element('div', 'mainDrawer', {}, [element('div', 'scrollContainer', {}, [
+      element('div', 'libraryMenuOptions', {}, [], 'libraries'),
+      ...(admin ? [element('div', 'adminMenuOptions', {}, [element('h3', 'sidebarHeader'), link('#/dashboard'), link('#/metadata')], 'admin')] : []),
+      element('div', 'userMenuOptions', {}, [element('h3', 'sidebarHeader'), link('#', 'settings'), link('#', 'signout')], 'user'),
+    ])], 'drawer'))
+    body.appendChild(element('div', 'page libraryPage', {}, [element('div', 'readOnlyContent', {}, [
+      element('div', 'verticalSection', {}, [], 'preferences'),
+      ...(admin ? [element('div', 'adminSection verticalSection', {}, [element('h2', 'sectionTitle'), element('a', 'emby-button listItem-border', { is: 'emby-linkbutton', href: '#/dashboard' })], 'admin')] : []),
+      element('div', 'userSection verticalSection', {}, [], 'user'),
+    ], 'settings')]))
+    const items = [
+      muiItem('#/userprofile?userId=' + user, 'profile', 'AccountCircleIcon', 'Profile'),
+      muiItem('#/mypreferencesmenu', 'settings', 'SettingsIcon', 'Settings'),
+      ...(scenario.apps ? [divider(), muiItem('', 'clientsettings', 'DevicesIcon', 'Client settings')] : []),
+      ...(admin ? [divider(), muiItem('#/dashboard', 'dashboard', 'DashboardIcon', 'Dashboard'), muiItem('#/metadata', 'metadata', 'EditIcon', 'Metadata')] : []),
+      divider(),
+      muiItem('#/quickconnect', 'quickconnect', 'PhonelinkLockIcon', 'Quick Connect'),
+      muiItem('', 'signout', 'LogoutIcon', 'Sign out'),
+    ]
+    body.appendChild(element('div', 'MuiPopover-root MuiMenu-root', { id: 'app-user-menu' }, [element('div', 'MuiPaper-root', {}, [element('ul', 'MuiList-root MuiMenu-list', {}, items)])]))
+  }
+  // describe names an item, an entry as "Mira" when it is a plain link
+  // to the admin app named so, in the style of the menu's own items.
+  function describe(item) {
+    if (!item.classList.contains('miraEntry')) return item.name
+    if (item.classList.contains('MuiDivider-root')) return '|'
+    const a = item.tagName === 'A' ? item : item.querySelector('a')
+    const problems = []
+    if (!a || a.getAttribute('href') !== 'http://mira.test/admin/?from=web' || a.hasAttribute('is')) problems.push('link')
+    if (item.textContent !== 'Mira') problems.push('text ' + item.textContent)
+    if (item.querySelector('h2') || item.querySelector('h3')) problems.push('heading')
+    if (item.parentNode.tagName === 'UL') {
+      const path = item.querySelector('svg path')
+      if (!item.classList.contains('MuiMenuItem-root') || !path || path.getAttribute('d') !== dashboardIcon || item.querySelector('[data-testid="SettingsIcon"]')) problems.push('item')
+    } else if (!a || !a.querySelector('.material-icons.dashboard') || !a.classList.contains(item.closest('.mainDrawer') ? 'navMenuOption' : 'listItem-border')) problems.push('item')
+    return problems.length ? 'Mira(' + problems.join(', ') + ')' : 'Mira'
+  }
+  function show() {
+    for (const [name, selector] of [['drawer', '.mainDrawer .scrollContainer'], ['settings', '.readOnlyContent'], ['menu', '#app-user-menu ul']]) {
+      const container = root.querySelector(selector)
+      // The side menu's user section is listed after its name, heading left out.
+      const list = (item) => (item.name === 'user' && item.parentNode.classList.contains('scrollContainer') ? ['user:', ...item.children.slice(1).map(describe)] : [describe(item)])
+      log.push([name, ...(container ? container.children.flatMap(list) : [])].join(' '))
+    }
+  }
+  const store = {}
+  if (scenario.stored) store[key] = scenario.stored
+  const localStorage = {
+    getItem: (name) => (name in store ? store[name] : null),
+    setItem: (name, value) => { store[name] = String(value) },
+    removeItem: (name) => { delete store[name] },
+  }
+  const answers = {}
+  const ApiClient = {
+    getUrl: (path) => 'http://mira.test/' + path,
+    getCurrentUserId: () => user || undefined,
+    getJSON: () => Promise.reject(new Error('down')),
+    // Asked as the user signed in then.
+    getCurrentUser: () => {
+      const asked = user
+      if (!asked) return Promise.reject(new Error('no user'))
+      const answer = () => ({ Id: asked, Policy: { IsAdministrator: scenario.administrators.includes(asked) } })
+      if (!scenario.deferred) return Promise.resolve(answer())
+      return new Promise((resolve) => (answers[asked] ||= []).push(() => resolve(answer())))
+    },
+  }
+  const location = { href: 'http://mira.test/web/', hash: '', replace: (url) => log.push('replace ' + url) }
+  const go = (hash) => { location.hash = hash; location.href = 'http://mira.test/web/' + hash }
+  const history = { pushState: (state, title, url) => go(url), replaceState: (state, title, url) => go(url) }
+  runScript(script, {
+    location, history, document, MutationObserver, window: { ApiClient, localStorage },
+    Date, setTimeout: () => 0, clearTimeout: () => {},
+    addEventListener: () => {},
+  })
+  await flush()
+  for (const step of scenario.steps) {
+    if (step === 'show') show()
+    else if (step === 'draw') draw()
+    else if (step === 'storage') log.push(key in store ? 'saved ' + JSON.parse(store[key]).user : 'saved nothing')
+    else if (step.startsWith('answer ')) {
+      const give = (answers[step.slice(7)] || []).shift()
+      if (give) give()
+      else log.push('no answer')
+    } else {
+      user = step === 'signout' ? '' : step.slice(7)
+      history.pushState(null, '', '#/home')
+    }
+    await flush()
+  }
+  return log
+}
+;(async () => {
+  const results = {}
+  for (const [name, scenario] of Object.entries(scenarios)) {
+    try {
+      results[name] = await run(scenario)
+    } catch (error) {
+      results[name] = ['harness: ' + error.stack]
+    }
+  }
+  process.stdout.write(JSON.stringify(results))
+})()
+`
+	type input struct {
+		User           string   `json:"user"`
+		Administrators []string `json:"administrators"`
+		Apps           bool     `json:"apps"`
+		Deferred       bool     `json:"deferred"`
+		Stored         string   `json:"stored,omitempty"`
+		Steps          []string `json:"steps"`
+	}
+	inputs := map[string]input{}
+	for name, s := range scenarios {
+		inputs[name] = input{s.user, append([]string{}, s.administrators...), s.apps, s.deferred, s.stored, s.steps}
+	}
+	data, _ := json.Marshal(map[string]any{
+		"script": string(webScriptBody), "key": savedKey, "scenarios": inputs,
+		// MUI's Dashboard icon, which jellyfin-web 12.2 draws in the user menu.
+		"dashboardIcon": "M3 13h8V3H3zm0 8h8v-6H3zm10 0h8V11h-8zm0-18v6h8V3z",
+	})
+	command := exec.CommandContext(t.Context(), node, "-e", harness)
+	command.Stdin = strings.NewReader(string(data))
+	output, err := command.Output()
+	if err != nil {
+		t.Fatalf("node: %v", err)
+	}
+	var results map[string][]string
+	if err := json.Unmarshal(output, &results); err != nil {
+		t.Fatalf("node printed %q: %v", output, err)
+	}
+	for name, s := range scenarios {
+		if got := results[name]; !slices.Equal(got, s.want) {
+			t.Errorf("%s:\n got  %q\n want %q", name, got, s.want)
+		}
+	}
+}
+
+// On a title's page, the script shows the title's three scores, as
+// /Mira/Items/{id}/Ratings answers them, in the first line of its
+// details, before jellyfin-web's own star and critic rating, which it
+// hides: labelled, with a tooltip, in jellyfin-web's language. It asks
+// again 3 seconds later while MDBList is asked about the title, 10 times
+// at most; an answer without a score, or none, changes nothing; a video
+// playing is never touched; jellyfin-web's renders find the scores again,
+// and leaving the title gives the line back. It runs in Node.js, in a
+// context that stands for the browser: a small document holding the title
+// page and its first line of details, a clock and timers the harness moves
+// on.
+func TestTitlePagesShowTheirThreeScores(t *testing.T) {
+	t.Parallel()
+	node, err := exec.LookPath("node")
+	if err != nil {
+		t.Skip("Node.js is not installed")
+	}
+	const (
+		id    = "0123456789abcdef0123456789abcdef"
+		title = "#/details?id=" + id + "&serverId=fedcba9876543210fedcba9876543210"
+		other = "ffffffffffffffffffffffffffffffff"
+		ask   = "ask ratings"
+		plain = "line year star critic"
+		kept  = `line year scores(IMDb 8.1 "IMDb rating", Critics 97% "Critics’ score", Audience 92% "Audience score") (star) (critic)`
+	)
+	all := map[string]any{"CommunityRating": 8.1, "CriticsScore": 97, "AudienceScore": 92, "Pending": false}
+	type scenario struct {
+		answers []map[string]any
+		forever bool
+		lang    string
+		steps   []string
+		want    []string
+	}
+	scenarios := map[string]scenario{
+		"scores kept": {answers: []map[string]any{all}, steps: []string{title, "show"}, want: []string{ask, kept}},
+		"asked again while MDBList is asked": {
+			answers: []map[string]any{{"Pending": true}, {"CommunityRating": 7, "AudienceScore": 60.4, "Pending": false}},
+			steps:   []string{title, "show", "wait 2999", "show", "wait 1", "show", "wait 10000"},
+			want: []string{ask, plain, plain, ask,
+				`line year scores(IMDb 7.0 "IMDb rating", Audience 60% "Audience score") (star) (critic)`},
+		},
+		"ten asks at most": {
+			answers: []map[string]any{{"Pending": true}}, forever: true, steps: []string{title, "wait 60000", "show"},
+			want: []string{ask, ask, ask, ask, ask, ask, ask, ask, ask, ask, plain},
+		},
+		"no score":  {answers: []map[string]any{{"Pending": false}}, steps: []string{title, "show", "wait 10000"}, want: []string{ask, plain}},
+		"no answer": {steps: []string{title, "show", "wait 10000"}, want: []string{ask, plain}},
+		"rendered anew": {
+			answers: []map[string]any{all}, steps: []string{title, "show", "render", "show"}, want: []string{ask, kept, kept},
+		},
+		"leaving the title": {
+			answers: []map[string]any{all}, steps: []string{title, "show", "#/home", "show"}, want: []string{ask, kept, plain},
+		},
+		"another title": {
+			answers: []map[string]any{all}, steps: []string{title, "show", "#/details?id=" + other, "show"},
+			want: []string{ask, kept, "ask http://mira.test/Mira/Items/" + other + "/Ratings", plain},
+		},
+		"in French": {
+			answers: []map[string]any{all}, lang: "fr-FR", steps: []string{title, "show"},
+			want: []string{ask, "line year scores(IMDb 8.1 \"Note IMDb\", Critiques 97\u00a0% \"Score des critiques\", " +
+				"Public 92\u00a0% \"Score du public\") (star) (critic)"},
+		},
+		"during a video": {
+			answers: []map[string]any{all}, steps: []string{"video", title, "show", "end video", "show"}, want: []string{ask, plain, kept},
+		},
+	}
+	const harness = scriptRunner + `
+const { script, scenarios } = JSON.parse(require('node:fs').readFileSync(0, 'utf8'))
+const flush = () => new Promise((resolve) => setImmediate(resolve))
+const TITLE = '0123456789abcdef0123456789abcdef'
+async function run(scenario) {
+  const log = []
+  let now = 0
+  const timers = []
+  const listeners = {}
+  // Changes reach the observers once the code that made them is done.
+  const observers = new Set()
+  let queued = false
+  const changed = () => {
+    if (queued) return
+    queued = true
+    queueMicrotask(() => {
+      queued = false
+      for (const observer of [...observers]) if (observers.has(observer)) try { observer.callback([]) } catch (error) {}
+    })
+  }
+  class MutationObserver {
+    constructor(callback) { this.callback = callback }
+    observe() { observers.add(this) }
+    disconnect() { observers.delete(this) }
+  }
+  const classes = (element) => element.className.split(' ').filter(Boolean)
+  const matches = (element, selector) => /^(\.[\w-]+)+$/.test(selector) && selector.slice(1).split('.').every((c) => classes(element).includes(c))
+  const all = (root, selector) => root.children.flatMap((child) => (child.children ? [...(matches(child, selector) ? [child] : []), ...all(child, selector)] : []))
+  class Element {
+    constructor(tag, className) { this.tagName = tag; this.className = className || ''; this.children = []; this.parentNode = null; this.title = ''; this.style = {}; this.text = '' }
+    get classList() {
+      return {
+        contains: (c) => classes(this).includes(c),
+        add: (c) => { if (!classes(this).includes(c)) { this.className = [...classes(this), c].join(' '); changed() } },
+        remove: (c) => { this.className = classes(this).filter((x) => x !== c).join(' '); changed() },
+        toggle: () => {},
+      }
+    }
+    set textContent(text) { this.text = text; this.children = []; changed() }
+    get textContent() { return this.text + this.children.map((child) => child.textContent).join('') }
+    appendChild(child) { return this.insertBefore(child, null) }
+    insertBefore(child, before) {
+      if (child.parentNode) child.parentNode.removeChild(child)
+      const at = before ? this.children.indexOf(before) : -1
+      this.children.splice(at < 0 ? this.children.length : at, 0, child)
+      child.parentNode = this
+      changed()
+      return child
+    }
+    removeChild(child) { this.children.splice(this.children.indexOf(child), 1); child.parentNode = null; changed(); return child }
+    querySelector(selector) { return all(this, selector)[0] || null }
+    querySelectorAll(selector) { return all(this, selector) }
+    setAttribute() {}
+    getAttribute() { return null }
+    hasAttribute() { return false }
+    removeAttribute() {}
+    addEventListener() {}
+    closest() { return null }
+  }
+  // The title page and its first line of details, as jellyfin-web renders
+  // it: the year, its star and its critic rating.
+  const body = new Element('body')
+  const page = body.appendChild(new Element('div', 'page itemDetailPage'))
+  const line = page.appendChild(new Element('div', 'itemMiscInfo itemMiscInfo-primary'))
+  const render = () => {
+    for (const child of [...line.children]) line.removeChild(child)
+    for (const name of ['year', 'starRatingContainer', 'mediaInfoCriticRating mediaInfoCriticRatingFresh']) line.appendChild(new Element('div', 'mediaInfoItem ' + name))
+  }
+  render()
+  const sheets = []
+  const document = {
+    body,
+    documentElement: { lang: scenario.lang || 'en-US' },
+    head: { appendChild: (sheet) => sheets.push(sheet) },
+    createElement: (tag) => new Element(tag),
+    createTextNode: (text) => ({ textContent: text, parentNode: null }),
+    getElementById: (id) => sheets.find((sheet) => sheet.id === id) || null,
+    querySelector: (selector) => {
+      if (selector === '.page.itemDetailPage:not(.hide)') return body.querySelector('.page.itemDetailPage')
+      return body.querySelector(selector)
+    },
+    querySelectorAll: (selector) => body.querySelectorAll(selector),
+  }
+  // A score shows its label, its value and its tooltip; jellyfin-web's own
+  // ratings show in brackets where the script's style hides them.
+  function show() {
+    const hidden = line.classList.contains('miraRated') && sheets.some((sheet) => sheet.textContent.includes('.miraRated .starRatingContainer'))
+    const words = line.children.map((child) => {
+      if (classes(child).includes('miraScores')) {
+        return 'scores(' + child.children.map((score) => score.children[0].textContent + ' ' + score.children[1].textContent + ' "' + score.title + '"').join(', ') + ')'
+      }
+      if (classes(child).includes('starRatingContainer')) return hidden ? '(star)' : 'star'
+      if (classes(child).includes('mediaInfoCriticRating')) return hidden ? '(critic)' : 'critic'
+      return 'year'
+    })
+    log.push(['line', ...words].join(' '))
+  }
+  const location = { href: 'http://mira.test/web/', hash: '', replace: (url) => log.push('replace ' + url) }
+  const go = (hash) => { location.hash = hash; location.href = 'http://mira.test/web/' + hash }
+  const history = { pushState: (state, title, url) => go(url), replaceState: (state, title, url) => go(url) }
+  const answers = (scenario.answers || []).slice()
+  const ApiClient = {
+    getUrl: (path) => 'http://mira.test/' + path,
+    getCurrentUserId: () => 'user',
+    getCurrentUser: () => Promise.resolve({ Id: 'user', Policy: { IsAdministrator: true } }),
+    getJSON: (url) => {
+      // The title's versions and the user's views are another part's.
+      if (!url.endsWith('/Ratings')) return Promise.reject(new Error('not asked here'))
+      log.push('ask ' + (url === 'http://mira.test/Mira/Items/' + TITLE + '/Ratings' ? 'ratings' : url))
+      const answer = scenario.forever && answers.length === 1 ? answers[0] : answers.shift()
+      return answer ? Promise.resolve({ ...answer }) : Promise.reject(new Error('down'))
+    },
+  }
+  class CustomEvent { constructor(type, init) { this.type = type; this.detail = init && init.detail } }
+  class Event { constructor(type) { this.type = type } }
+  runScript(script, {
+    location, history, URL, document, CustomEvent, Event, MutationObserver, window: { ApiClient },
+    Date: { now: () => now },
+    setTimeout: (run, delay) => timers.push({ run, at: now + delay }),
+    clearTimeout: (id) => { if (id) timers[id - 1] = null },
+    addEventListener: (type, listener) => { (listeners[type] ||= []).push(listener) },
+  })
+  await flush()
+  let video = null
+  for (const step of scenario.steps) {
+    if (step === 'show') show()
+    else if (step === 'render') render()
+    else if (step === 'video') video = body.appendChild(new Element('div', 'videoPlayerContainer'))
+    else if (step === 'end video') body.removeChild(video)
+    else if (step.startsWith('wait ')) {
+      const until = now + Number(step.slice(5))
+      for (;;) {
+        let next = -1
+        timers.forEach((timer, i) => { if (timer && timer.at <= until && (next < 0 || timer.at < timers[next].at)) next = i })
+        if (next < 0) break
+        const timer = timers[next]
+        timers[next] = null
+        now = timer.at
+        timer.run()
+        await flush()
+      }
+      now = until
+    } else history.pushState(null, '', step)
+    await flush()
+  }
+  return log
+}
+;(async () => {
+  const results = {}
+  for (const [name, scenario] of Object.entries(scenarios)) {
+    try {
+      results[name] = await run(scenario)
+    } catch (error) {
+      results[name] = ['harness: ' + error.stack]
+    }
+  }
+  process.stdout.write(JSON.stringify(results))
+})()
+`
+	type input struct {
+		Answers []map[string]any `json:"answers"`
+		Forever bool             `json:"forever"`
+		Lang    string           `json:"lang,omitempty"`
+		Steps   []string         `json:"steps"`
+	}
+	inputs := map[string]input{}
+	for name, s := range scenarios {
+		inputs[name] = input{s.answers, s.forever, s.lang, s.steps}
+	}
+	data, _ := json.Marshal(map[string]any{"script": string(webScriptBody), "scenarios": inputs})
+	command := exec.CommandContext(t.Context(), node, "-e", harness)
+	command.Stdin = strings.NewReader(string(data))
+	output, err := command.Output()
+	if err != nil {
+		t.Fatalf("node: %v", err)
+	}
+	var results map[string][]string
+	if err := json.Unmarshal(output, &results); err != nil {
+		t.Fatalf("node printed %q: %v", output, err)
+	}
+	for name, s := range scenarios {
+		if got := results[name]; !slices.Equal(got, s.want) {
+			t.Errorf("%s:\n got  %q\n want %q", name, got, s.want)
+		}
+	}
+}
+
+// The item menus jellyfin-web opens from a card's ⋮ button, a right click
+// on a card, a title page's ⋮ button, or the ⋮ of a selection of one card,
+// which a long press makes on a touch screen, get Mira's entries: "Remove
+// from Continue Watching" for a card of a row whose cards all resume,
+// "Remove from Next Up" for an episode's card in Next Up, whose series
+// then leaves Next Up's answers kept, unless played since, "Hide this
+// title" for a title, or a season or an episode of one, "Show this title
+// again" for a hidden one, and "Add to Watchlist" for a movie, an episode
+// or a series, or a season of one, in the page's language (the watchlist's
+// entries are tested on their own below). An entry closes the menu as Back
+// does, then sends its change. It runs in Node.js, in a context that stands
+// for the browser and jellyfin-web.
+func TestItemMenusGetMirasEntries(t *testing.T) {
+	t.Parallel()
+	node, err := exec.LookPath("node")
+	if err != nil {
+		t.Skip("Node.js is not installed")
+	}
+	// The entries added, then what pressing the first did: the menu closes
+	// first, as Back closes it, then the change is sent. Then what the row
+	// draws when it refreshes, as the change's message has it do, from the
+	// answer jellyfin-web kept from before the change: the item taken off
+	// stays off, unless played again since. Then what a row draws from that
+	// same answer once the page loads again, as jellyfin-web keeps its
+	// answers in IndexedDB: a second, for the same user, for another user,
+	// and 2 minutes and a second later, by when the script kept nothing.
+	const page = "0123456789abcdef0123456789abcdef"
+	const untouched = " | reloaded m1,m2 | another user m1,m2 | later m1,m2"
+	scenarios := map[string]string{
+		"a card of Continue Watching":                          "Remove from Continue Watching | Hide this title | Add to Watchlist => back, DELETE Mira/UserItems/m1/Resume, card m1 gone | refreshed m2 | reloaded m2 | another user m1,m2 | later m1,m2",
+		"a card right-clicked":                                 "Remove from Continue Watching | Hide this title | Add to Watchlist => back, DELETE Mira/UserItems/m1/Resume, card m1 gone | refreshed m2 | reloaded m2 | another user m1,m2 | later m1,m2",
+		"a card taken off, then played again":                  "Remove from Continue Watching | Hide this title | Add to Watchlist => back, DELETE Mira/UserItems/m1/Resume, card m1 gone | refreshed m1,m2" + untouched,
+		"a card of a row that does not resume":                 "Hide this title | Add to Watchlist => back, POST Mira/UserItems/m1/Hidden, card m1 gone, toast This title is hidden from your lists. | refreshed m2 | reloaded m2 | another user m1,m2 | later m1,m2",
+		"a hidden title's page, in French":                     "Afficher de nouveau ce titre | Ajouter à «\u202fÀ regarder\u202f» => back, DELETE Mira/UserItems/" + page + "/Hidden, toast Ce titre est de retour dans vos listes. | refreshed m1,m2" + untouched,
+		"a title's page":                                       "Hide this title | Add to Watchlist => back, POST Mira/UserItems/" + page + "/Hidden, toast This title is hidden from your lists. | refreshed m1,m2" + untouched,
+		"an episode of a hidden series":                        "Show this title again | Add to Watchlist => back, DELETE Mira/UserItems/m1/Hidden, toast This title is back in your lists. | refreshed m1,m2" + untouched,
+		"an episode card whose series the user hides":          "Hide this title | Add to Watchlist => back, POST Mira/UserItems/m1/Hidden, card m1 gone, toast This title is hidden from your lists. | refreshed m3 | reloaded m3 | another user m1,m2,m3 | later m1,m2,m3",
+		"a Next Up card of an episode":                         "Remove from Next Up | Hide this title | Add to Watchlist => back, DELETE Mira/UserItems/m1/NextUp, card m1 gone, toast This series is off Next Up until you play one of its episodes or a new one comes out. | refreshed m2 | reloaded m2 | another user m1,m2 | later m1,m2",
+		"a Next Up card of an episode played again":            "Remove from Next Up | Hide this title | Add to Watchlist => back, DELETE Mira/UserItems/m1/NextUp, card m1 gone, toast This series is off Next Up until you play one of its episodes or a new one comes out. | refreshed m1,m2" + untouched,
+		"a card of Continue Watching selected by a long press": "Remove from Continue Watching | Hide this title | Add to Watchlist => back, DELETE Mira/UserItems/m1/Resume, unselected, card m1 gone | refreshed m2 | reloaded m2 | another user m1,m2 | later m1,m2",
+		"two cards selected by a long press":                   "",
+		"a card of Continue Watching on a narrow screen":       "Remove from Continue Watching | Hide this title | Add to Watchlist | left 175px => back, DELETE Mira/UserItems/m1/Resume, card m1 gone | refreshed m2 | reloaded m2 | another user m1,m2 | later m1,m2",
+		"a person's card":                                      "",
+		"another click before the menu":                        "",
+		"a menu too late":                                      "",
+	}
+	const harness = scriptRunner + `
+const { script, scenarios } = JSON.parse(require('node:fs').readFileSync(0, 'utf8'))
+const settle = () => new Promise((resolve) => setImmediate(resolve))
+;(async () => {
+  const results = {}
+  for (const name of scenarios) {
+    let now = 0
+    const listeners = {}
+    const did = []
+    const observers = []
+    class MutationObserver {
+      constructor(callback) { this.callback = callback }
+      observe(target, options) { if (!options.subtree) observers.push(this) }
+      disconnect() {}
+    }
+    const classes = (initial) => {
+      const set = new Set(initial)
+      return { add: (...c) => c.forEach((x) => set.add(x)), contains: (c) => set.has(c), has: set }
+    }
+    // A row of cards, the first the one the menu is for: a div, whose
+    // fetchData jellyfin-web sets once the script runs.
+    // Next Up's section on the home page has its title link to the Next
+    // Up page.
+    const section = { classList: classes(['verticalSection']),
+      querySelector: (s) => (name.includes('Next Up') && s === '.sectionTitleContainer a[href*="type=nextup"]' ? {} : null) }
+    class HTMLDivElement {}
+    const row = Object.assign(Object.create(HTMLDivElement.prototype), { cards: [] })
+    row.closest = (s) => (s === '.verticalSection' ? section : null)
+    row.querySelectorAll = (s) => (s === '.card[data-id]' ? row.cards : [])
+    row.querySelector = (s) => (s === '.card' ? row.cards[0] || null : null)
+    // What the row drew last, as jellyfin-web keeps it, and draws again
+    // when it refreshes within the minute: a Continue Watching row.
+    const kept = { Items: [
+      { Id: 'm1', SeriesId: name.includes('Next Up') ? 's1' : undefined, UserData: { PlaybackPositionTicks: 6000,
+        LastPlayedDate: name.includes('played again') ? '2026-10-03T20:00:00.0000000Z' : name.includes('Next Up') ? undefined : '2026-10-01T20:00:00.0000000Z' } },
+      { Id: 'm2', SeriesId: name.includes('user hides') ? 's1' : undefined, UserData: { PlaybackPositionTicks: 6000 } },
+      { Id: 'm3', UserData: { PlaybackPositionTicks: 6000 } },
+    ].filter((item) => name.includes('user hides') || item.Id !== 'm3') }
+    const card = (id, resumes) => {
+      const c = { id, attributes: { 'data-id': id, 'data-positionticks': resumes ? '6000' : null } }
+      c.getAttribute = (a) => c.attributes[a] || null
+      c.closest = (s) => (s === '.card[data-id]' || s === '.card[data-id], .listItem[data-id]' ? c : s === '.itemsContainer' ? row
+        : s === '.verticalSection' ? section : null)
+      c.remove = () => { row.cards = row.cards.filter((x) => x !== c); did.push('card ' + id + ' gone') }
+      return c
+    }
+    // A person or an episode is listed elsewhere than in Continue Watching.
+    const first = card('m1', !name.includes('person') && !name.includes('episode'))
+    row.cards = [first, card('m2', !name.includes('does not resume'))]
+    const button = { closest: (s) => (s === 'button[data-action="menu"]' ? button : s === '.card[data-id], .listItem[data-id]' ? first : null) }
+    // A long press on a touch screen selects cards: the selection's ⋮ is
+    // pressed with one card, or two, checked.
+    const checked = name.includes('selected') ? [{ closest: (s) => (s === '.card[data-id]' ? first : null) }] : []
+    if (name.includes('two cards')) checked.push({ closest: () => null })
+    const unselect = { click: () => did.push('unselected') }
+    const target = name.includes('selected')
+      ? { closest: (s) => (s === '.btnSelectionPanelOptions' ? {} : null) }
+      : name.includes('page')
+      ? { closest: (s) => (s === '.btnMoreCommands' ? {} : null) }
+      : name.includes('right-clicked') ? { closest: (s) => (s === '.card[data-id]' ? first : null) } : { closest: (s) => (s === 'button[data-action="menu"]' ? button : null) }
+    // What Mira answers. A title page's scores (the ninth feature) are
+    // asked too: they answer none, which changes nothing.
+    const items = {
+      m1: name.includes('person') ? { Type: 'Person' } : name.includes('episode') ? { Type: 'Episode', SeriesId: 's1' } : { Type: 'Movie' },
+    }
+    const hidden = name.includes('hidden') ? [{ Id: name.includes('episode') ? 's1' : 'm1' }] : []
+    const ApiClient = {
+      getCurrentUserId: () => 'u1',
+      serverId: () => 'srv',
+      getUrl: (path) => path,
+      getItem: (user, id) => Promise.resolve(items[id]),
+      getJSON: (url) => Promise.resolve(url.endsWith('/Ratings') ? { Pending: false }
+        : url === 'Mira/UserItems/Hidden' ? { Items: hidden }
+        : url === 'Mira/UserItems/Watchlist' ? { Items: [] }
+        : { Items: name.includes('does not resume') ? [{ Id: 'm1' }] : [{ Id: 'm1' }, { Id: 'm2' }] }),
+      ajax: (request) => {
+        did.push(request.type + ' ' + request.url)
+        return Promise.resolve(request.dataType === 'json' ? { LastPlayedDate: '2026-10-01T20:00:00.0000000Z' } : undefined)
+      },
+    }
+    // The menu jellyfin-web opens: a dialog with its own entries.
+    const entries = []
+    const model = { cloneNode: () => {
+      const text = { textContent: 'Play' }
+      const mark = { className: 'actionsheetMenuItemIcon material-icons play_arrow' }
+      const entry = { text, mark, classList: classes([]), listeners: {}, attributes: {} }
+      entry.setAttribute = (a, v) => { entry.attributes[a] = v }
+      entry.querySelector = (s) => (s === '.actionSheetItemText' ? text : s === '.actionsheetMenuItemIcon' ? mark : null)
+      entry.addEventListener = (type, listener) => { entry.listeners[type] = listener }
+      return entry
+    } }
+    const scroller = { querySelector: (s) => (s === '.actionSheetMenuItem' ? model : null), appendChild: (e) => entries.push(e) }
+    // On a narrow screen, the menu jellyfin-web placed for its own entries
+    // runs past the right edge with Mira's.
+    const narrow = name.includes('narrow')
+    const sheet = { style: { top: '10px', left: narrow ? '202px' : '' }, getAttribute: (a) => (a === 'data-history' ? 'true' : null),
+      querySelector: (s) => (s === '.actionSheetScroller' ? scroller : null),
+      getBoundingClientRect: () => ({ bottom: 100, height: 90, right: narrow ? 420 : 300, width: 218 }) }
+    const container = { isConnected: true, classList: classes(['dialogContainer']), querySelector: (s) => (s === '.actionSheet' || s === '.dialog' ? sheet : null) }
+    const toasts = []
+    const element = () => {
+      const e = { classList: classes([]), appendChild: (child) => { if (child.className === 'toast') toasts.push(child.textContent) }, remove: () => {} }
+      return e
+    }
+    const body = { appendChild: () => {} }
+    const document = {
+      head: { appendChild: () => {} }, body, documentElement: { lang: name.includes('French') ? 'fr' : 'en' },
+      createElement: element,
+      querySelector: (s) => (s === '.selectionCommandsPanel .btnCloseSelectionPanel' && checked.length ? unselect : null),
+      querySelectorAll: (s) => (s === '.card[data-id]' ? row.cards : s === '.itemsContainer' ? [row] : s === '.chkItemSelect:checked' ? checked : []),
+    }
+    const location = { href: 'http://mira.test/web/#/details?id=m1', hash: name.includes('page') ? '#/details?id=0123456789abcdef0123456789abcdef' : '#/home', replace: () => {} }
+    if (name.includes('page')) {
+      items['0123456789abcdef0123456789abcdef'] = items.m1
+      if (hidden.length && hidden[0].Id === 'm1') hidden[0].Id = '0123456789abcdef0123456789abcdef'
+    }
+    const history = { pushState: () => {}, replaceState: () => {}, back: () => did.push('back') }
+    // The session's storage, which outlives a reload.
+    const stored = {}
+    const sessionStorage = {
+      getItem: (key) => (key in stored ? stored[key] : null),
+      setItem: (key, value) => { stored[key] = String(value) },
+      removeItem: (key) => { delete stored[key] },
+    }
+    runScript(script, {
+      location, history, URL, document, MutationObserver, Promise, HTMLDivElement, WeakMap,
+      window: { ApiClient, innerHeight: 800, innerWidth: narrow ? 393 : 1280, sessionStorage, localStorage: { getItem: () => null, setItem: () => {}, removeItem: () => {} } },
+      Date: { now: () => now, parse: Date.parse }, setTimeout: (run) => run(), clearTimeout: () => {},
+      addEventListener: (type, listener) => { (listeners[type] ||= []).push(listener) },
+    })
+    row.fetchData = () => Promise.resolve(kept)
+    const fire = (type, event) => { for (const listener of listeners[type] || []) listener(event) }
+    fire(name.includes('right-clicked') ? 'contextmenu' : 'click', { type: name.includes('right-clicked') ? 'contextmenu' : 'click', target })
+    if (name.includes('another click')) fire('click', { type: 'click', target: { closest: () => null } })
+    if (name.includes('too late')) now += 11000
+    observers.forEach((observer) => observer.callback([{ addedNodes: [container] }]))
+    for (let i = 0; i < 5; i++) await settle()
+    const words = entries.map((e) => e.text.textContent)
+    if (narrow) words.push('left ' + sheet.style.left)
+    if (entries.length) {
+      const event = { stopPropagation: () => {}, preventDefault: () => {} }
+      entries[0].listeners.click(event)
+      for (let i = 0; i < 5; i++) await settle()
+    }
+    const pressed = did.concat(toasts.map((t) => 'toast ' + t)).join(', ')
+    let refreshed = ''
+    if (entries.length) {
+      const answer = await row.fetchData()
+      refreshed = ' | refreshed ' + answer.Items.map((item) => item.Id).join(',')
+      if (kept.Items.length !== (name.includes('user hides') ? 3 : 2)) refreshed += ' (the answer kept changed)'
+      // The page loads again: the script runs anew, with the session's
+      // storage, and a new row draws the answer kept.
+      const reload = async (user, at) => {
+        now = at
+        class Div {}
+        const again = Object.create(Div.prototype)
+        runScript(script, {
+          location: { href: 'http://mira.test/web/#/home', hash: '#/home', replace: () => {} },
+          history: { pushState: () => {}, replaceState: () => {}, back: () => {} }, URL, MutationObserver, Promise, HTMLDivElement: Div, WeakMap,
+          document: { head: { appendChild: () => {} }, body: { appendChild: () => {} }, documentElement: { lang: 'en' }, createElement: element,
+            querySelector: () => null, querySelectorAll: () => [] },
+          window: { ApiClient: Object.assign({}, ApiClient, { getCurrentUserId: () => user }), innerHeight: 800, sessionStorage,
+            localStorage: { getItem: () => null, setItem: () => {}, removeItem: () => {} } },
+          Date: { now: () => now, parse: Date.parse }, setTimeout: () => {}, clearTimeout: () => {}, addEventListener: () => {},
+        })
+        again.closest = row.closest
+        again.fetchData = () => Promise.resolve(kept)
+        return (await again.fetchData()).Items.map((item) => item.Id).join(',')
+      }
+      refreshed += ' | reloaded ' + (await reload('u1', 1000))
+      refreshed += ' | another user ' + (await reload('u2', 1000))
+      refreshed += ' | later ' + (await reload('u1', 121000))
+      if (Object.keys(stored).length) refreshed += ' (still kept: ' + JSON.stringify(stored) + ')'
+    }
+    results[name] = words.join(' | ') + (pressed ? ' => ' + pressed : '') + refreshed
+  }
+  process.stdout.write(JSON.stringify(results))
+})()
+`
+	names := make([]string, 0, len(scenarios))
+	for name := range scenarios {
+		names = append(names, name)
+	}
+	input, _ := json.Marshal(map[string]any{"script": string(webScriptBody), "scenarios": names})
+	command := exec.CommandContext(t.Context(), node, "-e", harness)
+	command.Stdin = strings.NewReader(string(input))
+	output, err := command.Output()
+	if err != nil {
+		t.Fatalf("node: %v", err)
+	}
+	var results map[string]string
+	if err := json.Unmarshal(output, &results); err != nil {
+		t.Fatalf("node printed %q: %v", output, err)
+	}
+	for name, want := range scenarios {
+		if got := results[name]; got != want {
+			t.Errorf("%s:\n got  %q\n want %q", name, got, want)
+		}
+	}
+}
+
+// The item menus get "Add to Watchlist" for a movie, an episode or a
+// series, or a season standing for its series, and "Remove from
+// Watchlist" in its place for a title on the user's watchlist playlist, as
+// one request to /Mira/UserItems/Watchlist per menu tells: a movie or
+// an episode when it is an entry, a series when an entry is an episode of
+// it. Add posts the title to /Mira/UserItems/{id}/Watchlist, Remove
+// deletes it there, a series taking every entry of it, and takes the
+// cards of what went off the rows of the watchlist (Mira's Now
+// available and Still waiting, the watchlist playlist's page), not off
+// the others, nor off another playlist's page; the next menu for the
+// title offers the other entry. For two minutes after either, the rows of
+// the watchlist ask Mira anew, and leave out what Remove took off,
+// until the title is put back. A watchlist the user deleted is made again
+// by Add, and its page known. It runs in Node.js, in a context that stands
+// for the browser and jellyfin-web.
+func TestItemMenusPutTitlesOnTheWatchlist(t *testing.T) {
+	t.Parallel()
+	node, err := exec.LookPath("node")
+	if err != nil {
+		t.Skip("Node.js is not installed")
+	}
+	const (
+		page     = "0123456789abcdef0123456789abcdef"
+		list     = "fedcba9876543210fedcba9876543210"
+		remade   = "00112233445566778899aabbccddeeff"
+		another  = "abababababababababababababababab"
+		hide     = "Hide this title (visibility_off) | "
+		add      = "Add to Watchlist (bookmark_add)"
+		remove   = "Remove from Watchlist (bookmark_remove)"
+		added    = "toast This title is on your Watchlist."
+		removed  = "toast This title is off your Watchlist."
+		home     = "Movies[m1 m2 v1] | Shows[s1 n1 n2 e1 e2] | Others[p1 b1 a1]"
+		others   = " | " + home
+		frAdd    = "Ajouter à «\u202fÀ regarder\u202f»"
+		frRemove = "Retirer de «\u202fÀ regarder\u202f»"
+	)
+	type scenario struct {
+		Hash      string   `json:"hash"`
+		Language  string   `json:"language"`
+		Watchlist []string `json:"watchlist"`
+		Available []string `json:"available"`
+		Page      []string `json:"page"`
+		Deleted   bool     `json:"deleted"`
+		Pending   []string `json:"pending"`
+		Steps     []string `json:"steps"`
+		want      []string
+	}
+	// The home page shows the rows of two libraries, Mira's Now
+	// available (the watchlist's titles, or Available) and Trending (a
+	// catalog), and a row of other kinds. A playlist's page (#/details?id=
+	// it) shows its entries as a list (the watchlist's, or Page) over the
+	// home page, hidden. Each step logs: a menu's entries, with their
+	// icons, and how many times the watchlist was asked as it opened; what
+	// pressing an entry did; the cards of each row; what each row with a
+	// fetchData draws from the answer jellyfin-web kept, and whether it
+	// asked Mira anew.
+	scenarios := map[string]scenario{
+		"a movie": {Watchlist: []string{"e1"},
+			Steps: []string{"menu Movies m1", "press Add to Watchlist", "menu Movies m1", "press Remove from Watchlist", "menu Movies m1"},
+			want: []string{hide + add + ", asked 1", "back, POST Mira/UserItems/m1/Watchlist, " + added, hide + remove + ", asked 1",
+				"back, DELETE Mira/UserItems/m1/Watchlist, " + removed, hide + add + ", asked 1"}},
+		// An episode is on the watchlist itself; its season and its series
+		// as soon as one of their episodes is.
+		"a series one of whose episodes is on the watchlist": {Watchlist: []string{"e1"},
+			Steps: []string{"menu Shows s1", "menu Shows n1", "menu Shows n2", "menu Shows e1", "menu Shows e2", "press Add to Watchlist", "menu Shows e2"},
+			want: []string{hide + remove + ", asked 1", hide + remove + ", asked 1", hide + add + ", asked 1", hide + remove + ", asked 1", hide + add + ", asked 1",
+				"back, POST Mira/UserItems/e2/Watchlist, " + added, hide + remove + ", asked 1"}},
+		"a series put on the watchlist": {
+			Steps: []string{"menu Shows s1", "press Add to Watchlist", "menu Shows e1", "menu Shows e2", "menu Shows n2", "menu Shows s1"},
+			want: []string{hide + add + ", asked 1", "back, POST Mira/UserItems/s1/Watchlist, " + added,
+				hide + remove + ", asked 1", hide + remove + ", asked 1", hide + remove + ", asked 1", hide + remove + ", asked 1"}},
+		// A season puts its own episodes, not the series' others.
+		"a season put on the watchlist": {
+			Steps: []string{"menu Shows n1", "press Add to Watchlist", "menu Shows e1", "menu Shows e2", "menu Shows n2", "menu Shows s1"},
+			want: []string{hide + add + ", asked 1", "back, POST Mira/UserItems/n1/Watchlist, " + added,
+				hide + remove + ", asked 1", hide + add + ", asked 1", hide + add + ", asked 1", hide + remove + ", asked 1"}},
+		// Remove on a season takes its entries off, not the series' others;
+		// an episode of it put back is no longer left out.
+		"a season taken off on the watchlist's page": {Hash: "#/details?id=" + list, Watchlist: []string{"e1", "e2", "m1"}, Available: []string{"s1"},
+			Steps: []string{"menu Shows n1", "press Remove from Watchlist", "rows", "menu Shows s1", "menu Shows e1", "press Add to Watchlist", "rows"},
+			want: []string{hide + remove + ", asked 1",
+				"back, DELETE Mira/UserItems/n1/Watchlist, card e1 off Playlist, " + removed,
+				"Playlist[e2 m1] (asked anew)" + others, hide + remove + ", asked 1", hide + add + ", asked 1",
+				"back, POST Mira/UserItems/e1/Watchlist, " + added, "Playlist[e1 e2 m1] (asked anew)" + others}},
+		// Remove on a series takes every entry of it off the watchlist's
+		// page, and the series off Now available; the movie stays.
+		"a series taken off on the watchlist's page": {Hash: "#/details?id=" + list + "&serverId=srv", Watchlist: []string{"e1", "m1", "e2"}, Available: []string{"s1", "m1"},
+			Steps: []string{"menu Shows s1", "press Remove from Watchlist", "cards", "rows", "menu Shows e1", "menu Shows s1", "later", "rows"},
+			want: []string{hide + remove + ", asked 1",
+				"back, DELETE Mira/UserItems/s1/Watchlist, card e1 off Playlist, card e2 off Playlist, card s1 off Now available, " + removed,
+				"Playlist[m1] | Movies[m1 m2 v1] | Shows[s1 n1 n2 e1 e2] | Now available[m1] | Trending[m1 s1 s3] | Others[p1 b1 a1]",
+				"Playlist[m1] (asked anew)" + others, hide + add + ", asked 1", hide + add + ", asked 1",
+				"Playlist[e1 m1 e2]" + others}},
+		// Remove on an episode takes only that episode off; its series
+		// stays on the watchlist while another episode of it is.
+		"an episode taken off on the watchlist's page": {Hash: "#/details?id=" + list, Watchlist: []string{"e1", "e2"}, Available: []string{"s1"},
+			Steps: []string{"menu Playlist e1", "press Remove from Watchlist", "rows", "menu Shows s1", "menu Shows e1"},
+			want: []string{hide + remove + ", asked 1",
+				"back, DELETE Mira/UserItems/e1/Watchlist, card e1 off Playlist, " + removed,
+				"Playlist[e2] (asked anew)" + others, hide + remove + ", asked 1", hide + add + ", asked 1"}},
+		// Put back within the two minutes, what was taken off is no longer
+		// left out: an episode of a series taken off, a series whose
+		// episodes were.
+		"a series taken off, then an episode of it put back": {Hash: "#/details?id=" + list, Watchlist: []string{"e1", "e2"}, Available: []string{"s1"},
+			Steps: []string{"menu Shows s1", "press Remove from Watchlist", "rows", "menu Shows e1", "press Add to Watchlist", "rows"},
+			want: []string{hide + remove + ", asked 1",
+				"back, DELETE Mira/UserItems/s1/Watchlist, card e1 off Playlist, card e2 off Playlist, card s1 off Now available, " + removed,
+				"Playlist[] (asked anew)" + others, hide + add + ", asked 1", "back, POST Mira/UserItems/e1/Watchlist, " + added,
+				"Playlist[e1 e2] (asked anew)" + others}},
+		"episodes taken off, then their series put back": {Hash: "#/details?id=" + list, Watchlist: []string{"e1", "e2", "m1"},
+			Steps: []string{"menu Playlist e1", "press Remove from Watchlist", "menu Playlist e2", "press Remove from Watchlist", "rows",
+				"menu Shows s1", "press Add to Watchlist", "rows"},
+			want: []string{hide + remove + ", asked 1", "back, DELETE Mira/UserItems/e1/Watchlist, card e1 off Playlist, card e1 off Now available, " + removed,
+				hide + remove + ", asked 1", "back, DELETE Mira/UserItems/e2/Watchlist, card e2 off Playlist, card e2 off Now available, " + removed,
+				"Playlist[m1] (asked anew)" + others, hide + add + ", asked 1", "back, POST Mira/UserItems/s1/Watchlist, " + added,
+				"Playlist[e1 e2 m1] (asked anew)" + others}},
+		// Another playlist's page is not the watchlist's: its cards stay.
+		"another playlist's page": {Hash: "#/details?id=" + another, Watchlist: []string{"m1"}, Page: []string{"m1", "m2"},
+			Steps: []string{"menu Playlist m1", "press Remove from Watchlist", "rows"},
+			want: []string{hide + remove + ", asked 1",
+				"back, DELETE Mira/UserItems/m1/Watchlist, card m1 off Now available, " + removed,
+				"Playlist[m1 m2]" + others}},
+		// The user deleted the watchlist: Add makes it again, under a new
+		// Id, whose page is then the watchlist's.
+		"a deleted watchlist": {Hash: "#/details?id=" + remade, Deleted: true, Page: []string{"m1", "m2"},
+			Steps: []string{"menu Movies m1", "rows", "press Add to Watchlist", "rows", "menu Playlist m1", "press Remove from Watchlist"},
+			want: []string{hide + add + ", asked 1", "Playlist[m1 m2]" + others, "back, POST Mira/UserItems/m1/Watchlist, " + added,
+				"Playlist[m1 m2] (asked anew)" + others, hide + remove + ", asked 1",
+				"back, DELETE Mira/UserItems/m1/Watchlist, card m1 off Playlist, " + removed}},
+		// A series none of whose episodes aired is held pending, by its own
+		// Id: it shows as on the watchlist, and Remove takes it off.
+		"a series added before any episode aired": {Pending: []string{"s3"},
+			Steps: []string{"menu Trending s3", "press Remove from Watchlist", "menu Trending s3", "press Add to Watchlist", "menu Trending s3"},
+			want: []string{hide + remove + ", asked 1", "back, DELETE Mira/UserItems/s3/Watchlist, " + removed,
+				hide + add + ", asked 1", "back, POST Mira/UserItems/s3/Watchlist, " + added, hide + remove + ", asked 1"}},
+		"a title's page": {Hash: "#/details?id=" + page,
+			Steps: []string{"menu details", "press Add to Watchlist", "menu details"},
+			want:  []string{hide + add + ", asked 1", "back, POST Mira/UserItems/" + page + "/Watchlist, " + added, hide + remove + ", asked 1"}},
+		"other kinds": {Watchlist: []string{"m1"},
+			Steps: []string{"menu Movies v1", "menu Others p1", "menu Others b1", "menu Others a1"},
+			want:  []string{"Hide this title (visibility_off), asked 1", "none, asked 1", "none, asked 1", "none, asked 1"}},
+		"in French": {Language: "fr", Watchlist: []string{"m1"},
+			Steps: []string{"menu Movies m1", "press " + frRemove, "menu Movies m2", "press " + frAdd},
+			want: []string{"Masquer ce titre (visibility_off) | " + frRemove + " (bookmark_remove), asked 1",
+				"back, DELETE Mira/UserItems/m1/Watchlist, card m1 off Now available, toast Ce titre n’est plus dans «\u202fÀ regarder\u202f».",
+				"Masquer ce titre (visibility_off) | " + frAdd + " (bookmark_add), asked 1",
+				"back, POST Mira/UserItems/m2/Watchlist, toast Ce titre est dans «\u202fÀ regarder\u202f»."}},
+	}
+	const harness = scriptRunner + `
+const { script, scenarios, page, list, remade } = JSON.parse(require('node:fs').readFileSync(0, 'utf8'))
+const settle = () => new Promise((resolve) => setImmediate(resolve))
+// matches tells whether an element matches a compound selector: a tag,
+// classes, an id and attributes; anything else matches nothing.
+const matches = (element, compound) => {
+  const parsed = /^([a-z]+)?((?:[#.][\w-]+|\[[\w-]+(?:\*?="[^"]*")?\])*)$/i.exec(compound)
+  if (!parsed || (!parsed[1] && !parsed[2])) return false
+  if (parsed[1] && element.tagName !== parsed[1].toUpperCase()) return false
+  return (parsed[2].match(/[#.][\w-]+|\[[^\]]+\]/g) || []).every((part) => {
+    if (part[0] === '.') return element.className.split(' ').includes(part.slice(1))
+    if (part[0] === '#') return element.attributes.id === part.slice(1)
+    const attribute = /^\[([\w-]+)(?:(\*?)="([^"]*)")?\]$/.exec(part)
+    const value = element.getAttribute(attribute[1])
+    if (value === null) return false
+    return attribute[3] === undefined || (attribute[2] ? value.includes(attribute[3]) : value === attribute[3])
+  })
+}
+const matchesComplex = (element, selector) => {
+  const parts = selector.trim().split(/\s+/)
+  if (!matches(element, parts.pop())) return false
+  let at = element.parentNode
+  while (parts.length) {
+    while (at && !matches(at, parts[parts.length - 1])) at = at.parentNode
+    if (!at) return false
+    parts.pop()
+    at = at.parentNode
+  }
+  return true
+}
+;(async () => {
+  const results = {}
+  for (const [name, scenario] of Object.entries(scenarios)) {
+    let now = 0
+    const clock = { now: () => now, parse: Date.parse }
+    const log = []
+    const did = []
+    const listeners = {}
+    const dialogWatchers = []
+    class MutationObserver {
+      constructor(callback) { this.callback = callback }
+      observe(target, options) { if (target === body && options && options.childList && !options.subtree) dialogWatchers.push(this) }
+      disconnect() {}
+    }
+    class HTMLDivElement {}
+    class Element extends HTMLDivElement {
+      constructor(tag, className, attributes) {
+        super()
+        this.tagName = tag.toUpperCase(); this.className = className || ''; this.attributes = Object.assign({}, attributes)
+        this.children = []; this.parentNode = null; this.style = {}; this.text = ''; this.listeners = {}; this.isConnected = true
+      }
+      get classList() {
+        const list = () => this.className.split(' ').filter(Boolean)
+        return {
+          contains: (c) => list().includes(c),
+          add: (...added) => { this.className = [...new Set([...list(), ...added])].join(' ') },
+          remove: (...removed) => { this.className = list().filter((c) => !removed.includes(c)).join(' ') },
+          toggle: (c, on) => { if (on === undefined ? !list().includes(c) : on) this.classList.add(c); else this.classList.remove(c) },
+        }
+      }
+      set textContent(text) { this.text = String(text); this.children = [] }
+      get textContent() { return this.text + this.children.map((child) => child.textContent).join('') }
+      get firstChild() { return this.children[0] || null }
+      appendChild(child) { if (child.parentNode) child.parentNode.removeChild(child); this.children.push(child); child.parentNode = this; return child }
+      removeChild(child) { this.children.splice(this.children.indexOf(child), 1); child.parentNode = null; return child }
+      remove() { if (this.parentNode) this.parentNode.removeChild(this) }
+      setAttribute(name, value) { this.attributes[name] = String(value) }
+      getAttribute(name) { return name in this.attributes ? this.attributes[name] : null }
+      hasAttribute(name) { return name in this.attributes }
+      removeAttribute(name) { delete this.attributes[name] }
+      addEventListener(type, listener) { (this.listeners[type] ||= []).push(listener) }
+      removeEventListener() {}
+      cloneNode() {
+        const copy = new Element(this.tagName, this.className, this.attributes)
+        copy.text = this.text
+        this.children.forEach((child) => copy.appendChild(child.cloneNode()))
+        return copy
+      }
+      matches(selector) { return selector.split(',').some((one) => matchesComplex(this, one)) }
+      closest(selector) { for (let e = this; e; e = e.parentNode) if (e.matches(selector)) return e; return null }
+      querySelectorAll(selector) {
+        const found = []
+        const walk = (e) => e.children.forEach((child) => { if (child.matches(selector)) found.push(child); walk(child) })
+        walk(this)
+        return found
+      }
+      querySelector(selector) { return this.querySelectorAll(selector)[0] || null }
+      getBoundingClientRect() { return { top: 10, bottom: 100, height: 90, left: 0, right: 200, width: 200 } }
+    }
+    const body = new Element('body')
+    const document = {
+      body,
+      documentElement: { lang: scenario.language || 'en', clientWidth: 1280, classList: { contains: () => false }, contains: () => true },
+      head: { appendChild: () => {} },
+      createElement: (tag) => new Element(tag),
+      createTextNode: (text) => ({ textContent: text }),
+      getElementById: () => null,
+      querySelector: (selector) => body.querySelector(selector),
+      querySelectorAll: (selector) => body.querySelectorAll(selector),
+    }
+    const location = { href: 'http://mira.test/web/' + (scenario.hash || '#/home'), hash: scenario.hash || '#/home', replace: () => {} }
+    const history = { pushState: () => {}, replaceState: () => {}, back: () => did.push('back') }
+    // What Mira knows: the titles, and the user's watchlist playlist,
+    // whose entries are movies and episodes: a series or a season puts
+    // its episodes, a series takes all its entries off. Its Id is given
+    // as a GUID, empty while the user has none; one is made by an add.
+    const items = { m1: { Type: 'Movie' }, m2: { Type: 'Movie' }, s1: { Type: 'Series' }, n1: { Type: 'Season', SeriesId: 's1' },
+      n2: { Type: 'Season', SeriesId: 's1' }, e1: { Type: 'Episode', SeriesId: 's1', SeasonId: 'n1' }, e2: { Type: 'Episode', SeriesId: 's1', SeasonId: 'n2' },
+      s3: { Type: 'Series' }, v1: { Type: 'Video' }, p1: { Type: 'Person' }, b1: { Type: 'BoxSet' }, a1: { Type: 'MusicAlbum' } }
+    items[page] = { Type: 'Movie' }
+    const episodes = { s1: ['e1', 'e2'], n1: ['e1'], n2: ['e2'], s3: [] }
+    const guid = (id) => id.replace(/^(.{8})(.{4})(.{4})(.{4})/, '$1-$2-$3-$4-').toUpperCase()
+    let playlist = scenario.deleted ? '' : guid(list)
+    let entries = [...(scenario.watchlist || [])]
+    // The titles Mira holds pending: a series none of whose episodes
+    // aired.
+    let pending = [...(scenario.pending || [])]
+    let asked = 0
+    const ApiClient = {
+      getCurrentUserId: () => 'u1',
+      getCurrentUser: () => Promise.resolve({ Id: 'u1', Policy: {} }),
+      serverId: () => 'srv',
+      getUrl: (path) => path,
+      getItem: (user, id) => Promise.resolve(Object.assign({ Id: id }, items[id])),
+      getDisplayPreferences: () => Promise.resolve({ CustomPrefs: {} }),
+      getJSON: (url) => {
+        if (url !== 'Mira/UserItems/Watchlist') return Promise.resolve(url.endsWith('/Ratings') ? { Pending: false } : { Items: [] })
+        asked++
+        return Promise.resolve({ PlaylistId: playlist, Items: entries.map((id) => Object.assign({ Id: id, AddedAt: '2026-11-01T20:00:00.0000000Z' },
+          items[id].SeriesId ? { SeriesId: items[id].SeriesId, SeasonId: items[id].SeasonId } : {}))
+          .concat(pending.map((id) => ({ Id: id, Pending: true, AddedAt: '2026-11-01T20:00:00.0000000Z' }))) })
+      },
+      ajax: (request) => {
+        did.push(request.type + ' ' + request.url)
+        const change = /^Mira\/UserItems\/(\w+)\/Watchlist$/.exec(request.url)
+        if (change) {
+          const id = change[1]
+          const its = episodes[id] || [id]
+          if (request.type === 'POST' && its.length === 0 && !pending.includes(id)) pending.push(id)
+          if (request.type === 'POST' && its.length > 0) {
+            if (!playlist) playlist = guid(remade)
+            entries = its.filter((one) => !entries.includes(one)).concat(entries)
+          }
+          if (request.type === 'DELETE') {
+            pending = pending.filter((one) => one !== id)
+            entries = entries.filter((one) => !(its.includes(one) || (items[id].Type === 'Series' && items[one].SeriesId === id)))
+          }
+        }
+        return Promise.resolve(undefined)
+      },
+    }
+    const stored = {}
+    const sessionStorage = {
+      getItem: (key) => (key in stored ? stored[key] : null),
+      setItem: (key, value) => { stored[key] = String(value) },
+      removeItem: (key) => { delete stored[key] },
+    }
+    runScript(script, {
+      location, history, URL, URLSearchParams, document, MutationObserver, Promise, HTMLDivElement, WeakMap,
+      window: { ApiClient, innerHeight: 800, innerWidth: 1280, sessionStorage, localStorage: { getItem: () => null, setItem: () => {}, removeItem: () => {} } },
+      Date: clock, setTimeout: () => 0, clearTimeout: () => {},
+      addEventListener: (type, listener) => { (listeners[type] ||= []).push(listener) },
+    })
+    // The rows, drawn once the script runs, as jellyfin-web sets their
+    // fetchData then: each draws again from the answer it kept, unless
+    // asked as if that answer were older than a minute.
+    const card = (id, list) => {
+      const made = new Element('div', list ? 'listItem' : 'card', { 'data-id': id })
+      made.appendChild(new Element('button', 'cardOverlayButton', { 'data-action': 'menu' }))
+      made.remove = () => {
+        did.push('card ' + id + ' off ' + made.closest('.itemsContainer').getAttribute('data-name'))
+        Element.prototype.remove.call(made)
+      }
+      return made
+    }
+    const itemsOf = (rowName, ids, fetched, list) => {
+      const container = new Element('div', 'itemsContainer', { 'data-name': rowName })
+      ids.forEach((id) => container.appendChild(card(id, list)))
+      if (fetched) {
+        const kept = { Items: ids.map((id) => ({ Id: id, SeriesId: items[id].SeriesId, SeasonId: items[id].SeasonId })) }
+        container.fetchData = function () {
+          this.anew = clock.now() - now > 60000
+          return Promise.resolve(JSON.parse(JSON.stringify(kept)))
+        }
+      }
+      return container
+    }
+    const section = (rowName, href, ids, kind) => {
+      const made = new Element('div', 'verticalSection' + (kind ? ' miraHomeRow' : ''), kind ? { 'data-mira-kind': kind } : {})
+      made.appendChild(new Element('div', 'sectionTitleContainer')).appendChild(new Element('a', 'sectionTitleTextButton', { href }))
+      made.appendChild(itemsOf(rowName, ids, !kind))
+      return made
+    }
+    const titles = scenario.watchlist || []
+    // A playlist's page lists its entries, as jellyfin-web draws them.
+    if (scenario.hash && scenario.hash !== '#/details?id=' + page) {
+      body.appendChild(new Element('div', 'page itemDetailPage')).appendChild(itemsOf('Playlist', scenario.page || titles, true, true))
+    }
+    const home = body.appendChild(new Element('div', 'page homePage' + (scenario.hash ? ' hide' : '')))
+    home.appendChild(section('Movies', '#/movies?topParentId=f1f1f1f1f1f1f1f1f1f1f1f1f1f1f1f1&collectionType=movies&tab=1', ['m1', 'm2', 'v1']))
+    home.appendChild(section('Shows', '#/tv?topParentId=f2f2f2f2f2f2f2f2f2f2f2f2f2f2f2f2&collectionType=tvshows&tab=1', ['s1', 'n1', 'n2', 'e1', 'e2']))
+    home.appendChild(section('Now available', '#/list?parentId=r6&serverId=srv', scenario.available || titles, 'NowAvailable'))
+    home.appendChild(section('Trending', '#/list?parentId=r1&serverId=srv', ['m1', 's1', 's3'], 'Catalog'))
+    home.appendChild(section('Others', '#/list?parentId=f3f3f3f3f3f3f3f3f3f3f3f3f3f3f3f3&serverId=srv', ['p1', 'b1', 'a1']))
+    const fire = (type, event) => { for (const listener of listeners[type] || []) listener(event) }
+    let menu = []
+    for (const step of scenario.steps) {
+      if (step.startsWith('menu ')) {
+        // The ⋮ of a card of a row, or of the title's page; then the menu
+        // jellyfin-web opens.
+        const [rowName, id] = [step.slice(5, step.lastIndexOf(' ')), step.slice(step.lastIndexOf(' ') + 1)]
+        const target = step === 'menu details' ? new Element('button', 'btnMoreCommands')
+          : body.querySelectorAll('.itemsContainer').find((row) => row.getAttribute('data-name') === rowName)
+            .querySelectorAll('.card, .listItem').find((c) => c.getAttribute('data-id') === id).querySelector('button')
+        const before = asked
+        fire('click', { type: 'click', target })
+        const container = new Element('div', 'dialogContainer')
+        const sheet = container.appendChild(new Element('div', 'dialog actionSheet', { 'data-history': 'true' }))
+        sheet.style.top = '10px'
+        const scroller = sheet.appendChild(new Element('div', 'actionSheetScroller'))
+        const model = scroller.appendChild(new Element('button', 'listItem actionSheetMenuItem', { 'data-id': 'play' }))
+        model.appendChild(new Element('span', 'actionsheetMenuItemIcon listItemIcon material-icons play_arrow'))
+        model.appendChild(new Element('div', 'actionSheetItemText')).textContent = 'Play'
+        body.appendChild(container)
+        dialogWatchers.forEach((watcher) => watcher.callback([{ addedNodes: [container] }]))
+        for (let i = 0; i < 5; i++) await settle()
+        container.remove()
+        menu = scroller.querySelectorAll('.miraMenuItem')
+        const words = menu.map((entry) => entry.querySelector('.actionSheetItemText').textContent + ' (' + entry.querySelector('.actionsheetMenuItemIcon').className.split(' ').pop() + ')')
+        log.push((words.join(' | ') || 'none') + ', asked ' + (asked - before))
+      } else if (step.startsWith('press ')) {
+        const entry = menu.find((e) => e.querySelector('.actionSheetItemText').textContent === step.slice(6))
+        if (!entry) { log.push('no ' + step.slice(6)); continue }
+        did.length = 0
+        for (const listener of entry.listeners.click || []) listener({ stopPropagation: () => {}, preventDefault: () => {} })
+        for (let i = 0; i < 5; i++) await settle()
+        const toasts = body.querySelectorAll('.toast').map((toast) => 'toast ' + toast.textContent)
+        body.querySelectorAll('.toastContainer').forEach((holder) => holder.remove())
+        log.push(did.concat(toasts).join(', '))
+      } else if (step === 'cards') {
+        log.push(body.querySelectorAll('.itemsContainer').map((row) => row.getAttribute('data-name') + '[' + row.querySelectorAll('.card, .listItem').map((c) => c.getAttribute('data-id')).join(' ') + ']').join(' | '))
+      } else if (step === 'rows') {
+        const drawn = []
+        for (const row of body.querySelectorAll('.itemsContainer')) {
+          if (!row.fetchData) continue
+          const answer = await row.fetchData()
+          drawn.push(row.getAttribute('data-name') + '[' + answer.Items.map((item) => item.Id).join(' ') + ']' + (row.anew ? ' (asked anew)' : ''))
+        }
+        log.push(drawn.join(' | '))
+      } else if (step === 'later') {
+        now += 121000
+      }
+    }
+    results[name] = log
+  }
+  process.stdout.write(JSON.stringify(results))
+})().catch((error) => { process.stdout.write(JSON.stringify({ harness: [String(error.stack)] })) })
+`
+	input, _ := json.Marshal(map[string]any{"script": string(webScriptBody), "scenarios": scenarios, "page": page, "list": list, "remade": remade})
+	command := exec.CommandContext(t.Context(), node, "-e", harness)
+	command.Stdin = strings.NewReader(string(input))
+	output, err := command.Output()
+	if err != nil {
+		t.Fatalf("node: %v", err)
+	}
+	var results map[string][]string
+	if err := json.Unmarshal(output, &results); err != nil {
+		t.Fatalf("node printed %q: %v", output, err)
+	}
+	if failed, ok := results["harness"]; ok {
+		t.Fatalf("harness: %v", failed)
+	}
+	for name, s := range scenarios {
+		if got := results[name]; !slices.Equal(got, s.want) {
+			t.Errorf("%s:\n got  %q\n want %q", name, got, s.want)
+		}
+	}
+}
+
+// The home page gets the rows of Settings › Web player › Home rows, as
+// /Mira/HomeRows answers them: each at its place among the user's home
+// sections, drawn as jellyfin-web draws a library's row, its name opening
+// its list and each card its title's page, with its played mark, count or
+// progress. They are asked again each time the home page shows, put back
+// from the answer when jellyfin-web draws the page anew, and nothing
+// changes elsewhere or without an answer. It runs in Node.js, in a context
+// that stands for the browser and jellyfin-web.
+func TestTheHomePageGetsTheServersRows(t *testing.T) {
+	t.Parallel()
+	node, err := exec.LookPath("node")
+	if err != nil {
+		t.Skip("Node.js is not installed")
+	}
+	type row = map[string]any
+	item := func(id, name string, data row, image bool) row {
+		item := row{"Id": id, "Name": name, "Type": "Movie", "ProductionYear": 2020, "UserData": data, "ImageTags": row{}}
+		if image {
+			item["ImageTags"] = row{"Primary": "tag" + id}
+		}
+		return item
+	}
+	episodeOf := func(id, name, series, season string) row {
+		episode := item(id, name, row{}, true)
+		episode["Type"] = "Episode"
+		episode["SeriesId"] = series
+		episode["SeasonId"] = season
+		return episode
+	}
+	trending := row{"Id": "r1", "Name": "Trending", "Place": "Top", "Items": []row{
+		item("a1", "Alpha", row{"Played": true}, true),
+		item("b2", "Bravo", row{"PlayedPercentage": 40.5}, true),
+	}}
+	picks := row{"Id": "r2", "Name": "Picks", "Place": "AfterResume", "Items": []row{item("c3", "Charlie", row{}, false)}}
+	because := row{"Id": "r3", "Name": "Because you watched Alpha", "Place": "AfterNextUp", "Items": []row{
+		{"Id": "s4", "Name": "Delta", "Type": "Series", "UserData": row{"UnplayedItemCount": 3}, "ImageTags": row{"Primary": "t"}},
+	}}
+	fresh := row{"Id": "r4", "Name": "New", "Place": "Bottom", "Items": []row{item("e5", "Echo", row{}, true)}}
+	all := []row{trending, picks, because, fresh}
+	const (
+		ask      = "ask rows"
+		sections = "s0 s1 s2 s3 s4 s5 s6 s7 s8 s9"
+	)
+	byDefault := "Trending[Alpha Bravo] s0 s1 Picks[Charlie] s2 s3 s4 s5 Because you watched Alpha[Delta] s6 s7 s8 s9 New[Echo]"
+	type scenario struct {
+		answers     [][]row
+		preferences row
+		tv          bool
+		drops       []row
+		storage     string
+		steps       []string
+		want        []string
+	}
+	scenarios := map[string]scenario{
+		"rows at their places": {answers: [][]row{all}, steps: []string{"home", "wait 100", "show"}, want: []string{ask, byDefault}},
+		"cards as jellyfin-web draws them": {answers: [][]row{all}, steps: []string{"home", "wait 100", "cards"}, want: []string{ask,
+			"Trending → #/list?parentId=r1&serverId=srv: " +
+				"Alpha(#/details?id=a1&serverId=srv, url(\"img a1 Primary 407x272 taga1\"), played) " +
+				"Bravo(#/details?id=b2&serverId=srv, url(\"img b2 Primary 407x272 tagb2\"), progress 40.5%)",
+			"Picks → #/list?parentId=r2&serverId=srv: Charlie(#/details?id=c3&serverId=srv, icon movie)",
+			"Because you watched Alpha → #/list?parentId=r3&serverId=srv: Delta(#/details?id=s4&serverId=srv, url(\"img s4 Primary 407x272 t\"), 3 unplayed)",
+			"New → #/list?parentId=r4&serverId=srv: Echo(#/details?id=e5&serverId=srv, url(\"img e5 Primary 407x272 tage5\"))",
+		}},
+		// Continue Watching first, Next Up left out: its rows take the
+		// place before, after those of Continue Watching.
+		"the user's own sections": {
+			answers: [][]row{all}, preferences: row{"homesection0": "resume", "homesection1": "latestmedia", "homesection2": "none",
+				"homesection3": "none", "homesection4": "none", "homesection5": "none", "homesection6": "none"},
+			steps: []string{"home", "wait 100", "show"},
+			want:  []string{ask, "Trending[Alpha Bravo] s0 Picks[Charlie] Because you watched Alpha[Delta] s1 s2 s3 s4 s5 s6 s7 s8 s9 New[Echo]"},
+		},
+		// The TV layout starts with the library tiles when the user's
+		// sections lack them.
+		"the TV layout": {
+			answers: [][]row{all}, tv: true, preferences: row{"homesection0": "resume", "homesection1": "nextup", "homesection2": "none",
+				"homesection3": "none", "homesection4": "none", "homesection5": "none", "homesection6": "none"},
+			steps: []string{"home", "wait 100", "show"},
+			want:  []string{ask, "Trending[Alpha Bravo] s0 s1 Picks[Charlie] s2 Because you watched Alpha[Delta] s3 s4 s5 s6 s7 s8 s9 New[Echo]"},
+		},
+		"drawn anew": {
+			answers: [][]row{all}, steps: []string{"home", "wait 100", "show", "render", "show"},
+			want: []string{ask, byDefault, byDefault},
+		},
+		// Each time the home page shows, the rows are asked again: a row
+		// the user turned off meanwhile is not drawn.
+		"asked again on each visit": {
+			answers: [][]row{all, {trending, fresh}},
+			steps:   []string{"home", "wait 100", "show", "away", "wait 100", "home", "wait 100", "show"},
+			want:    []string{ask, byDefault, ask, "Trending[Alpha Bravo] s0 s1 s2 s3 s4 s5 s6 s7 s8 s9 New[Echo]"},
+		},
+		"elsewhere": {answers: [][]row{all}, steps: []string{"#/movies", "wait 100", "show"}, want: []string{sections}},
+		"no answer": {steps: []string{"home", "wait 100", "show"}, want: []string{ask, sections}},
+		"no row":    {answers: [][]row{{}}, steps: []string{"home", "wait 100", "show", "render", "wait 100", "show"}, want: []string{ask, sections, sections}},
+		"before sections": {answers: [][]row{all}, steps: []string{"empty", "home", "wait 100", "show", "render", "wait 100", "show"},
+			want: []string{ask, "", byDefault}},
+		// The item menus' Hide this title keeps what it hid in the session
+		// storage: a title hidden, or an episode of a series hidden (its
+		// menu keeps the episode and its series), leaves
+		// the rows, also when they are drawn again from the same answer; a
+		// row left without a title goes. Another viewer's entries, or an
+		// expired one, hide nothing.
+		"titles hidden from the menu": {
+			answers: [][]row{{trending, picks, {"Id": "r5", "Name": "Episodes", "Place": "Bottom", "Items": []row{
+				{"Id": "e6", "Name": "Pilot", "Type": "Episode", "SeriesId": "SER-9", "UserData": row{}, "ImageTags": row{}}}}}},
+			drops: []row{
+				{"kind": "hidden", "id": "a1", "viewer": "srv/other", "until": 1e12},
+				{"kind": "hidden", "id": "c3", "viewer": "srv/user", "until": -1},
+			},
+			steps: []string{"home", "wait 100", "show", "hide b2", "hide e6 ser9", "show", "render", "show"},
+			want: []string{ask, "Trending[Alpha Bravo] s0 s1 Picks[Charlie] s2 s3 s4 s5 s6 s7 s8 s9 Episodes[Pilot]",
+				"Trending[Alpha] s0 s1 Picks[Charlie] s2 s3 s4 s5 s6 s7 s8 s9",
+				"Trending[Alpha] s0 s1 Picks[Charlie] s2 s3 s4 s5 s6 s7 s8 s9"},
+		},
+		"malformed drops": {answers: [][]row{all}, storage: "{not json", steps: []string{"home", "wait 100", "show"}, want: []string{ask, byDefault}},
+		// The item menus' Remove from Watchlist keeps what it took off in
+		// the session storage too: the title leaves the Now available and
+		// Still waiting rows, also when they are drawn again from the same
+		// answer, and stays in the others.
+		"titles taken off the watchlist from the menu": {
+			answers: [][]row{{trending,
+				{"Id": "r6", "Name": "Now available", "Kind": "NowAvailable", "Place": "AfterResume", "Items": []row{item("a1", "Alpha", row{}, true), item("b2", "Bravo", row{}, true)}},
+				{"Id": "r7", "Name": "Still waiting", "Kind": "StillWaiting", "Place": "Bottom", "Items": []row{item("c3", "Charlie", row{}, true)}}}},
+			steps: []string{"home", "wait 100", "show", "unlist b2 c3", "show", "render", "show"},
+			want: []string{ask, "Trending[Alpha Bravo] s0 s1 Now available[Alpha Bravo] s2 s3 s4 s5 s6 s7 s8 s9 Still waiting[Charlie]",
+				"Trending[Alpha Bravo] s0 s1 Now available[Alpha] s2 s3 s4 s5 s6 s7 s8 s9",
+				"Trending[Alpha Bravo] s0 s1 Now available[Alpha] s2 s3 s4 s5 s6 s7 s8 s9"},
+		},
+		// A series or a season taken off takes off the episodes of it the
+		// rows hold, as the watchlist loses every entry of it; an episode
+		// taken off takes only itself, and leaves its series.
+		"a series, a season and an episode taken off the watchlist from the menu": {
+			answers: [][]row{{trending,
+				{"Id": "r6", "Name": "Now available", "Kind": "NowAvailable", "Place": "AfterResume", "Items": []row{
+					item("d4", "Delta", row{}, true), episodeOf("e5", "Echo", "d4", "d5"), item("f6", "Foxtrot", row{}, true), episodeOf("h8", "Hotel", "g7", "g8"),
+					episodeOf("i9", "India", "k1", "j0"), episodeOf("l2", "Lima", "k1", "m3"),
+				}},
+				{"Id": "r7", "Name": "Still waiting", "Kind": "StillWaiting", "Place": "Bottom", "Items": []row{item("g7", "Golf", row{}, true)}}}},
+			steps: []string{"home", "wait 100", "show", "unlist d4* h8 j0^", "render", "show"},
+			want: []string{ask, "Trending[Alpha Bravo] s0 s1 Now available[Delta Echo Foxtrot Hotel India Lima] s2 s3 s4 s5 s6 s7 s8 s9 Still waiting[Golf]",
+				"Trending[Alpha Bravo] s0 s1 Now available[Foxtrot Lima] s2 s3 s4 s5 s6 s7 s8 s9 Still waiting[Golf]"},
+		},
+		// The rows drawn are found by their places, not by the order of the
+		// list: listed in another order than their places', with other
+		// numbers of titles, they are drawn once and stay.
+		"listed out of their places' order": {answers: [][]row{{fresh, trending, because}},
+			steps: []string{"home", "wait 100", "show", "wait 100", "show"},
+			want: []string{ask, "Trending[Alpha Bravo] s0 s1 s2 s3 s4 s5 Because you watched Alpha[Delta] s6 s7 s8 s9 New[Echo]",
+				"Trending[Alpha Bravo] s0 s1 s2 s3 s4 s5 Because you watched Alpha[Delta] s6 s7 s8 s9 New[Echo]"}},
+		// A row of a playlist opens the playlist's page; an episode shows
+		// its series' poster and name, then its season and episode
+		// numbers before its name, as jellyfin-web shows one in a row.
+		"rows of playlists": {answers: [][]row{{
+			{"Id": "r8", "Name": "Mine", "Kind": "Watchlist", "PlaylistId": "p1", "Place": "Top", "Items": []row{
+				item("a1", "Alpha", row{}, true),
+				{"Id": "e6", "Name": "Pilot", "Type": "Episode", "SeriesId": "s9", "SeriesName": "Show", "SeriesPrimaryImageTag": "st",
+					"ParentIndexNumber": 1, "IndexNumber": 2, "UserData": row{}, "ImageTags": row{"Primary": "et"}},
+				{"Id": "e7", "Name": "Special", "Type": "Episode", "SeriesId": "s9", "SeriesName": "Show", "UserData": row{}, "ImageTags": row{}},
+			}},
+			{"Id": "r9", "Name": "Friday night", "Kind": "Playlist", "PlaylistId": "p2", "Place": "Bottom", "Items": []row{item("b2", "Bravo", row{}, false)}},
+		}}, steps: []string{"home", "wait 100", "cards"}, want: []string{ask,
+			"Mine → #/details?id=p1&serverId=srv: Alpha(#/details?id=a1&serverId=srv, url(\"img a1 Primary 407x272 taga1\")) " +
+				"Show(#/details?id=e6&serverId=srv, url(\"img s9 Primary 407x272 st\"), S1:E2 - Pilot) " +
+				"Show(#/details?id=e7&serverId=srv, icon tv, Special)",
+			"Friday night → #/details?id=p2&serverId=srv: Bravo(#/details?id=b2&serverId=srv, icon movie)",
+		}},
+		// Taken off the watchlist from the menu, a title leaves the
+		// Watchlist row as it leaves Now available, and stays in a row of
+		// another playlist; a series, which the row shows once for its
+		// episodes, leaves it whole.
+		"titles taken off the watchlist leave the Watchlist row": {
+			answers: [][]row{{
+				{"Id": "r8", "Name": "Mine", "Kind": "Watchlist", "PlaylistId": "p1", "Place": "Top", "Items": []row{
+					item("a1", "Alpha", row{}, true), item("b2", "Bravo", row{}, true),
+					{"Id": "s9", "Name": "Show", "Type": "Series", "UserData": row{}, "ImageTags": row{"Primary": "st"}}}},
+				{"Id": "r9", "Name": "Friday night", "Kind": "Playlist", "PlaylistId": "p2", "Place": "Bottom", "Items": []row{item("b2", "Bravo", row{}, true)}},
+			}},
+			steps: []string{"home", "wait 100", "show", "unlist b2", "render", "show", "unlist s9*", "render", "show"},
+			want: []string{ask, "Mine[Alpha Bravo Show] s0 s1 s2 s3 s4 s5 s6 s7 s8 s9 Friday night[Bravo]",
+				"Mine[Alpha Show] s0 s1 s2 s3 s4 s5 s6 s7 s8 s9 Friday night[Bravo]",
+				"Mine[Alpha] s0 s1 s2 s3 s4 s5 s6 s7 s8 s9 Friday night[Bravo]"},
+		},
+	}
+	const harness = scriptRunner + `
+const { script, scenarios } = JSON.parse(require('node:fs').readFileSync(0, 'utf8'))
+const flush = () => new Promise((resolve) => setImmediate(resolve))
+async function run(scenario) {
+  const log = []
+  let now = 0
+  const timers = []
+  const listeners = {}
+  const observers = new Set()
+  let queued = false
+  // changes counts the page's changes: a script that keeps changing it,
+  // which would hang a browser, is stopped and logged.
+  let changes = 0
+  const changed = () => {
+    if (queued) return
+    queued = true
+    queueMicrotask(() => {
+      queued = false
+      if (++changes > 10000) {
+        observers.clear()
+        log.push('changes the page without end')
+        return
+      }
+      for (const observer of [...observers]) if (observers.has(observer)) try { observer.callback([]) } catch (error) {}
+    })
+  }
+  class MutationObserver {
+    constructor(callback) { this.callback = callback }
+    observe() { observers.add(this) }
+    disconnect() { observers.delete(this) }
+  }
+  const classes = (element) => (element.className || '').split(' ').filter(Boolean)
+  const matches = (element, selector) => /^(\.[\w-]+)+$/.test(selector) && selector.slice(1).split('.').every((c) => classes(element).includes(c))
+  const all = (root, selector) => (root.children || []).flatMap((child) => (child.children ? [...(matches(child, selector) ? [child] : []), ...all(child, selector)] : []))
+  const classList = (element) => ({
+    contains: (c) => classes(element).includes(c),
+    add: (c) => { if (!classes(element).includes(c)) { element.className = [...classes(element), c].join(' '); changed() } },
+    remove: (c) => { element.className = classes(element).filter((x) => x !== c).join(' '); changed() },
+    toggle: () => {},
+  })
+  class Element {
+    constructor(tag, className) { this.tagName = tag; this.className = className || ''; this.children = []; this.parentNode = null; this.style = {}; this.text = ''; this.attributes = {} }
+    get classList() { return classList(this) }
+    set textContent(text) { this.text = text; this.children = []; changed() }
+    get textContent() { return this.text + this.children.map((child) => child.textContent).join('') }
+    get nextSibling() { return this.parentNode ? this.parentNode.children[this.parentNode.children.indexOf(this) + 1] || null : null }
+    get firstChild() { return this.children[0] || null }
+    appendChild(child) { return this.insertBefore(child, null) }
+    insertBefore(child, before) {
+      if (child.parentNode) child.parentNode.removeChild(child)
+      const at = before ? this.children.indexOf(before) : -1
+      this.children.splice(at < 0 ? this.children.length : at, 0, child)
+      child.parentNode = this
+      changed()
+      return child
+    }
+    removeChild(child) { this.children.splice(this.children.indexOf(child), 1); child.parentNode = null; changed(); return child }
+    querySelector(selector) { return all(this, selector)[0] || null }
+    querySelectorAll(selector) { return all(this, selector) }
+    setAttribute(name, value) { this.attributes[name] = String(value) }
+    getAttribute(name) { return name in this.attributes ? this.attributes[name] : null }
+    hasAttribute(name) { return name in this.attributes }
+    removeAttribute(name) { delete this.attributes[name] }
+    addEventListener() {}
+    closest(selector) { for (let e = this; e && e.children; e = e.parentNode) if (matches(e, selector)) return e; return null }
+  }
+  // jellyfin-web's home page, hidden until the route opens it, and its ten
+  // sections, which it fills in place.
+  const body = new Element('body')
+  const page = body.appendChild(new Element('div', 'page homePage hide'))
+  const container = page.appendChild(new Element('div', 'sections homeSectionsContainer'))
+  const render = () => {
+    for (const child of [...container.children]) container.removeChild(child)
+    for (let i = 0; i < 10; i++) container.appendChild(new Element('div', 'verticalSection section' + i))
+  }
+  render()
+  const document = {
+    body,
+    documentElement: { lang: 'en-US', className: scenario.tv ? 'layout-tv' : 'layout-desktop', get classList() { return classList(this) } },
+    head: { appendChild: () => {} },
+    createElement: (tag) => new Element(tag),
+    createTextNode: (text) => ({ textContent: text, parentNode: null }),
+    getElementById: () => null,
+    querySelector: (selector) => body.querySelector(selector),
+    querySelectorAll: (selector) => body.querySelectorAll(selector),
+  }
+  const describe = (element) => {
+    if (classes(element).includes('miraHomeRow')) {
+      return element.querySelector('.sectionTitle').textContent + '[' + element.querySelectorAll('.card').map((card) => card.querySelector('.cardText-first').textContent).join(' ') + ']'
+    }
+    return 's' + classes(element).find((c) => /^section\d$/.test(c)).slice(7)
+  }
+  const show = () => log.push(container.children.map(describe).join(' '))
+  const cards = () => {
+    for (const row of container.querySelectorAll('.miraHomeRow')) {
+      const title = row.querySelector('.sectionTitleTextButton')
+      const items = row.querySelector('.itemsContainer')
+      const described = items.children.map((card) => {
+        const image = card.querySelector('.cardImageContainer')
+        const marks = [image.getAttribute('href')]
+        marks.push(image.style.backgroundImage || 'icon ' + image.querySelector('.cardImageIcon').className.split(' ').pop())
+        if (image.querySelector('.playedIndicator')) marks.push('played')
+        const count = image.querySelector('.countIndicator')
+        if (count) marks.push(count.textContent + ' unplayed')
+        const bar = image.querySelector('.itemProgressBarForeground')
+        if (bar) marks.push('progress ' + bar.style.width)
+        if (card.getAttribute('data-id') !== card.querySelector('.textActionButton').getAttribute('href').slice(13, 15)) marks.push('wrong id')
+        if (card.getAttribute('data-type') === 'Episode') marks.push(card.querySelector('.cardText-secondary').textContent)
+        return card.querySelector('.cardText-first').textContent + '(' + marks.join(', ') + ')'
+      })
+      const shaped = [title.getAttribute('is'), items.getAttribute('is'), row.querySelector('.emby-scroller').getAttribute('is')].join()
+      if (shaped !== 'emby-linkbutton,emby-itemscontainer,emby-scroller') described.push('shaped ' + shaped)
+      log.push(row.querySelector('.sectionTitle').textContent + ' → ' + title.getAttribute('href') + ': ' + described.join(' '))
+    }
+  }
+  const location = { href: 'http://mira.test/web/', hash: '' }
+  const go = (hash) => { location.hash = hash; location.href = 'http://mira.test/web/' + hash }
+  const history = { pushState: (state, title, url) => go(url), replaceState: (state, title, url) => go(url) }
+  const answers = (scenario.answers || []).slice()
+  // The session storage, where the item menus keep what they hid.
+  const stored = {}
+  if (scenario.storage) stored.miraDrops = scenario.storage
+  else if (scenario.drops) stored.miraDrops = JSON.stringify(scenario.drops)
+  const sessionStorage = {
+    getItem: (key) => (key in stored ? stored[key] : null),
+    setItem: (key, value) => { stored[key] = String(value) },
+    removeItem: (key) => { delete stored[key] },
+  }
+  // hide does what the menu's Hide this title does: it keeps the title,
+  // and the series of an episode, then takes their cards off the page.
+  const hide = (ids) => {
+    const drops = JSON.parse(stored.miraDrops || '[]')
+    for (const id of ids) drops.push({ kind: 'hidden', id, viewer: 'srv/user', until: 1e12 })
+    stored.miraDrops = JSON.stringify(drops)
+    for (const card of container.querySelectorAll('.card')) if (ids.includes(card.getAttribute('data-id'))) card.parentNode.removeChild(card)
+  }
+  // unlist does what the menu's Remove from Watchlist does: it keeps the
+  // title, a series marked with * or a season with ^ standing for every
+  // entry of it, then takes its cards off the rows of the watchlist.
+  const unlist = (ids) => {
+    const drops = JSON.parse(stored.miraDrops || '[]')
+    ids = ids.map((id) => {
+      const whole = id.endsWith('*') ? 'series' : id.endsWith('^') ? 'season' : ''
+      if (whole) id = id.slice(0, -1)
+      drops.push({ kind: 'watchlist', id, whole, viewer: 'srv/user', until: 1e12 })
+      return id
+    })
+    stored.miraDrops = JSON.stringify(drops)
+    for (const card of container.querySelectorAll('.card')) {
+      const row = card.closest('.miraHomeRow')
+      if (ids.includes(card.getAttribute('data-id')) && /^(NowAvailable|StillWaiting|Watchlist)$/.test(row.getAttribute('data-mira-kind'))) card.parentNode.removeChild(card)
+    }
+  }
+  const ApiClient = {
+    serverId: () => 'srv',
+    getUrl: (path, query) => 'http://mira.test/' + path + (query ? '?' + new URLSearchParams(query) : ''),
+    getCurrentUserId: () => 'user',
+    getCurrentUser: () => Promise.resolve({ Id: 'user', Policy: { IsAdministrator: true } }),
+    getScaledImageUrl: (id, options) => 'img ' + id + ' ' + options.type + ' ' + options.fillHeight + 'x' + options.fillWidth + ' ' + options.tag,
+    getDisplayPreferences: (id, user, client) =>
+      id === 'usersettings' && user === 'user' && client === 'emby' ? Promise.resolve({ CustomPrefs: { ...(scenario.preferences || {}) } }) : Promise.reject(new Error('wrong')),
+    getJSON: (url) => {
+      if (!url.startsWith('http://mira.test/Mira/HomeRows?')) return Promise.reject(new Error('not asked here'))
+      log.push('ask rows')
+      const answer = answers.shift()
+      return answer ? Promise.resolve({ Items: JSON.parse(JSON.stringify(answer)) }) : Promise.reject(new Error('down'))
+    },
+  }
+  class CustomEvent { constructor(type, init) { this.type = type; this.detail = init && init.detail } }
+  class Event { constructor(type) { this.type = type } }
+  runScript(script, {
+    location, history, URL, URLSearchParams, document, CustomEvent, Event, MutationObserver, window: { ApiClient, sessionStorage },
+    Date: { now: () => now },
+    setTimeout: (run, delay) => timers.push({ run, at: now + delay }),
+    clearTimeout: (id) => { if (id) timers[id - 1] = null },
+    addEventListener: (type, listener) => { (listeners[type] ||= []).push(listener) },
+  })
+  await flush()
+  for (const step of scenario.steps) {
+    if (step === 'show') show()
+    else if (step.startsWith('hide ')) hide(step.slice(5).split(' '))
+    else if (step.startsWith('unlist ')) unlist(step.slice(7).split(' '))
+    else if (step === 'cards') cards()
+    else if (step === 'render') render()
+    else if (step === 'empty') for (const child of [...container.children]) container.removeChild(child)
+    else if (step === 'home') { history.pushState(null, '', '#/home'); page.classList.remove('hide') }
+    else if (step === 'away') { history.pushState(null, '', '#/details?id=x'); page.classList.add('hide') }
+    else if (step.startsWith('wait ')) {
+      const until = now + Number(step.slice(5))
+      for (;;) {
+        let next = -1
+        timers.forEach((timer, i) => { if (timer && timer.at <= until && (next < 0 || timer.at < timers[next].at)) next = i })
+        if (next < 0) break
+        const timer = timers[next]
+        timers[next] = null
+        now = timer.at
+        timer.run()
+        await flush()
+      }
+      now = until
+    } else { history.pushState(null, '', step); page.classList.remove('hide') }
+    await flush()
+  }
+  return log
+}
+;(async () => {
+  const results = {}
+  for (const [name, scenario] of Object.entries(scenarios)) {
+    try {
+      results[name] = await run(scenario)
+    } catch (error) {
+      results[name] = ['harness: ' + error.stack]
+    }
+  }
+  process.stdout.write(JSON.stringify(results))
+})()
+`
+	type input struct {
+		Answers     [][]row  `json:"answers"`
+		Preferences row      `json:"preferences,omitempty"`
+		TV          bool     `json:"tv"`
+		Drops       []row    `json:"drops,omitempty"`
+		Storage     string   `json:"storage,omitempty"`
+		Steps       []string `json:"steps"`
+	}
+	inputs := map[string]input{}
+	for name, s := range scenarios {
+		inputs[name] = input{s.answers, s.preferences, s.tv, s.drops, s.storage, s.steps}
+	}
+	data, _ := json.Marshal(map[string]any{"script": string(webScriptBody), "scenarios": inputs})
+	command := exec.CommandContext(t.Context(), node, "-e", harness)
+	command.Stdin = strings.NewReader(string(data))
+	output, err := command.Output()
+	if err != nil {
+		t.Fatalf("node: %v", err)
+	}
+	var results map[string][]string
+	if err := json.Unmarshal(output, &results); err != nil {
+		t.Fatalf("node printed %q: %v", output, err)
+	}
+	for name, s := range scenarios {
+		if got := results[name]; !slices.Equal(got, s.want) {
+			t.Errorf("%s:\n got  %q\n want %q", name, got, s.want)
+		}
+	}
+}
+
+// On a movie's or an episode's page, the script adds a Share button
+// before the page's ⋮ button, drawn as jellyfin-web's own, when
+// /Mira/Items/{id}/Share answers that the user may share the title; it
+// opens the address the answer gives, in the same tab. It asks every
+// second until jellyfin-web made its client, 10 times at most; an answer
+// that the title may not be shared, or none, changes nothing; a video
+// playing is never touched; jellyfin-web's renders find the button again,
+// and leaving the title takes it off. It runs in Node.js, in a context
+// that stands for the browser: a small document holding the title page
+// and its buttons, a clock and timers the harness moves on.
+func TestTitlePagesOfferShare(t *testing.T) {
+	t.Parallel()
+	node, err := exec.LookPath("node")
+	if err != nil {
+		t.Skip("Node.js is not installed")
+	}
+	const (
+		id     = "0123456789abcdef0123456789abcdef"
+		title  = "#/details?id=" + id + "&serverId=fedcba9876543210fedcba9876543210"
+		other  = "ffffffffffffffffffffffffffffffff"
+		ask    = "ask share"
+		plain  = "buttons play more"
+		shared = "buttons play share(Share, share) more"
+		opened = "open http://mira.test/admin/me/account?share=" + id + "&from=web#shared-links"
+	)
+	yes := map[string]any{"Shareable": true, "Url": "/admin/me/account?share=" + id + "#shared-links"}
+	no := map[string]any{"Shareable": false}
+	type scenario struct {
+		answers  []map[string]any
+		lang     string
+		noClient bool
+		steps    []string
+		want     []string
+	}
+	scenarios := map[string]scenario{
+		"shareable":     {answers: []map[string]any{yes}, steps: []string{title, "show", "click"}, want: []string{ask, shared, opened}},
+		"not shareable": {answers: []map[string]any{no}, steps: []string{title, "show"}, want: []string{ask, plain}},
+		"no address":    {answers: []map[string]any{{"Shareable": true}}, steps: []string{title, "show"}, want: []string{ask, plain}},
+		"no answer":     {steps: []string{title, "show"}, want: []string{ask, plain}},
+		"the client comes late": {
+			answers: []map[string]any{yes}, noClient: true,
+			steps: []string{title, "wait 2500", "client", "show", "wait 1000", "show"},
+			want:  []string{plain, ask, shared},
+		},
+		"ten asks at most": {
+			answers: []map[string]any{yes}, noClient: true,
+			steps: []string{title, "wait 60000", "client", "wait 10000", "show"},
+			want:  []string{plain},
+		},
+		"rendered anew": {
+			answers: []map[string]any{yes}, steps: []string{title, "show", "render", "show"}, want: []string{ask, shared, shared},
+		},
+		"leaving the title": {
+			answers: []map[string]any{yes}, steps: []string{title, "show", "#/home", "show"}, want: []string{ask, shared, plain},
+		},
+		"another title": {
+			answers: []map[string]any{yes, no}, steps: []string{title, "show", "#/details?id=" + other, "show"},
+			want: []string{ask, shared, "ask http://mira.test/Mira/Items/" + other + "/Share", plain},
+		},
+		"in French": {
+			answers: []map[string]any{yes}, lang: "fr-FR", steps: []string{title, "show"},
+			want: []string{ask, "buttons play share(Partager, share) more"},
+		},
+		"during a video": {
+			answers: []map[string]any{yes}, steps: []string{"video", title, "show", "end video", "show"}, want: []string{ask, plain, shared},
+		},
+	}
+	const harness = scriptRunner + `
+const { script, scenarios } = JSON.parse(require('node:fs').readFileSync(0, 'utf8'))
+const flush = () => new Promise((resolve) => setImmediate(resolve))
+const TITLE = '0123456789abcdef0123456789abcdef'
+async function run(scenario) {
+  const log = []
+  let now = 0
+  const timers = []
+  // Changes reach the observers once the code that made them is done.
+  const observers = new Set()
+  let queued = false
+  const changed = () => {
+    if (queued) return
+    queued = true
+    queueMicrotask(() => {
+      queued = false
+      for (const observer of [...observers]) if (observers.has(observer)) try { observer.callback([]) } catch (error) {}
+    })
+  }
+  class MutationObserver {
+    constructor(callback) { this.callback = callback }
+    observe() { observers.add(this) }
+    disconnect() { observers.delete(this) }
+  }
+  const classes = (element) => element.className.split(' ').filter(Boolean)
+  const matches = (element, selector) => /^(\.[\w-]+)+$/.test(selector) && selector.slice(1).split('.').every((c) => classes(element).includes(c))
+  const all = (root, selector) => root.children.flatMap((child) => [...(matches(child, selector) ? [child] : []), ...all(child, selector)])
+  class Element {
+    constructor(tag, className) { this.tagName = tag; this.className = className || ''; this.children = []; this.parentNode = null; this.title = ''; this.attributes = {}; this.listeners = {}; this.text = '' }
+    get classList() {
+      return {
+        contains: (c) => classes(this).includes(c),
+        add: (c) => { if (!classes(this).includes(c)) { this.className = [...classes(this), c].join(' '); changed() } },
+        remove: (c) => { this.className = classes(this).filter((x) => x !== c).join(' '); changed() },
+      }
+    }
+    set textContent(text) { this.text = text; this.children = []; changed() }
+    get textContent() { return this.text + this.children.map((child) => child.textContent).join('') }
+    appendChild(child) { return this.insertBefore(child, null) }
+    insertBefore(child, before) {
+      if (before && before.parentNode !== this) throw new Error('not a child')
+      if (child.parentNode) child.parentNode.removeChild(child)
+      const at = before ? this.children.indexOf(before) : -1
+      this.children.splice(at < 0 ? this.children.length : at, 0, child)
+      child.parentNode = this
+      changed()
+      return child
+    }
+    removeChild(child) { this.children.splice(this.children.indexOf(child), 1); child.parentNode = null; changed(); return child }
+    querySelector(selector) { return all(this, selector)[0] || null }
+    querySelectorAll(selector) { return all(this, selector) }
+    setAttribute(name, value) { this.attributes[name] = String(value) }
+    getAttribute(name) { return name in this.attributes ? this.attributes[name] : null }
+    addEventListener(type, listener) { (this.listeners[type] ||= []).push(listener) }
+  }
+  // The title page and its buttons, as jellyfin-web renders them: Play,
+  // then the ⋮ button.
+  const body = new Element('body')
+  const page = body.appendChild(new Element('div', 'page itemDetailPage'))
+  const buttons = page.appendChild(new Element('div', 'mainDetailButtons focuscontainer-x'))
+  const render = () => {
+    for (const child of [...buttons.children]) buttons.removeChild(child)
+    buttons.appendChild(new Element('button', 'button-flat btnPlay detailButton'))
+    buttons.appendChild(new Element('button', 'button-flat btnMoreCommands detailButton'))
+  }
+  render()
+  const document = {
+    body,
+    documentElement: { lang: scenario.lang || 'en-US' },
+    head: { appendChild: () => {} },
+    createElement: (tag) => new Element(tag),
+    getElementById: () => null,
+    querySelector: (selector) => {
+      if (selector === '.page.itemDetailPage:not(.hide)') return body.querySelector('.page.itemDetailPage')
+      return body.querySelector(selector)
+    },
+    querySelectorAll: (selector) => body.querySelectorAll(selector),
+  }
+  // The button the script adds shows its tooltip, which its label repeats,
+  // and its icon.
+  function show() {
+    const words = buttons.children.map((child) => {
+      if (!classes(child).includes('miraShare')) return classes(child).includes('btnPlay') ? 'play' : 'more'
+      const icon = child.children[0].children[0]
+      const drawn = classes(child).includes('detailButton') && child.attributes.type === 'button' && child.attributes['aria-label'] === child.title &&
+        classes(child.children[0]).includes('detailButton-content') && icon.attributes['aria-hidden'] === 'true'
+      return 'share(' + child.title + ', ' + classes(icon).pop() + ')' + (drawn ? '' : ' (not drawn as jellyfin-web)')
+    })
+    log.push(['buttons', ...words].join(' '))
+  }
+  let href = 'http://mira.test/web/'
+  const location = {
+    hash: '',
+    get href() { return href },
+    set href(url) { log.push('open ' + url) },
+    replace: (url) => log.push('replace ' + url),
+  }
+  const go = (hash) => { location.hash = hash; href = 'http://mira.test/web/' + hash }
+  const history = { pushState: (state, title, url) => go(url), replaceState: (state, title, url) => go(url) }
+  const answers = (scenario.answers || []).slice()
+  const ApiClient = {
+    getUrl: (path) => 'http://mira.test/' + path,
+    getCurrentUserId: () => 'user',
+    getCurrentUser: () => Promise.resolve({ Id: 'user', Policy: { IsAdministrator: true } }),
+    getJSON: (url) => {
+      // The title's versions and scores, and the user's views, are other parts'.
+      if (!url.endsWith('/Share')) return Promise.reject(new Error('not asked here'))
+      log.push('ask ' + (url === 'http://mira.test/Mira/Items/' + TITLE + '/Share' ? 'share' : url))
+      const answer = answers.shift()
+      return answer ? Promise.resolve({ ...answer }) : Promise.reject(new Error('down'))
+    },
+  }
+  const window = scenario.noClient ? {} : { ApiClient }
+  class CustomEvent { constructor(type, init) { this.type = type; this.detail = init && init.detail } }
+  class Event { constructor(type) { this.type = type } }
+  runScript(script, {
+    location, history, document, CustomEvent, Event, MutationObserver, window,
+    Date: { now: () => now },
+    setTimeout: (run, delay) => timers.push({ run, at: now + delay }),
+    clearTimeout: (id) => { if (id) timers[id - 1] = null },
+    addEventListener: () => {},
+  })
+  await flush()
+  let video = null
+  for (const step of scenario.steps) {
+    if (step === 'show') show()
+    else if (step === 'render') render()
+    else if (step === 'client') window.ApiClient = ApiClient
+    else if (step === 'click') {
+      const share = buttons.querySelector('.miraShare')
+      for (const listener of (share ? share.listeners.click : null) || []) listener({ type: 'click' })
+    } else if (step === 'video') video = body.appendChild(new Element('div', 'videoPlayerContainer'))
+    else if (step === 'end video') body.removeChild(video)
+    else if (step.startsWith('wait ')) {
+      const until = now + Number(step.slice(5))
+      for (;;) {
+        let next = -1
+        timers.forEach((timer, i) => { if (timer && timer.at <= until && (next < 0 || timer.at < timers[next].at)) next = i })
+        if (next < 0) break
+        const timer = timers[next]
+        timers[next] = null
+        now = timer.at
+        timer.run()
+        await flush()
+      }
+      now = until
+    } else history.pushState(null, '', step)
+    await flush()
+  }
+  return log
+}
+;(async () => {
+  const results = {}
+  for (const [name, scenario] of Object.entries(scenarios)) {
+    try {
+      results[name] = await run(scenario)
+    } catch (error) {
+      results[name] = ['harness: ' + error.stack]
+    }
+  }
+  process.stdout.write(JSON.stringify(results))
+})()
+`
+	type input struct {
+		Answers  []map[string]any `json:"answers"`
+		Lang     string           `json:"lang,omitempty"`
+		NoClient bool             `json:"noClient"`
+		Steps    []string         `json:"steps"`
+	}
+	inputs := map[string]input{}
+	for name, s := range scenarios {
+		inputs[name] = input{s.answers, s.lang, s.noClient, s.steps}
+	}
+	data, _ := json.Marshal(map[string]any{"script": string(webScriptBody), "scenarios": inputs})
+	command := exec.CommandContext(t.Context(), node, "-e", harness)
+	command.Stdin = strings.NewReader(string(data))
+	output, err := command.Output()
+	if err != nil {
+		t.Fatalf("node: %v", err)
+	}
+	var results map[string][]string
+	if err := json.Unmarshal(output, &results); err != nil {
+		t.Fatalf("node printed %q: %v", output, err)
+	}
+	for name, s := range scenarios {
+		if got := results[name]; !slices.Equal(got, s.want) {
+			t.Errorf("%s:\n got  %q\n want %q", name, got, s.want)
+		}
+	}
+}

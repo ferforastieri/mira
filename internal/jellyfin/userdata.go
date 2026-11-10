@@ -1,0 +1,696 @@
+package jellyfin
+
+import (
+	"bytes"
+	"context"
+	"encoding/json"
+	"errors"
+	"io"
+	"net/http"
+	"slices"
+	"strings"
+	"time"
+
+	"github.com/ferforastieri/mira/internal/accounts"
+	"github.com/ferforastieri/mira/internal/library"
+	"github.com/ferforastieri/mira/internal/playback"
+	"github.com/ferforastieri/mira/internal/smartlists"
+	"github.com/ferforastieri/mira/internal/trackers"
+	"github.com/ferforastieri/mira/internal/userdata"
+)
+
+func (h *Handler) userDataRoutes(rt *router) {
+	signedIn := func(method, pattern string, handler http.HandlerFunc) {
+		rt.handle(method, pattern, h.authenticated(handler))
+	}
+	for _, played := range []string{"/UserPlayedItems/{itemId}", "/Users/{userId}/PlayedItems/{itemId}"} {
+		signedIn(http.MethodPost, played, h.markPlayed(true))
+		signedIn(http.MethodDelete, played, h.markPlayed(false))
+	}
+	for _, favorite := range []string{"/UserFavoriteItems/{itemId}", "/Users/{userId}/FavoriteItems/{itemId}"} {
+		signedIn(http.MethodPost, favorite, h.markFavorite(true))
+		signedIn(http.MethodDelete, favorite, h.markFavorite(false))
+	}
+	for _, item := range []string{"/UserItems/{itemId}", "/Users/{userId}/Items/{itemId}"} {
+		signedIn(http.MethodPost, item+"/Rating", h.rate(true))
+		signedIn(http.MethodDelete, item+"/Rating", h.rate(false))
+		signedIn(http.MethodGet, item+"/UserData", h.userData)
+		signedIn(http.MethodPost, item+"/UserData", h.updateUserData)
+	}
+	signedIn(http.MethodGet, "/UserItems/Resume", h.resume)
+	signedIn(http.MethodGet, "/Users/{userId}/Items/Resume", h.resume)
+	signedIn(http.MethodGet, "/Shows/NextUp", h.nextUp)
+	signedIn(http.MethodGet, "/Shows/Upcoming", h.upcoming)
+	h.hiddenTitleRoutes(signedIn)
+	h.nextUpRemovalRoutes(signedIn)
+	h.watchlistRoutes(signedIn)
+}
+
+// userState is what a user did with the items of one response, what is
+// known of its songs' lyrics and of its songs' and albums' gains, and how
+// the app asking is told collection libraries.
+type userState struct {
+	data map[accounts.ID]userdata.Data
+	// counts are the played and resumable episodes under series and
+	// seasons.
+	counts map[accounts.ID]userdata.Counts
+	// contents describes the episodes of series listed without them that
+	// the user started, so that their progress shows.
+	contents map[accounts.ID]*library.Contents
+	// lyrics holds the songs known to have lyrics (see lyrics.Known):
+	// listings never look songs up.
+	lyrics map[accounts.ID]bool
+	// gains holds the gains known of songs and albums (see gains).
+	gains map[accounts.ID]float64
+	// collectionLibraries tells the app asking an addon's collection
+	// library holds collections: an administrator chose the app (see
+	// appCollectionType).
+	collectionLibraries bool
+	// badges holds what the badges over the posters of movies and series
+	// show, while the settings draw them (see posterBadges).
+	badges map[accounts.ID]string
+}
+
+// userState loads what user did with items, which of its songs have
+// lyrics, the gains of its songs and albums, and whether the app asking,
+// the caller of ctx, is told collection libraries hold collections: every
+// description of a library goes through it.
+func (h *Handler) userState(ctx context.Context, user accounts.User, items []library.Item) (userState, error) {
+	ids := make([]accounts.ID, 0, len(items))
+	var parents, songs, videos, collections []accounts.ID
+	for _, item := range items {
+		ids = append(ids, item.ID)
+		if item.Kind == library.KindSeries || item.Kind == library.KindSeason {
+			parents = append(parents, item.ID)
+		}
+		if item.Kind == library.KindTrack {
+			songs = append(songs, item.ID)
+		}
+		if counted(item) {
+			videos = append(videos, item.Contents.Videos...)
+		}
+		if item.Kind == library.KindCollection {
+			collections = append(collections, item.ID)
+		}
+	}
+	data, err := h.UserData.Get(ctx, user.ID, append(ids, videos...))
+	if err != nil {
+		return userState{}, err
+	}
+	// The collection of a search in plain words is a favorite once saved
+	// as the user's own smart list (see markFavorite).
+	saved, err := h.Library.SavedPlainSearches(ctx, user, collections)
+	if err != nil {
+		return userState{}, err
+	}
+	for id := range saved {
+		if data == nil {
+			data = map[accounts.ID]userdata.Data{}
+		}
+		d := data[id]
+		d.Favorite = true
+		data[id] = d
+	}
+	counts, err := h.UserData.EpisodeCounts(ctx, user.ID, parents)
+	if err != nil {
+		return userState{}, err
+	}
+	// A folder counts its videos the user watched, and started, as a
+	// series counts its episodes; so does a season of an episode order,
+	// which the episodes' data does not name.
+	for _, item := range items {
+		if !counted(item) {
+			continue
+		}
+		var c userdata.Counts
+		for _, video := range item.Contents.Videos {
+			if data[video].Played {
+				c.Played++
+			}
+			if data[video].Position > 0 {
+				c.Resumable++
+			}
+		}
+		counts[item.ID] = c
+	}
+	state := userState{data: data, counts: counts, contents: map[accounts.ID]*library.Contents{}, lyrics: h.Lyrics.Known(ctx, songs),
+		gains: h.gains(ctx, items), collectionLibraries: h.collectionLibrariesByType(ctx), badges: h.posterBadges(ctx, items)}
+	var incomplete []accounts.ID
+	for _, item := range items {
+		if item.Kind == library.KindSeries && item.Contents == nil && counts[item.ID].Played > 0 {
+			incomplete = append(incomplete, item.ID)
+		}
+	}
+	if len(incomplete) > 0 {
+		complete, err := h.Library.Items(ctx, user, incomplete)
+		if err != nil {
+			return userState{}, err
+		}
+		for _, series := range complete {
+			state.contents[series.ID] = series.Contents
+		}
+	}
+	return state, nil
+}
+
+// counted reports whether the videos an item holds are counted from their
+// own data: a folder's, a playlist's, and a season of an episode order's.
+func counted(item library.Item) bool {
+	return item.Contents != nil && (item.Kind == library.KindFolder || item.Kind == kindPlaylist || item.Kind == library.KindSeason && item.EpisodeGroup != "")
+}
+
+// of describes what the user did with item. Series and seasons count
+// their played episodes, and folders and playlists their played videos; a
+// partly watched episode or video counts as unplayed. Other folders only
+// show that they are not played.
+func (s userState) of(item library.Item) UserItemData {
+	result := UserItemData{Key: hyphenated(item.ID), ItemId: item.ID.String()}
+	data := s.data[item.ID]
+	result.IsFavorite, result.Rating, result.Likes = data.Favorite, data.Rating, data.Likes()
+	switch item.Kind {
+	case library.KindMovie, library.KindVideo, library.KindEpisode, library.KindRecording, library.KindReplay, library.KindTrack, library.KindAudiobook,
+		library.KindExtra, library.KindThemeSong:
+		result.PlaybackPositionTicks = int64(data.Position / 100)
+		result.PlayCount = data.PlayCount
+		result.Played = data.Played
+		if data.LastPlayed != nil {
+			result.LastPlayedDate = new(Time(*data.LastPlayed))
+		}
+		if percent, ok := data.PlayedPercentage(); ok {
+			result.PlayedPercentage = new(percent)
+		}
+	case library.KindSeries, library.KindSeason, library.KindCollection, library.KindFolder, kindPlaylist:
+		result.PlayedPercentage = new(0.0)
+		contents := item.Contents
+		if contents == nil {
+			contents = s.contents[item.ID]
+		}
+		if contents == nil {
+			break
+		}
+		played := min(s.counts[item.ID].Played, contents.Released)
+		result.UnplayedItemCount = new(contents.Released - played)
+		if contents.Released > 0 {
+			result.PlayedPercentage = new(float64(played) / float64(contents.Released) * 100)
+			result.Played = played == contents.Released
+		}
+	}
+	return result
+}
+
+// resumable reports whether the user can resume item: a movie or episode
+// with a resume point, or a series, season or folder with such an episode
+// or video.
+func (s userState) resumable(item library.Item) bool {
+	if item.Kind == library.KindSeries || item.Kind == library.KindSeason || item.Kind == library.KindFolder {
+		return s.counts[item.ID].Resumable > 0
+	}
+	return s.data[item.ID].Position > 0
+}
+
+// itemData is what user did with one item.
+func (h *Handler) itemData(ctx context.Context, user accounts.User, item library.Item) (UserItemData, error) {
+	state, err := h.userState(ctx, user, []library.Item{item})
+	if err != nil {
+		return UserItemData{}, err
+	}
+	return state.of(item), nil
+}
+
+// stored names an item for the user data store: episodes name their series
+// and season.
+func stored(item library.Item) userdata.Item {
+	if item.Kind == library.KindEpisode {
+		return userdata.Item{ID: item.ID, Series: item.SeriesID, Season: item.SeasonID}
+	}
+	return userdata.Item{ID: item.ID}
+}
+
+// userDataItem binds the item a user data endpoint acts on and the user it
+// acts for. A version stands for its title; a playlist the user sees is
+// described as an item too (see playlistItem). ok is false once w was
+// answered.
+func (h *Handler) userDataItem(w http.ResponseWriter, r *http.Request, b bindErrors) (accounts.User, library.Item, bool) {
+	id := b.pathID(r, "itemId")
+	user, ok := h.viewer(w, r, b, notFoundProblem)
+	if !ok {
+		return accounts.User{}, library.Item{}, false
+	}
+	item, err := h.Library.Item(r.Context(), user, id)
+	if errors.Is(err, library.ErrNotFound) {
+		item, err = h.title(r.Context(), user, id)
+	}
+	if errors.Is(err, library.ErrNotFound) {
+		item, err = h.playlistItem(r.Context(), user, id)
+	}
+	if err != nil {
+		h.browseError(w, r, err)
+		return accounts.User{}, library.Item{}, false
+	}
+	return user, item, true
+}
+
+// change applies change to the data of items and answers what the user did
+// with item afterwards. The user's apps that keep a socket open get the new
+// data of item and items.
+func (h *Handler) change(w http.ResponseWriter, r *http.Request, user accounts.User, item library.Item, items []library.Item, change func(*userdata.Data)) {
+	h.changeEach(w, r, user, item, items, func(_ userdata.Item, d *userdata.Data) { change(d) })
+}
+
+// changeEach is change with change told which item it changes. It reports
+// whether the change was made.
+func (h *Handler) changeEach(w http.ResponseWriter, r *http.Request, user accounts.User, item library.Item, items []library.Item,
+	change func(userdata.Item, *userdata.Data)) bool {
+	refs := make([]userdata.Item, 0, len(items))
+	for _, target := range items {
+		refs = append(refs, stored(target))
+	}
+	if _, err := h.UserData.ChangeEach(r.Context(), user.ID, refs, change); err != nil {
+		h.internalError(w, r, err)
+		return false
+	}
+	h.userDataChanged(user, append([]library.Item{item}, items...))
+	data, err := h.itemData(r.Context(), user, item)
+	if err != nil {
+		h.internalError(w, r, err)
+		return true
+	}
+	writeJSON(w, http.StatusOK, data)
+	return true
+}
+
+// markPlayed marks an item played or unplayed: a movie or an episode
+// itself, or every released episode of a season or series. The user's
+// tracking services are told of the movies and episodes it counts a new
+// play of, or of all it unmarks.
+func (h *Handler) markPlayed(played bool) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		b := bindErrors{}
+		var date *time.Time
+		if raw := strings.TrimSpace(query(r, "datePlayed")); raw != "" {
+			if parsed, ok := parseTime(raw); ok {
+				date = &parsed
+			} else {
+				b.add("datePlayed", notValid(raw))
+			}
+		}
+		user, item, ok := h.userDataItem(w, r, b)
+		if !ok {
+			return
+		}
+		targets, err := h.markTargets(r.Context(), user, item)
+		if err != nil {
+			h.browseError(w, r, err)
+			return
+		}
+		now := time.Now().UTC()
+		var plays []accounts.ID
+		if !h.changeEach(w, r, user, item, targets, func(target userdata.Item, d *userdata.Data) {
+			if played {
+				// As MarkPlayed counts plays: a dated mark is one more, an
+				// undated one only on what was not played.
+				if date != nil || !d.Played {
+					plays = append(plays, target.ID)
+				}
+				d.MarkPlayed(date, now)
+			} else {
+				d.MarkUnplayed()
+			}
+		}) {
+			return
+		}
+		if h.Trackers == nil {
+			return
+		}
+		sent := targets
+		if played {
+			sent = slices.DeleteFunc(slices.Clone(targets), func(target library.Item) bool { return !slices.Contains(plays, target.ID) })
+		}
+		h.Trackers.Mark(user.ID, trackers.Mark{Played: played, Date: date, Scope: markScope(item.Kind), Titles: h.trackedTitles(user, sent)})
+	}
+}
+
+// markTargets lists the items a played mark applies to.
+func (h *Handler) markTargets(ctx context.Context, user accounts.User, item library.Item) ([]library.Item, error) {
+	var episodes []library.Item
+	var err error
+	switch item.Kind {
+	case library.KindMovie, library.KindVideo, library.KindEpisode, library.KindRecording, library.KindReplay, library.KindTrack, library.KindAudiobook,
+		library.KindExtra, library.KindThemeSong:
+		return []library.Item{item}, nil
+	case library.KindAlbum, library.KindMusicPlaylist:
+		// As Jellyfin marks a folder's tracks.
+		return h.Library.Music(ctx, user, library.MusicQuery{Parent: item.ID})
+	case kindPlaylist:
+		return h.playlistMarkTargets(ctx, user, item)
+	case library.KindSeries:
+		episodes, err = h.Library.Episodes(ctx, user, item.ID, nil)
+	case library.KindSeason:
+		episodes, err = h.Library.Episodes(ctx, user, item.SeriesID, &item.ID)
+	case library.KindFolder:
+		// As Jellyfin marks a folder's videos.
+		episodes, err = h.Library.FolderVideos(ctx, user, item.ID)
+	default:
+		return nil, nil
+	}
+	if err != nil {
+		return nil, err
+	}
+	released := episodes[:0]
+	for _, episode := range episodes {
+		if episode.Available {
+			released = append(released, episode)
+		}
+	}
+	return released, nil
+}
+
+// markFavorite marks an item, of any kind, as a favorite or not. Favorites
+// do not spread to what the item contains. The collection of a search in
+// plain words is saved as the user's own smart list instead, or the list
+// saved from it deleted (see library.SavePlainSearch). A user whose apps
+// would not show the list, or who has as many as they may, is refused with
+// an empty 403, as Jellyfin refuses what a user's policy does not allow.
+func (h *Handler) markFavorite(favorite bool) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		user, item, ok := h.userDataItem(w, r, bindErrors{})
+		if !ok {
+			return
+		}
+		if item.Kind == library.KindCollection && h.Library.IsPlainSearch(user, item.ID) {
+			h.savePlainSearch(w, r, user, item, favorite)
+			return
+		}
+		h.change(w, r, user, item, []library.Item{item}, func(d *userdata.Data) { d.Favorite = favorite })
+	}
+}
+
+// savePlainSearch saves the collection of a search in plain words, or
+// deletes the list saved from it, and answers what the user did with it.
+func (h *Handler) savePlainSearch(w http.ResponseWriter, r *http.Request, user accounts.User, item library.Item, save bool) {
+	_, err := h.Library.SavePlainSearch(r.Context(), user, item.ID, save)
+	if errors.Is(err, library.ErrOwnListsOff) || errors.Is(err, smartlists.ErrTooMany) {
+		w.WriteHeader(http.StatusForbidden)
+		return
+	}
+	if err != nil {
+		h.internalError(w, r, err)
+		return
+	}
+	data, err := h.itemData(r.Context(), user, item)
+	if err != nil {
+		h.internalError(w, r, err)
+		return
+	}
+	writeJSON(w, http.StatusOK, data)
+}
+
+// rate records that the user likes or dislikes an item. Posting without
+// likes, like deleting, removes the rating. The tracking services that
+// keep ratings are told of the change.
+func (h *Handler) rate(post bool) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		b := bindErrors{}
+		likes, set := b.bool(r, "likes")
+		user, item, ok := h.userDataItem(w, r, b)
+		if !ok {
+			return
+		}
+		var was, now *float64
+		if h.changeEach(w, r, user, item, []library.Item{item}, func(_ userdata.Item, d *userdata.Data) {
+			was = d.Rating
+			d.Rating = nil
+			if post && set {
+				d.Like(likes)
+			}
+			now = d.Rating
+		}) {
+			h.rated(user, item, was, now)
+		}
+	}
+}
+
+func (h *Handler) userData(w http.ResponseWriter, r *http.Request) {
+	user, item, ok := h.userDataItem(w, r, bindErrors{})
+	if !ok {
+		return
+	}
+	data, err := h.itemData(r.Context(), user, item)
+	if err != nil {
+		h.internalError(w, r, err)
+		return
+	}
+	writeJSON(w, http.StatusOK, data)
+}
+
+// userDataUpdate is Jellyfin's UpdateUserItemDataDto: the fields sent, and
+// not null, replace the stored ones as they are.
+type userDataUpdate struct {
+	Rating                *float64
+	PlaybackPositionTicks *int64
+	PlayCount             *int
+	IsFavorite            *bool
+	Likes                 *bool
+	LastPlayedDate        *Time
+	Played                *bool
+}
+
+// updateUserData replaces what an app sends, without the rules playback
+// follows: apps use it to upload what was played offline. A title it turns
+// played or unplayed is marked so on the user's tracking services, as a
+// played mark is, and a rating it changes is sent as rate sends it.
+func (h *Handler) updateUserData(w http.ResponseWriter, r *http.Request) {
+	if !jsonContent(r.Header.Get("Content-Type")) {
+		unsupportedMediaTypeProblem(w)
+		return
+	}
+	body, err := io.ReadAll(http.MaxBytesReader(w, r.Body, maxBody))
+	if err != nil {
+		processingError(w, http.StatusRequestEntityTooLarge)
+		return
+	}
+	if len(bytes.TrimSpace(body)) == 0 {
+		validationProblem(w, map[string][]string{"": {"A non-empty request body is required."}, "userDataDto": {"The userDataDto field is required."}})
+		return
+	}
+	var update userDataUpdate
+	if err := json.Unmarshal(body, &update); err != nil {
+		validationProblem(w, map[string][]string{"$": {"The JSON value could not be converted."}, "userDataDto": {"The userDataDto field is required."}})
+		return
+	}
+	user, item, ok := h.userDataItem(w, r, bindErrors{})
+	if !ok {
+		return
+	}
+	var turned *bool
+	var was, now *float64
+	if !h.changeEach(w, r, user, item, []library.Item{item}, func(_ userdata.Item, d *userdata.Data) {
+		was = d.Rating
+		played := d.Played
+		defer func() {
+			now = d.Rating
+			if d.Played != played {
+				turned = new(d.Played)
+			}
+		}()
+		if update.PlaybackPositionTicks != nil {
+			d.Position = time.Duration(max(*update.PlaybackPositionTicks, 0)) * 100
+			if d.Runtime <= 0 {
+				// The resume point is measured against the title's runtime
+				// until a version of it is played.
+				d.Runtime = item.Runtime
+			}
+		}
+		if update.PlayCount != nil {
+			d.PlayCount = max(*update.PlayCount, 0)
+		}
+		if update.IsFavorite != nil {
+			d.Favorite = *update.IsFavorite
+		}
+		if update.Likes != nil {
+			d.Like(*update.Likes)
+		}
+		if update.Rating != nil {
+			d.Rating = new(min(max(*update.Rating, 0), 10))
+		}
+		if update.LastPlayedDate != nil {
+			d.LastPlayed = new(time.Time(*update.LastPlayedDate).UTC())
+		}
+		if update.Played != nil {
+			d.Played = *update.Played
+		}
+	}) {
+		return
+	}
+	h.rated(user, item, was, now)
+	if turned == nil || h.Trackers == nil {
+		return
+	}
+	var date *time.Time
+	if *turned && update.LastPlayedDate != nil {
+		date = new(time.Time(*update.LastPlayedDate).UTC())
+	}
+	h.Trackers.Mark(user.ID, trackers.Mark{Played: *turned, Date: date, Scope: markScope(item.Kind), Titles: h.trackedTitles(user, []library.Item{item})})
+}
+
+// playbackEvent is the kind of a playback report.
+type playbackEvent int
+
+const (
+	playbackStarted playbackEvent = iota
+	playbackProgressed
+	playbackStopped
+)
+
+// track applies a playback report to the user's data of the title played,
+// as Jellyfin does: a start counts a play, positions move the resume point
+// or mark the title played, and a stop without a position plays it
+// through. playing is what the device was known to play before the report.
+// Every report, channels' too, goes to the playbacks Mira follows.
+func (h *Handler) track(ctx context.Context, user accounts.User, device accounts.Device, event playbackEvent, state playback.PlayState, positionKnown bool, playing playback.NowPlaying) {
+	deviceID := device.ID
+	id, mediaSource := state.Item, state.MediaSourceID
+	if id == (accounts.ID{}) {
+		id = playing.Item
+	}
+	if mediaSource == "" && playing.Item == id {
+		mediaSource = playing.MediaSourceID
+	}
+	if id == (accounts.ID{}) {
+		return
+	}
+	item, err := h.played(ctx, user, id)
+	if err != nil {
+		if !errors.Is(err, library.ErrNotFound) {
+			h.Logger.Warn("A playback report could not be recorded", "error", err)
+		}
+		return
+	}
+	h.followPlayback(user, device, event, state, positionKnown, playing, item)
+	// Channels, and videos that play live, have no user data, nor a place
+	// in the activity log; nothing is read from their streams for
+	// thumbnails or speech.
+	if item.Kind == library.KindChannel || h.reportedLive(ctx, user, item, mediaSource) {
+		return
+	}
+	// The tracks a report says play may be the user's choice, when they
+	// changed since the last report of the device.
+	if event == playbackStarted || playing.Item != id || !equalIndex(playing.AudioStreamIndex, state.AudioStreamIndex) ||
+		!equalIndex(playing.SubtitleStreamIndex, state.SubtitleStreamIndex) {
+		h.rememberTracks(ctx, user, item, state, mediaSource)
+	}
+	h.recordPlayback(ctx, user, device.DeviceName, event, item)
+	runtime := h.playedRuntime(ctx, user, item, mediaSource, event == playbackStarted || playing.Item != id)
+	// Videos prepare the next episode near the end, make thumbnails and
+	// find their speech, and local episodes without an intro or credits
+	// have them looked for in their season's audio; tracks prepare the next
+	// track as they start, as it comes soon.
+	audio := audioItem(item.Kind)
+	if !audio && event != playbackStopped && (positionKnown || event == playbackStarted) {
+		h.prepareNearTheEnd(user, deviceID, item, runtime, state.Position)
+	}
+	if !audio && event == playbackStarted {
+		h.queueImages(ctx, user, deviceID, item, mediaSource)
+		h.findInAudio(ctx, user, item, mediaSource)
+		h.findSpeech(ctx, user, item, mediaSource)
+	}
+	if audio && event == playbackStarted {
+		h.prepareNextTrack(user, item, state)
+		// A song played is looked up once, so that its lyrics are there
+		// when the app asks, and an addon's measured once, so that its
+		// gain is there the next time it plays.
+		h.lookUpLyrics(item)
+		h.measureLoudness(user, item)
+	}
+	now := time.Now().UTC()
+	settings := h.Accounts.Settings()
+	thresholds := userdata.Thresholds{Resume: settings.ResumePercent, Played: settings.PlayedPercent}
+	_, err = h.UserData.Change(ctx, user.ID, []userdata.Item{stored(item)}, func(d *userdata.Data) {
+		switch {
+		case event == playbackStarted:
+			// Songs keep no resume point; videos and audiobooks do.
+			d.Start(now, !song(item.Kind))
+		case positionKnown && song(item.Kind):
+			d.Reached(d.ReachSong(state.Position, runtime, thresholds), now)
+		case positionKnown && item.Kind == library.KindAudiobook:
+			d.Reached(d.ReachAudiobook(state.Position, runtime), now)
+		case positionKnown:
+			d.Reached(d.Reach(state.Position, runtime, thresholds), now)
+		case event == playbackStopped:
+			d.Finish(now)
+		}
+	})
+	if err != nil {
+		h.Logger.Warn("A playback report could not be recorded", "error", err)
+		return
+	}
+	// Like Jellyfin, apps are not told of every position a player reports:
+	// starts and stops are enough for what they show.
+	if event != playbackProgressed {
+		h.userDataChanged(user, []library.Item{item})
+	}
+	if h.Trackers != nil && (item.Kind == library.KindMovie || item.Kind == library.KindEpisode) {
+		h.Trackers.Playback(user.ID, trackers.Playback{
+			Event:         trackedEvents[event],
+			Device:        deviceID,
+			Item:          item.ID,
+			Position:      state.Position,
+			PositionKnown: positionKnown,
+			Runtime:       runtime,
+			Paused:        state.Paused,
+			// As the change above decides.
+			Played: event == playbackStopped && !positionKnown ||
+				event != playbackStarted && positionKnown && thresholds.Reaches(state.Position, runtime),
+			Title: func(ctx context.Context) (trackers.Title, bool) {
+				titles := h.trackedTitles(user, []library.Item{item})(ctx)
+				if len(titles) == 0 {
+					return trackers.Title{}, false
+				}
+				return titles[0], true
+			},
+		})
+	}
+	// Songs go to the music services, by their artist and title.
+	if h.Trackers != nil && item.Kind == library.KindTrack {
+		if song, ok := trackers.SongOf(item, runtime); ok {
+			h.Trackers.Listen(user.ID, trackers.Listening{
+				Event:         trackedEvents[event],
+				Device:        deviceID,
+				Position:      state.Position,
+				PositionKnown: positionKnown,
+				Paused:        state.Paused,
+				Song:          song,
+			})
+		}
+	}
+}
+
+// playedRuntime is the runtime of the version a report names, as analyzed,
+// or the title's when the report names no version. The report that starts
+// a playback, starts, looks it up, and the playback's other reports reuse
+// it: by the next playback, the same name may stand for another file, as
+// when a local file is replaced at its path, the title's own identifier
+// standing for the version its first media source describes (see
+// firstWorkingVersion).
+func (h *Handler) playedRuntime(ctx context.Context, user accounts.User, item library.Item, mediaSource string, starts bool) time.Duration {
+	id, ok := parseGUID(mediaSource)
+	if !ok {
+		return item.Runtime
+	}
+	key := item.ID.String() + "|" + id.String()
+	if runtime, ok := h.runtimes.Get(key); ok && !starts {
+		return runtime
+	}
+	runtime := item.Runtime
+	wanted := id
+	if id == item.ID && versioned(item.Kind) {
+		wanted = h.firstWorkingVersion(ctx, user, item)
+	}
+	if version, err := h.version(ctx, user, item, wanted); err == nil {
+		if analysis, ok := h.Playback.Analyzed(ctx, version.ID); ok && analysis.Duration > 0 {
+			runtime = analysis.Duration
+		}
+	}
+	h.runtimes.Put(key, runtime)
+	return runtime
+}

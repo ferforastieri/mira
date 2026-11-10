@@ -1,0 +1,82 @@
+package admin
+
+import (
+	"maps"
+	"net/http"
+	"testing"
+)
+
+// The admin API saves the source cache by its preset, which sets its
+// limits, and tells each preset's; a limit set alone, as an older page
+// sets the cache's size, makes the preset custom.
+func TestSourceCachePresetsSetTheCachesLimits(t *testing.T) {
+	t.Parallel()
+	api := newTestAPI(t, 10)
+	administrator := api.signedIn("administrator", true)
+	base := map[string]any{"serverName": "Mira", "quickConnectEnabled": true, "language": "en"}
+	put := func(changes map[string]any) map[string]any {
+		t.Helper()
+		body := maps.Clone(base)
+		maps.Copy(body, changes)
+		status, saved, _ := administrator.call(http.MethodPut, "/settings", body)
+		if status != http.StatusOK {
+			t.Fatalf("saving %v: %d %v", changes, status, saved)
+		}
+		return saved
+	}
+	check := func(when string, body map[string]any, want map[string]any) {
+		t.Helper()
+		for name, value := range want {
+			if body[name] != value {
+				t.Errorf("%s: %s %#v, want %#v", when, name, body[name], value)
+			}
+		}
+	}
+
+	saved := put(map[string]any{"sourceCachePreset": "large", "cacheSizeGb": 5})
+	check("large", saved, map[string]any{"sourceCachePreset": "large", "cacheSizeGb": 250.0, "sourceCacheDays": 60.0,
+		"sourceCacheCreditDays": 7.0, "preloadWholeFiles": true})
+	limits, _ := saved["sourceCachePresetLimits"].(map[string]any)
+	if everyday, _ := limits["everyday"].(map[string]any); everyday["cacheSizeGb"] != 50.0 {
+		t.Errorf("the presets' limits: %v", limits)
+	}
+	if got := api.store.Settings(); got.CacheSizeGB != 250 || got.SourceCacheDays != 60 {
+		t.Errorf("stored: %d GB, %d days", got.CacheSizeGB, got.SourceCacheDays)
+	}
+
+	saved = put(map[string]any{"cacheSizeGb": 300})
+	check("a size alone", saved, map[string]any{"sourceCachePreset": "custom", "cacheSizeGb": 300.0, "sourceCacheDays": 60.0})
+
+	// The preset's own values leave it as it is.
+	put(map[string]any{"sourceCachePreset": "everyday"})
+	saved = put(map[string]any{"cacheSizeGb": 50, "sourceCacheDays": 14})
+	check("the preset's values", saved, map[string]any{"sourceCachePreset": "everyday"})
+}
+
+// The hour the source cache is emptied at is -1, never, by default; a PUT
+// leaving it out keeps it, and one out of 0 to 23 is refused.
+func TestSettingsSourceCacheEmptyHour(t *testing.T) {
+	t.Parallel()
+	api := newTestAPI(t, 10)
+	administrator := api.signedIn("administrator", true)
+	if _, body, _ := administrator.call(http.MethodGet, "/settings", nil); body["sourceCacheEmptyHour"] != -1.0 {
+		t.Errorf("default: %v", body["sourceCacheEmptyHour"])
+	}
+	base := map[string]any{"serverName": "Mira", "quickConnectEnabled": true, "language": "en"}
+	settings := maps.Clone(base)
+	settings["sourceCacheEmptyHour"] = 3
+	if status, body, _ := administrator.call(http.MethodPut, "/settings", settings); status != http.StatusOK || body["sourceCacheEmptyHour"] != 3.0 {
+		t.Fatalf("saving 3: %d %v", status, body)
+	}
+	if status, body, _ := administrator.call(http.MethodPut, "/settings", base); status != http.StatusOK || body["sourceCacheEmptyHour"] != 3.0 {
+		t.Errorf("left out: %d %v", status, body)
+	}
+	settings["sourceCacheEmptyHour"] = 24
+	if status, body, _ := administrator.call(http.MethodPut, "/settings", settings); status != http.StatusBadRequest ||
+		body["error"] != "invalid_source_cache_empty_hour" {
+		t.Errorf("hour 24: %d %v", status, body)
+	}
+	if got := api.store.Settings().SourceCacheEmptyHour; got != 3 {
+		t.Errorf("saved: %d", got)
+	}
+}

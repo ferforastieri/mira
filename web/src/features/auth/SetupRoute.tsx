@@ -1,0 +1,137 @@
+import { useState, type FormEvent } from 'react'
+import { ClockCounterClockwiseIcon, UserPlusIcon } from '@phosphor-icons/react'
+import { useMutation } from '@tanstack/react-query'
+import { queryClient, queryKeys, setup, type Status } from '@/api'
+import { errorMessage } from '@/format'
+import { computer, useServerSystem } from '@/features/sources/LocalFolders'
+import { useI18n } from '@/i18n'
+import { Button, Field, Notice, TextInput } from '@/ui'
+import { AuthFrame, authForm, wideButton } from './AuthFrame'
+import SetupRestore from './SetupRestore'
+
+/**
+ * The first administrator, shown by the session gate at any address until one exists; or, with
+ * "Restore a backup instead", the restore of a backup that brings its administrators back.
+ */
+export default function SetupRoute() {
+  const { t, language } = useI18n()
+  const host = computer(useServerSystem())
+  const [setupCode, setSetupCode] = useState('')
+  const [name, setName] = useState('')
+  const [password, setPassword] = useState('')
+  const [confirmation, setConfirmation] = useState('')
+  const [mismatch, setMismatch] = useState(false)
+  const [restoring, setRestoring] = useState(false)
+
+  const mutation = useMutation({
+    mutationFn: setup,
+    meta: { public: true },
+    onSuccess: (user) => {
+      queryClient.setQueryData(queryKeys.session, user)
+      queryClient.setQueryData<Status>(queryKeys.status, (old) =>
+        old ? { ...old, setupRequired: false } : old,
+      )
+      void queryClient.invalidateQueries({ queryKey: queryKeys.status })
+    },
+  })
+
+  function submit(event: FormEvent<HTMLFormElement>) {
+    event.preventDefault()
+    const mismatched = password !== confirmation
+    setMismatch(mismatched)
+    // The server adopts the interface language for the names it generates.
+    if (!mismatched)
+      mutation.mutate({ setupCode: setupCode.trim(), name: name.trim(), password, language })
+  }
+
+  if (restoring) {
+    return (
+      <AuthFrame title={t.setup.restoreTitle} lede={t.setup.restoreLede}>
+        <Notice className="mb-5">{t.setup.codeHelp[host]}</Notice>
+        <SetupRestore
+          setupCode={setupCode}
+          onSetupCode={setSetupCode}
+          onCancel={() => setRestoring(false)}
+        />
+      </AuthFrame>
+    )
+  }
+
+  return (
+    <AuthFrame title={t.setup.title} lede={t.setup.description}>
+      <Notice className="mb-5">{t.setup.codeHelp[host]}</Notice>
+      <form onSubmit={submit} noValidate className={authForm}>
+        <Field label={t.setup.setupCode} help={t.setup.setupCodeHint}>
+          <TextInput
+            value={setupCode}
+            onValue={setSetupCode}
+            autoComplete="off"
+            autoCapitalize="characters"
+            spellCheck={false}
+            placeholder="XXXX-XXXX"
+            mono
+            autoFocus
+            required
+          />
+        </Field>
+        <Field label={t.setup.name} help={t.common.nameRule}>
+          <TextInput
+            value={name}
+            onValue={setName}
+            autoComplete="username"
+            maxLength={64}
+            required
+          />
+        </Field>
+        <Field label={t.setup.password} help={t.common.passwordRule}>
+          <TextInput
+            type="password"
+            revealable
+            value={password}
+            onValue={setPassword}
+            autoComplete="new-password"
+            required
+          />
+        </Field>
+        <Field
+          label={t.setup.confirmPassword}
+          error={mismatch ? t.common.passwordMismatch : undefined}
+        >
+          <TextInput
+            type="password"
+            revealable
+            value={confirmation}
+            onValue={setConfirmation}
+            autoComplete="new-password"
+            required
+          />
+        </Field>
+        {mutation.isError && (
+          <Notice tone="danger" live>
+            {errorMessage(t, mutation.error)}
+          </Notice>
+        )}
+        <Button
+          type="submit"
+          variant="primary"
+          icon={UserPlusIcon}
+          loading={mutation.isPending}
+          className={wideButton}
+        >
+          {mutation.isPending ? t.setup.submitting : t.setup.submit}
+        </Button>
+        <Button
+          variant="ghost"
+          icon={ClockCounterClockwiseIcon}
+          onClick={() => {
+            mutation.reset()
+            setRestoring(true)
+          }}
+          className="w-full"
+        >
+          {t.setup.restoreInstead}
+        </Button>
+      </form>
+    </AuthFrame>
+  )
+}

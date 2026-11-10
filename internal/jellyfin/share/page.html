@@ -1,0 +1,53 @@
+<!doctype html>
+<html lang="{{.Language}}">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="robots" content="noindex, nofollow">
+<meta name="referrer" content="no-referrer">
+<title>{{if .Title}}{{.Title.Name}} · {{end}}{{.Text.PageTitle}}</title>
+<link rel="icon" href="{{.Assets.Logo}}">
+<link rel="preload" href="/share/assets/figtree-latin-wght-normal.woff2" as="font" type="font/woff2" crossorigin>
+<link rel="stylesheet" href="{{.Assets.Style}}">
+<script src="{{.Assets.Script}}" defer></script>
+</head>
+<body{{if .Title}} class="has-title"{{end}}>
+{{- if .Title}}
+<div class="room" aria-hidden="true"><img alt=""></div>
+{{- end}}
+<main class="share"{{if .Link}} data-link="{{.Link}}"{{end}}{{if .Gone}} data-gone{{end}}{{if .Title}} data-runtime="{{.Title.Seconds}}" data-hls="{{.Assets.Hls}}"{{end}}>
+<header class="top">
+<img class="mark" src="{{.Assets.Logo}}" alt="" width="40" height="40">
+<p class="from">{{.Text.SharedFrom}} <strong>{{.Server}}</strong></p>
+</header>
+{{- if .Title}}
+<div class="player">
+<video id="video" controls playsinline preload="none" poster="" data-backdrop="image/backdrop"></video>
+<div class="start">
+<button id="resume" class="play" type="button" data-label="{{.Text.ResumeAt}}" hidden></button>
+<button id="play" class="play" type="button" data-again="{{.Text.FromStart}}">{{.Text.Play}}</button>
+</div>
+</div>
+<p id="message" class="message" role="status" aria-live="polite" hidden></p>
+<section class="title">
+<img class="poster" src="" data-src="image/primary" alt="" width="200" hidden>
+<div>
+<h1>{{.Title.Name}}</h1>
+{{- if .Title.Subtitle}}
+<p class="subtitle">{{.Title.Subtitle}}</p>
+{{- end}}
+<p class="facts">{{if .Title.Year}}<span>{{.Title.Year}}</span>{{end}}{{if .Title.Minutes}}<span>{{.Title.Minutes}} {{.Text.Minutes}}</span>{{end}}</p>
+{{- if .Title.Overview}}
+<p class="overview">{{.Title.Overview}}</p>
+{{- end}}
+<p class="expires">{{.Text.Expires}} <time datetime="{{.Title.Expires.UTC.Format "2006-01-02T15:04:05Z07:00"}}">{{.Title.Expires.UTC.Format "2006-01-02 15:04 UTC"}}</time></p>
+</div>
+</section>
+{{- else}}
+<h1>{{.Text.NoTitle}}</h1>
+<p class="message">{{.Message}}</p>
+{{- end}}
+</main>
+<script id="share-messages" type="application/json">{{.Messages}}</script>
+</body>
+</html>

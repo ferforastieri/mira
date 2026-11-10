@@ -1,0 +1,249 @@
+package jellyfin
+
+import (
+	"cmp"
+	"context"
+	"errors"
+	"slices"
+	"strconv"
+	"time"
+
+	"github.com/ferforastieri/mira/internal/accounts"
+	"github.com/ferforastieri/mira/internal/hls"
+	"github.com/ferforastieri/mira/internal/library"
+	"github.com/ferforastieri/mira/internal/media"
+	"github.com/ferforastieri/mira/internal/metrics"
+	"github.com/ferforastieri/mira/internal/playback"
+)
+
+// LiveSession is a device playing, as the admin dashboard shows it, or a
+// guest playing through a share link: Shared then, under the sharer's name,
+// with guestApp as its app. A converted download is one too: Download
+// then, its position how far its file has been made, its device empty
+// when its request named none.
+type LiveSession struct {
+	User     accounts.User
+	Device   accounts.Device
+	Shared   bool
+	Download bool
+	// Controllable tells whether the device's app takes commands, such as
+	// stopping or showing a message.
+	Controllable bool
+	// Playing is what the device reported, its position moved on since.
+	Playing playback.NowPlaying
+	// Item is the movie, episode, channel or recording played; Found is
+	// false when it could not be resolved for the user.
+	Item  library.Item
+	Found bool
+	// Source is what the version played holds, when it was analyzed.
+	Source *media.Analysis
+	// Encodings are the remuxes and conversions of the play session: none
+	// when the app reads the file as it is.
+	Encodings []hls.Running
+	// Reasons are why the play session streamed over HLS, Jellyfin's
+	// TranscodeReasons, when known.
+	Reasons []string
+	// Size is what set the size of the video the play session converts,
+	Size *playback.ConversionSize
+	// Qualities are the heights of the qualities of converted video the
+	// play session's master playlist offers, the one chosen then the lower
+	// ones, when it offers several: its encodings' Key.Variant index them.
+	Qualities []int
+	// Switched names the version the play session went on from once its
+	// version's source failed, empty when it did not (see
+	// playback.Service.SwitchedTo): Source describes that one then.
+	Switched string
+	// Sent is the bytes per second Mira sends the app, and Received
+	// those the version's source sends Mira, averaged over
+	// bandwidth.Window (see measure); Redirected tells that the app was
+	// sent to read the source itself, so that none of its bytes pass
+	// through Mira. Origin is where the version is read from.
+	Sent, Received float64
+	Redirected     bool
+	Origin         Origin
+	// version is the version played, when the session's report does not
+	// name it.
+	version accounts.ID
+}
+
+// LiveSessions lists the devices playing, DLNA devices included, the guests
+// through share links, and the converted downloads, the latest started
+// first.
+func (h *Handler) LiveSessions(ctx context.Context) ([]LiveSession, error) {
+	h.endStaleGuests()
+	playing := h.sessions.All()
+	guests := h.guests.all()
+	downloads := h.downloads.all()
+	dlnaPlays := h.dlna.all()
+	if len(playing) == 0 && len(guests) == 0 && len(downloads) == 0 && len(dlnaPlays) == 0 {
+		return []LiveSession{}, nil
+	}
+	encodings := map[string][]hls.Running{}
+	for _, running := range h.Playback.Encodings() {
+		encodings[running.Key.Session] = append(encodings[running.Key.Session], running)
+	}
+	users := map[accounts.ID]accounts.User{}
+	sessions := make([]LiveSession, 0, len(playing)+len(guests)+len(downloads)+len(dlnaPlays))
+	sessions = append(sessions, h.guestSessions(ctx, encodings)...)
+	sessions = append(sessions, h.downloadSessions(ctx, downloads, encodings)...)
+	sessions = append(sessions, h.dlnaSessions(ctx, encodings)...)
+	for deviceID := range playing {
+		now, ok := h.sessions.Playing(deviceID)
+		if !ok {
+			continue
+		}
+		device, err := h.Accounts.Device(ctx, deviceID)
+		if errors.Is(err, accounts.ErrNotFound) {
+			continue
+		}
+		if err != nil {
+			return nil, err
+		}
+		user, ok := users[now.User]
+		if !ok {
+			if user, err = h.Accounts.User(ctx, now.User); errors.Is(err, accounts.ErrNotFound) {
+				continue
+			} else if err != nil {
+				return nil, err
+			}
+			users[now.User] = user
+		}
+		session := LiveSession{User: user, Device: device, Controllable: h.controllable(device), Playing: now,
+			Encodings: encodings[now.PlaySessionID]}
+		if now.PlaySessionID != "" {
+			session.Reasons, _ = h.reasons.Get(now.PlaySessionID)
+			if size, ok := h.sizes.Get(now.PlaySessionID); ok {
+				session.Size = &size
+			}
+			session.Qualities, _ = h.qualities.Get(now.PlaySessionID)
+		}
+		if item, err := h.played(ctx, user, now.Item); err == nil {
+			session.Item, session.Found = item, true
+		}
+		// The version played, which a title's own identifier, reported as
+		// the media source of its first version, does not name; the one
+		// the play went on from once that one failed.
+		if version, ok := h.playedVersion(deviceID, now); ok {
+			if switched, ok := h.Playback.SwitchedTo(now.PlaySessionID); ok && now.PlaySessionID != "" {
+				version, session.Switched = switched.ID, switched.Name
+			}
+			session.version = version
+			if analysis, ok := h.Playback.Analyzed(ctx, version); ok {
+				session.Source = &analysis
+			}
+		}
+		sessions = append(sessions, session)
+	}
+	for i := range sessions {
+		h.measure(ctx, &sessions[i])
+	}
+	slices.SortFunc(sessions, func(a, b LiveSession) int {
+		return cmp.Or(b.Playing.Started.Compare(a.Playing.Started), cmp.Compare(a.Device.ID.String(), b.Device.ID.String()))
+	})
+	return sessions, nil
+}
+
+// The kinds of title and the deliveries the metrics count playbacks by
+// (see PlaybackCounts).
+var (
+	playbackKinds      = []string{"video", "live_tv", "music", "audiobook"}
+	playbackDeliveries = []string{"direct_play", "remux", "conversion"}
+)
+
+// PlaybackCounts counts the playbacks under way for the metrics, by kind
+// of title, video, live_tv, music or audiobook, and by delivery:
+// direct_play when the app reads the file as it is, remux when Mira
+// streams it copying its tracks, conversion when it converts the video
+// or the audio. Every pair is told, zero when nothing plays so.
+func (h *Handler) PlaybackCounts(ctx context.Context) ([]metrics.Sample, error) {
+	sessions, err := h.LiveSessions(ctx)
+	if err != nil {
+		return nil, err
+	}
+	counts := map[[2]string]float64{}
+	for _, s := range sessions {
+		counts[[2]string{playbackKind(s.Item.Kind), s.delivery()}]++
+	}
+	samples := make([]metrics.Sample, 0, len(playbackKinds)*len(playbackDeliveries))
+	for _, kind := range playbackKinds {
+		for _, delivery := range playbackDeliveries {
+			samples = append(samples, metrics.Sample{Labels: []string{kind, delivery}, Value: counts[[2]string{kind, delivery}]})
+		}
+	}
+	return samples, nil
+}
+
+// playbackKind is the kind of title the metrics count a playback of an
+// item of kind as: video for movies, episodes, videos, recordings and
+// replays, and for items not found.
+func playbackKind(kind library.Kind) string {
+	switch kind {
+	case library.KindChannel, library.KindProgram:
+		return "live_tv"
+	case library.KindTrack:
+		return "music"
+	case library.KindAudiobook:
+		return "audiobook"
+	}
+	return "video"
+}
+
+// delivery is how the session plays, as the metrics count it: its
+// encodings tell best, one converting over one copying, as an app
+// switching audio track runs both a moment; else what the app reported.
+func (s LiveSession) delivery() string {
+	delivery := ""
+	for _, running := range s.Encodings {
+		switch {
+		case !running.Opened:
+		case running.Video != nil || running.AudioCodec != "":
+			return "conversion"
+		default:
+			delivery = "remux"
+		}
+	}
+	if delivery != "" {
+		return delivery
+	}
+	switch s.Playing.PlayMethod {
+	case "DirectPlay":
+		return "direct_play"
+	case "DirectStream":
+		return "remux"
+	}
+	return "conversion"
+}
+
+// ErrNotControllable reports a session whose app takes no commands: it
+// keeps no socket open, or did not declare media control.
+var ErrNotControllable = errors.New("the app takes no commands")
+
+// StopPlayback asks the app of session to stop playing, as Jellyfin's
+// remote control does, on behalf of by.
+func (h *Handler) StopPlayback(ctx context.Context, by accounts.User, session accounts.ID) error {
+	return h.sent(h.deliver(ctx, by, session, "Playstate", PlaystateRequest{Command: "Stop", ControllingUserId: by.ID.String()}))
+}
+
+// SendMessage has the app of session show a message, with an optional
+// header, for timeout or until it is dismissed when timeout is 0, on
+// behalf of by.
+func (h *Handler) SendMessage(ctx context.Context, by accounts.User, session accounts.ID, header, text string, timeout time.Duration) error {
+	arguments := map[string]string{"Text": text}
+	if header != "" {
+		arguments["Header"] = header
+	}
+	if timeout > 0 {
+		arguments["TimeoutMs"] = strconv.FormatInt(timeout.Milliseconds(), 10)
+	}
+	return h.sent(h.deliver(ctx, by, session, "GeneralCommand",
+		GeneralCommand{Name: "DisplayMessage", ControllingUserId: by.ID.String(), Arguments: arguments}))
+}
+
+// sent turns deliver's answer into an error, ErrNotControllable for a
+// command no app could take.
+func (h *Handler) sent(delivered bool, err error) error {
+	if err == nil && !delivered {
+		return ErrNotControllable
+	}
+	return err
+}

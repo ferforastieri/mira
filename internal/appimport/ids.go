@@ -1,0 +1,84 @@
+package appimport
+
+import (
+	"cmp"
+	"regexp"
+	"strconv"
+	"strings"
+
+	"github.com/ferforastieri/mira/internal/anime"
+	"github.com/ferforastieri/mira/internal/library"
+)
+
+var imdbID = regexp.MustCompile(`^tt\d+$`)
+
+// TitleRef names the title that an app built on Stremio addons names by
+// id, the identifier of a movie or series as metadata addons give it, and
+// for an episode its season and episode numbers (episode zero names the
+// title itself). Apps name titles by IMDb ("tt…"), TMDB ("tmdb:…") and
+// anime ("kitsu:…", "mal:…", "anidb:…") identifiers, the last found
+// through the anime mapping, and as anime catalogs list the entry; an
+// episode of an anime entry is numbered in the entry. It reports false
+// for other identifiers: the entry is then unmatched (see Identified).
+func TitleRef(mapping *anime.Service, id string, movie bool, season, episode int) (library.TitleRef, bool) {
+	ref := library.TitleRef{Episode: !movie && episode > 0, Series: !movie && episode <= 0}
+	if ref.Episode {
+		ref.Season, ref.Number = season, episode
+	}
+	if imdbID.MatchString(id) {
+		ref.IMDb = id
+		return ref, true
+	}
+	if tmdb, ok := strings.CutPrefix(id, "tmdb:"); ok {
+		number, err := strconv.Atoi(tmdb)
+		if err != nil || number <= 0 {
+			return library.TitleRef{}, false
+		}
+		ref.TMDB = number
+		return ref, true
+	}
+	source, entry, _, ok := anime.StremioID(id)
+	if !ok {
+		return library.TitleRef{}, false
+	}
+	return animeRef(mapping, source, entry, movie, episode), true
+}
+
+// animeRef names the anime entry source identifies as entry, or its
+// episode number when not zero: by the identifiers and numbering of
+// Mira's titles that the mapping gives, when it knows the entry, and
+// as anime catalogs list it, by its identifier and those the mapping
+// completes.
+func animeRef(mapping *anime.Service, source anime.Source, entry int, movie bool, episode int) library.TitleRef {
+	ref := library.TitleRef{Episode: !movie && episode > 0, Series: !movie && episode <= 0}
+	if mapped, ok := mapping.Title(source, entry, false, episode, movie); ok {
+		switch {
+		case mapped.Movie:
+			ref = library.TitleRef{IMDb: mapped.IMDb, TMDB: mapped.TMDB}
+		case ref.Episode:
+			ref = library.TitleRef{Episode: true, IMDb: mapped.IMDb, TVDB: mapped.TVDB, Season: mapped.Season, Number: mapped.Number,
+				Absolute: mapped.Absolute}
+		default:
+			ref = library.TitleRef{Series: true, IMDb: mapped.IMDb, TVDB: mapped.TVDB}
+		}
+	}
+	var listed library.AnimeRef
+	switch source {
+	case anime.Kitsu:
+		listed.Kitsu = entry
+	case anime.MyAnimeList:
+		listed.MyAnimeList = entry
+	case anime.AniDB:
+		listed.AniDB = entry
+	}
+	if found := mapping.IDs(source, strconv.Itoa(entry)); len(found) > 0 {
+		listed.Kitsu = cmp.Or(listed.Kitsu, found[0].Kitsu)
+		listed.MyAnimeList = cmp.Or(listed.MyAnimeList, found[0].MyAnimeList)
+		listed.AniDB = cmp.Or(listed.AniDB, found[0].AniDB)
+	}
+	if ref.Episode {
+		listed.Episode = episode
+	}
+	ref.Anime = listed
+	return ref
+}

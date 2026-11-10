@@ -1,0 +1,610 @@
+// Package trackers sends what each Mira user watches and listens to to
+// the tracking services they connect to their account: Trakt, Simkl and
+// MDBList, which follow playback as it happens (scrobbling) and keep a
+// watch history, PublicMetaDB, which keeps resume points and a watch
+// history, and AniList and MyAnimeList, which keep lists of anime with the
+// progress made in each (see animelists.go). Only movies and episodes
+// known by an IMDb, TMDB or TVDB identifier are sent to them, episodes by
+// their series' identifiers and their numbers; anime that addons name by
+// their Kitsu, MyAnimeList or AniDB identifier are sent by those the anime
+// mapping gives (see anime.go). The songs of music addons go to the music
+// services only, Last.fm and ListenBrainz (see music.go), by their artist
+// and title.
+//
+// Nothing is sent while a request is answered: playback reports and played
+// marks are queued and sent in the background, one user and service at a
+// time, at the pace each service allows. Changes to the history and resume
+// points, and scrobbled songs, are kept in the database until the service
+// accepts them or they are too old to matter; the start and pause of
+// playback, and the song playing now, are sent once, as they mean nothing
+// late.
+package trackers
+
+import (
+	"cmp"
+	"context"
+	"errors"
+	"log/slog"
+	"net/http"
+	"regexp"
+	"strconv"
+	"sync"
+	"time"
+
+	"github.com/jackc/pgx/v5/pgxpool"
+
+	"github.com/ferforastieri/mira/internal/accounts"
+	"github.com/ferforastieri/mira/internal/anime"
+	"github.com/ferforastieri/mira/internal/importlinks"
+	"github.com/ferforastieri/mira/internal/secrets"
+	"github.com/ferforastieri/mira/internal/userdata"
+	"github.com/ferforastieri/mira/internal/watchlist"
+)
+
+// The services, by the names the admin API gives them.
+const (
+	Trakt        = "trakt"
+	Simkl        = "simkl"
+	MDBList      = "mdblist"
+	PublicMetaDB = "publicmetadb"
+	AniList      = "anilist"
+	MyAnimeList  = "myanimelist"
+	LastFM       = "lastfm"
+	ListenBrainz = "listenbrainz"
+)
+
+// Services lists the services in the order the admin app shows them.
+var Services = []string{Trakt, Simkl, MDBList, PublicMetaDB, AniList, MyAnimeList, LastFM, ListenBrainz}
+
+// publicURLs are the base URLs of the services' APIs.
+var publicURLs = map[string]string{
+	Trakt:        "https://api.trakt.tv",
+	Simkl:        "https://api.simkl.com",
+	MDBList:      "https://api.mdblist.com",
+	PublicMetaDB: "https://publicmetadb.com",
+	AniList:      "https://graphql.anilist.co",
+	MyAnimeList:  "https://api.myanimelist.net/v2",
+	LastFM:       "https://ws.audioscrobbler.com/2.0/",
+	ListenBrainz: "https://api.listenbrainz.org",
+}
+
+// authURLs are the base URLs of the OAuth pages and endpoints of Trakt and
+// of the services whose users paste a code. Trakt's OAuth endpoints are
+// base + "/oauth/...", apart from its API (see traktAuth). For AniList and
+// MyAnimeList, the page users allow Mira on is base + "/authorize",
+// and tokens are asked of base + "/token".
+var authURLs = map[string]string{
+	Trakt:       "https://auth.trakt.tv",
+	AniList:     "https://anilist.co/api/v2/oauth",
+	MyAnimeList: "https://myanimelist.net/v1/oauth2",
+}
+
+// ByCode reports whether users connect service by entering a code on its
+// site (Trakt, Simkl) rather than by pasting their API key.
+func ByCode(service string) bool {
+	return service == Trakt || service == Simkl
+}
+
+// BySignIn reports whether users connect service by signing in on its site
+// and allowing Mira there (Last.fm).
+func BySignIn(service string) bool {
+	return service == LastFM
+}
+
+// ByPaste reports whether users connect service by allowing Mira on its
+// site, then pasting in Mira the code it shows (AniList) or the address
+// it sent their browser to (MyAnimeList).
+func ByPaste(service string) bool {
+	return service == AniList || service == MyAnimeList
+}
+
+// ByKey reports whether users connect service by pasting their API key or
+// user token (MDBList, PublicMetaDB, ListenBrainz), which they may read
+// again.
+func ByKey(service string) bool {
+	return known(service) && !ByCode(service) && !BySignIn(service) && !ByPaste(service)
+}
+
+// animeLists reports whether service keeps lists of anime with the
+// progress made in each, rather than a history of what was watched.
+func animeLists(service string) bool {
+	return service == AniList || service == MyAnimeList
+}
+
+// refreshes reports whether service's tokens expire and are refreshed with
+// a refresh token. AniList's last a year and cannot be.
+func refreshes(service string) bool {
+	return ByCode(service) || service == MyAnimeList
+}
+
+// Music reports whether service is told the songs users play, rather than
+// the movies and episodes they watch.
+func Music(service string) bool {
+	return service == LastFM || service == ListenBrainz
+}
+
+// scrobbles reports whether service follows the playback of movies and
+// episodes as it happens.
+func scrobbles(service string) bool {
+	return service != PublicMetaDB && !animeLists(service) && !Music(service)
+}
+
+// numbersByTMDB reports whether service numbers the episodes of a series
+// as TMDB does, which may differ from the numbers the addon gives them.
+func numbersByTMDB(service string) bool {
+	return service == PublicMetaDB || service == Trakt || service == MDBList
+}
+
+// tmdbNumbered returns titles as a service numbering episodes as TMDB does
+// takes them: the episodes TMDB numbers differently get TMDB's season and
+// number, and those not surely among TMDB's are left out. The
+// titles returned hold no TMDB numbers; titles itself is left as it is.
+func tmdbNumbered(titles []Title) []Title {
+	numbered := make([]Title, 0, len(titles))
+	for _, title := range titles {
+		switch {
+		case title.TMDBNumber < 0:
+			continue
+		case title.TMDBNumber > 0:
+			title.Season, title.Number = title.TMDBSeason, title.TMDBNumber
+		}
+		title.TMDBSeason, title.TMDBNumber = 0, 0
+		numbered = append(numbered, title)
+	}
+	return numbered
+}
+
+// imports reports whether Mira reads the watch history of service.
+func imports(service string) bool {
+	return known(service) && !Music(service)
+}
+
+// watchlists reports whether Mira reads the watchlist of service: Trakt's
+// watchlist, Simkl's, AniList's and MyAnimeList's Plan to Watch.
+func watchlists(service string) bool {
+	return service == Trakt || service == Simkl || animeLists(service)
+}
+
+// known reports whether service is one of Services.
+func known(service string) bool {
+	_, ok := publicURLs[service]
+	return ok
+}
+
+// Available reports whether users can connect service with settings: a
+// code or sign-in service needs the app an administrator registered with
+// it.
+func Available(service string, settings accounts.Settings) bool {
+	switch service {
+	case Trakt:
+		return settings.TraktAvailable()
+	case Simkl:
+		return settings.SimklAvailable()
+	case LastFM:
+		return settings.LastFMAvailable()
+	case AniList:
+		return settings.AniListAvailable()
+	case MyAnimeList:
+		return settings.MyAnimeListAvailable()
+	}
+	return true
+}
+
+// The problems a connection can have.
+const (
+	// ProblemReconnect: the service refused the token or key, and nothing
+	// is sent until the user connects again.
+	ProblemReconnect = "reconnect"
+	// ProblemUnreachable: recent sends failed and are being retried.
+	ProblemUnreachable = "unreachable"
+	// ProblemAppRefused: the service refused the app an administrator
+	// registered with it while the user was connecting, until the user
+	// tries again or the app's settings change.
+	ProblemAppRefused = "app_refused"
+)
+
+var (
+	// ErrUnknownService reports a service that is not one of Services, or
+	// that is not connected the way asked.
+	ErrUnknownService = errors.New("unknown tracking service")
+	// ErrNotAvailable reports a code service whose app the settings lack.
+	ErrNotAvailable = errors.New("tracking service not available")
+	// ErrInvalidKey reports an API key the service refused, or a malformed
+	// one.
+	ErrInvalidKey = errors.New("invalid API key")
+	// ErrUnreachable reports a service that could not be asked.
+	ErrUnreachable = errors.New("tracking service unreachable")
+	// ErrAppRefused reports a code service that refused the app the
+	// settings name: a wrong client ID or secret.
+	ErrAppRefused = errors.New("tracking service refused the server's app")
+)
+
+// Options are the dependencies of the service.
+type Options struct {
+	DB *pgxpool.Pool
+	// Watchlist keeps the watchlists the imports read, and makes their
+	// entries; nil keeps them in DB without making entries.
+	Watchlist *watchlist.Store
+	// Settings returns the server's settings, which hold the apps
+	// registered with Trakt and Simkl.
+	Settings func() accounts.Settings
+	// Secrets seals the tokens and API keys of the connections in the
+	// database, and opens them; nil stores them as they are.
+	Secrets *secrets.Box
+	// Version is Mira's, which the services are told.
+	Version string
+	Logger  *slog.Logger
+	// URLs replaces the base URLs of the services' APIs, by service name.
+	// Tests point them at fakes; the public APIs are used otherwise.
+	URLs map[string]string
+	// Titles finds the items of the titles an imported watch history
+	// names, and UserData keeps what imports add to the users' data;
+	// without both, nothing is imported.
+	Titles   Titles
+	UserData *userdata.Store
+	// Links keeps the titles the imports did not find, and applies the
+	// links users made of them (see package importlinks); nil keeps none.
+	Links *importlinks.Store
+	// Anime maps anime between identifiers and numberings: Simkl's anime
+	// history, the titles anime addons name, and what AniList and
+	// MyAnimeList list, are found and sent by it. Nil leaves them out.
+	Anime *anime.Service
+	// Stopped is told once each time a service refuses a user's token or
+	// key, or AniList's token expires, as the connection moves to Connect
+	// again; nil tells no one.
+	Stopped func(user accounts.ID, service string)
+	// AuthURLs replaces the base URLs of the services' OAuth pages and
+	// endpoints, as URLs does their APIs'.
+	AuthURLs map[string]string
+}
+
+// timing is how long the service waits for what. Tests shorten it.
+type timing struct {
+	// gaps are the least time between two requests for one user to a
+	// service: Trakt and Simkl take one write a second.
+	gaps map[string]time.Duration
+	// sharedGaps space every request to a service whose limit counts the
+	// server's address rather than each user: PublicMetaDB takes 300
+	// requests every 10 seconds, Last.fm about 5 a second, AniList 90 a
+	// minute.
+	sharedGaps map[string]time.Duration
+	// retryFirst is the first wait after a failed send, doubling up to
+	// retryMax; giveUp is how old a change gets before it is dropped.
+	retryFirst, retryMax, giveUp time.Duration
+	// unreachableAfter is how many sends in a row fail before the
+	// connection shows the service as unreachable.
+	unreachableAfter int
+	// stale is how old a start or pause gets before it is not worth
+	// sending.
+	stale time.Duration
+	// refreshAhead is how long before it expires a token is refreshed;
+	// tokens are checked every refreshEvery.
+	refreshAhead, refreshEvery time.Duration
+	// watchedWindow is how near the time a service counted a title
+	// watched a played mark of it counts as the same viewing.
+	watchedWindow time.Duration
+	// pollUnit is the unit of the intervals the services poll codes at,
+	// a second.
+	pollUnit time.Duration
+	// signInTime is how long Mira waits for a user to allow it on
+	// Last.fm, asking every signInPoll pollUnits.
+	signInTime time.Duration
+	signInPoll int
+	// request bounds each request.
+	request time.Duration
+	// importCheck is how often the imports of watch histories due are
+	// looked for: often enough for the shortest interval the settings
+	// offer (see accounts.Settings.ImportEveryMinutes).
+	importCheck time.Duration
+	// importGaps are the least time between two requests of an import to
+	// a service, which reads at most for importMaxWait when the service
+	// asks it to wait; it tries a failed request importRetries times more.
+	importGaps    map[string]time.Duration
+	importMaxWait time.Duration
+	importRetries int
+	// recommendationsEvery is how often Trakt's recommendations are read
+	// again, recommendationsRetry how soon after a failed read, and
+	// recommendationsAsked how lately a row must have asked for them for
+	// the hourly check to read them (see recommendations.go).
+	recommendationsEvery, recommendationsRetry, recommendationsAsked time.Duration
+}
+
+var defaultTiming = timing{
+	gaps:             map[string]time.Duration{Trakt: time.Second, Simkl: time.Second, MDBList: 250 * time.Millisecond, ListenBrainz: 250 * time.Millisecond, MyAnimeList: time.Second},
+	sharedGaps:       map[string]time.Duration{PublicMetaDB: 40 * time.Millisecond, LastFM: 250 * time.Millisecond, AniList: time.Second},
+	retryFirst:       30 * time.Second,
+	retryMax:         30 * time.Minute,
+	giveUp:           48 * time.Hour,
+	unreachableAfter: 3,
+	stale:            2 * time.Minute,
+	refreshAhead:     24 * time.Hour,
+	refreshEvery:     time.Hour,
+	watchedWindow:    6 * time.Hour,
+	pollUnit:         time.Second,
+	signInTime:       15 * time.Minute,
+	signInPoll:       5,
+	request:          15 * time.Second,
+	importCheck:      time.Minute,
+	// Trakt reads 1,000 pages (500 per its latest docs) every 5 minutes,
+	// Simkl 10 a second, MDBList counts a daily allowance; AniList's
+	// requests are spaced by its shared pace.
+	importGaps:    map[string]time.Duration{Trakt: time.Second, Simkl: 500 * time.Millisecond, MDBList: 500 * time.Millisecond, MyAnimeList: time.Second},
+	importMaxWait: 15 * time.Minute,
+	importRetries: 3,
+
+	recommendationsEvery: 12 * time.Hour,
+	recommendationsRetry: time.Hour,
+	recommendationsAsked: 7 * 24 * time.Hour,
+}
+
+// maxIntake bounds the reports and marks waiting to be looked at for one
+// user: past it, new ones are dropped.
+const maxIntake = 256
+
+// Service connects users' accounts and sends what they watch.
+type Service struct {
+	db        *pgxpool.Pool
+	settings  func() accounts.Settings
+	box       *secrets.Box
+	version   string
+	logger    *slog.Logger
+	urls      map[string]string
+	authURLs  map[string]string
+	client    *http.Client
+	now       func() time.Time
+	timing    timing
+	ctx       context.Context
+	cancel    context.CancelFunc
+	wg        sync.WaitGroup
+	refreshes refreshLocks
+
+	mu     sync.Mutex
+	closed bool
+	// pending are the code connections waiting for users.
+	pending map[laneKey]*pending
+	// refusedApps are the users whose code the service ended by refusing
+	// the server's app, with the app's credentials it refused.
+	refusedApps map[laneKey]string
+	// intakes are the reports and marks waiting to be looked at, by user.
+	intakes map[accounts.ID]*intake
+	// sessions are the playbacks of movies and episodes under way, and
+	// listens those of songs, by user and device.
+	sessions map[sessionKey]*session
+	listens  map[sessionKey]*listen
+	// lanes are what waits to be sent, by user and service.
+	lanes map[laneKey]*lane
+	seq   int64
+	// paces space every request to the services of sharedGaps.
+	paces map[string]*pace
+
+	titles   Titles
+	userData *userdata.Store
+	// importing are the imports running, by user and service.
+	importing map[laneKey]*importRun
+	// recommending are the reads of Trakt's recommendations running, by
+	// user (see recommendations.go).
+	recommending map[laneKey]bool
+	// publicMetaDBIMDb caches the IMDb identifiers PublicMetaDB maps TMDB
+	// identifiers to, as decided (see mapPublicMetaDB).
+	publicMetaDBIMDb map[string]imdbDecision
+	// anime maps anime between identifiers and numberings.
+	anime *anime.Service
+	// stopped is told as a connection stops (see Options.Stopped).
+	stopped func(user accounts.ID, service string)
+	// watchlist keeps the watchlists the imports read.
+	watchlist *watchlist.Store
+	// links keeps the titles the imports do not find and applies the
+	// links made of them; nil keeps none.
+	links *importlinks.Store
+}
+
+// New returns a service keeping connections and queued changes in the
+// database of options. Run sends what an earlier run left.
+func New(options Options) *Service {
+	ctx, cancel := context.WithCancel(context.Background())
+	urls := make(map[string]string, len(publicURLs))
+	for service, base := range publicURLs {
+		urls[service] = base
+		if replaced, ok := options.URLs[service]; ok {
+			urls[service] = replaced
+		}
+	}
+	auth := make(map[string]string, len(authURLs))
+	for service, base := range authURLs {
+		auth[service] = base
+		if replaced, ok := options.AuthURLs[service]; ok {
+			auth[service] = replaced
+		}
+	}
+	return &Service{
+		db:          options.DB,
+		settings:    options.Settings,
+		box:         options.Secrets,
+		version:     options.Version,
+		logger:      options.Logger,
+		authURLs:    auth,
+		urls:        urls,
+		client:      &http.Client{},
+		now:         time.Now,
+		timing:      defaultTiming,
+		ctx:         ctx,
+		cancel:      cancel,
+		pending:     map[laneKey]*pending{},
+		refusedApps: map[laneKey]string{},
+		intakes:     map[accounts.ID]*intake{},
+		sessions:    map[sessionKey]*session{},
+		listens:     map[sessionKey]*listen{},
+		paces:       map[string]*pace{PublicMetaDB: {}, LastFM: {}, AniList: {}},
+		lanes:       map[laneKey]*lane{},
+		titles:      options.Titles,
+		userData:    options.UserData,
+		importing:   map[laneKey]*importRun{},
+
+		recommending: map[laneKey]bool{},
+
+		publicMetaDBIMDb: map[string]imdbDecision{},
+		anime:            options.Anime,
+		stopped:          options.Stopped,
+		watchlist:        cmp.Or(options.Watchlist, watchlist.New(options.DB)),
+		links:            options.Links,
+	}
+}
+
+// Run sends the changes an earlier run left queued, keeps tokens fresh,
+// imports watch histories and reads Trakt's recommendations again when
+// due until ctx ends, then stops sending and waits for the sends under
+// way.
+func (s *Service) Run(ctx context.Context) {
+	s.resumeQueued()
+	s.importDue()
+	s.recommendationsDue()
+	ticker := time.NewTicker(s.timing.refreshEvery)
+	defer ticker.Stop()
+	imports := time.NewTicker(s.timing.importCheck)
+	defer imports.Stop()
+	for {
+		select {
+		case <-ctx.Done():
+			s.Close()
+			return
+		case <-ticker.C:
+			s.refreshDue()
+			s.recommendationsDue()
+		case <-imports.C:
+			s.importDue()
+		}
+	}
+}
+
+// Close stops sending and waits for the sends under way. What was not sent
+// stays queued for the next run.
+func (s *Service) Close() {
+	s.mu.Lock()
+	s.closed = true
+	s.mu.Unlock()
+	s.cancel()
+	s.wg.Wait()
+}
+
+// spawn runs f on a goroutine Close waits for, unless the service is
+// closed. It is called with s.mu held.
+func (s *Service) spawn(f func()) bool {
+	if s.closed {
+		return false
+	}
+	s.wg.Add(1)
+	go func() {
+		defer s.wg.Done()
+		f()
+	}()
+	return true
+}
+
+// sleep waits for d, and reports false if the service stopped first.
+func (s *Service) sleep(d time.Duration) bool {
+	if d <= 0 {
+		return s.ctx.Err() == nil
+	}
+	timer := time.NewTimer(d)
+	defer timer.Stop()
+	select {
+	case <-s.ctx.Done():
+		return false
+	case <-timer.C:
+		return true
+	}
+}
+
+// Title identifies a movie, a series or an episode to the services.
+type Title struct {
+	// Item is the movie's, series' or episode's identifier in Mira.
+	Item accounts.ID `json:"item"`
+	// IMDb ("tt…"), TMDB and TVDB identify the movie, or the series of an
+	// episode; any may be missing, but not all, unless Anime names the
+	// entry. Movies have no TVDB identifier.
+	IMDb string `json:"imdb,omitempty"`
+	TMDB int    `json:"tmdb,omitempty"`
+	TVDB int    `json:"tvdb,omitempty"`
+	// Episode is set for an episode, numbered Number in season Season,
+	// and Absolute in its series' absolute numbering, 0 when unknown.
+	Episode  bool `json:"episode,omitempty"`
+	Season   int  `json:"season,omitempty"`
+	Number   int  `json:"number,omitempty"`
+	Absolute int  `json:"absolute,omitempty"`
+	// TMDBSeason and TMDBNumber are how TMDB numbers the episode, for the
+	// services numbering episodes as TMDB does: TMDBNumber is 0 when TMDB
+	// numbers it Number in season Season too, -1 when it is not surely
+	// among TMDB's episodes, which those services are then not sent, and
+	// otherwise TMDB's number, in season TMDBSeason.
+	TMDBSeason int `json:"tmdbSeason,omitempty"`
+	TMDBNumber int `json:"tmdbNumber,omitempty"`
+	// Series is set for a series, which only ratings name.
+	Series bool `json:"series,omitempty"`
+	// Anime names the entry, and its episode, an anime addon gives the
+	// title by; nil for other titles.
+	Anime *AnimeID `json:"anime,omitempty"`
+}
+
+// AnimeID is an anime entry as an anime addon names it ("kitsu:<id>:<n>"):
+// by its Kitsu, MyAnimeList or AniDB identifier, and its episode, 0 for
+// the entry.
+type AnimeID struct {
+	Source  anime.Source `json:"source"`
+	ID      int          `json:"id"`
+	Episode int          `json:"episode,omitempty"`
+}
+
+// Identified reports whether t has an identifier the services other than
+// AniList and MyAnimeList take.
+func (t Title) Identified() bool {
+	return t.IMDb != "" || t.TMDB != 0 || t.TVDB != 0
+}
+
+// SetTMDBNumbers sets how TMDB numbers the episode t is, from TMDB's
+// season and number for it, ok false when it is not surely among TMDB's
+// episodes. Titles other than episodes are left as they are.
+func (t *Title) SetTMDBNumbers(season, number int, ok bool) {
+	if !t.Episode {
+		return
+	}
+	switch {
+	case !ok:
+		t.TMDBSeason, t.TMDBNumber = 0, -1
+	case season != t.Season || number != t.Number:
+		t.TMDBSeason, t.TMDBNumber = season, number
+	default:
+		t.TMDBSeason, t.TMDBNumber = 0, 0
+	}
+}
+
+var imdbPattern = regexp.MustCompile(`^tt\d+$`)
+
+// providerIDs reads the identifiers of providers, named as Jellyfin names
+// them, and reports whether any is usable.
+func (t *Title) providerIDs(providers map[string]string, tvdb bool) bool {
+	if imdbPattern.MatchString(providers["Imdb"]) {
+		t.IMDb = providers["Imdb"]
+	}
+	if id, err := strconv.Atoi(providers["Tmdb"]); err == nil && id > 0 {
+		t.TMDB = id
+	}
+	if id, err := strconv.Atoi(providers["Tvdb"]); err == nil && id > 0 && tvdb {
+		t.TVDB = id
+	}
+	return t.IMDb != "" || t.TMDB != 0 || t.TVDB != 0
+}
+
+// Movie identifies the movie item by its providers' identifiers (Imdb,
+// Tmdb), and reports false when it has none.
+func Movie(item accounts.ID, providers map[string]string) (Title, bool) {
+	title := Title{Item: item}
+	return title, title.providerIDs(providers, false)
+}
+
+// Episode identifies the episode item by its series' providers'
+// identifiers (Imdb, Tmdb, Tvdb) and its numbers, and reports false when
+// the series has none or the episode is not numbered.
+func Episode(item accounts.ID, series map[string]string, season, number int) (Title, bool) {
+	title := Title{Item: item, Episode: true, Season: season, Number: number}
+	return title, title.providerIDs(series, true) && season >= 0 && number > 0
+}

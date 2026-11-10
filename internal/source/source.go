@@ -1,0 +1,1657 @@
+// Package source reads remote files the way FFmpeg needs them: in blocks
+// fetched with range requests, over one connection per file or a few when
+// its host allows, kept in a bounded disk cache, and through a fresh link
+// when the old one expires.
+package source
+
+import (
+	"cmp"
+	"context"
+	"errors"
+	"fmt"
+	"io"
+	"io/fs"
+	"log/slog"
+	"math"
+	"net/http"
+	"net/url"
+	"os"
+	"path/filepath"
+	"slices"
+	"strconv"
+	"strings"
+	"sync"
+	"sync/atomic"
+	"time"
+
+	"github.com/ferforastieri/mira/internal/accounts"
+	"github.com/ferforastieri/mira/internal/bandwidth"
+	"github.com/ferforastieri/mira/internal/diskspace"
+)
+
+const (
+	blockSize = 1 << 20
+	// skipLimit is how many blocks a connection reads through to reach a
+	// block ahead of it, rather than opening a new connection.
+	skipLimit = 8
+	// attempts bounds the tries to reach a source before readers get an
+	// error, and slowTries those to reach one asking to slow down (429,
+	// 503): a host's burst passes within seconds.
+	attempts  = 4
+	slowTries = 5
+	// cooldown is how long a failure is reported to new readers before the
+	// source is tried again, and slowCooldown how long one asking to slow
+	// down past every try is.
+	cooldown     = 30 * time.Second
+	slowCooldown = 5 * time.Second
+	// maxWait bounds how long a source asking to come back later
+	// (Retry-After) is waited for, and maxBackoff the growing delay
+	// between tries otherwise: 0.5 s, 1 s, then 2 s.
+	maxWait    = 5 * time.Second
+	maxBackoff = 2 * time.Second
+	// sizeTolerance is how far, as a share of it, the size an addon
+	// announces may be from the file's: some addons' are a little off.
+	sizeTolerance = 0.01
+	// fetchInterval spaces the requests of Fetch and FetchRanges to a
+	// source: hosts answer 429 to bursts of them, then refuse every file
+	// of the account for minutes.
+	fetchInterval = time.Second / 8
+	// An attempt of Fetch or FetchRanges may take attemptTime, plus the
+	// time the bytes asked take at attemptRate bytes a second: the client
+	// sending them waits for headers without a deadline.
+	attemptTime = 30 * time.Second
+	attemptRate = 256 << 10
+)
+
+// ErrUnavailable reports a source that did not answer with its content.
+var ErrUnavailable = errors.New("source unavailable")
+
+// ErrSlowDown reports a source that asked to slow down (429, or 503), past
+// the tries made, or, read once, was overloaded (502, 504 too). It tells
+// the host's state, not the file's. It is an ErrUnavailable.
+var ErrSlowDown = fmt.Errorf("%w: the source asked to slow down", ErrUnavailable)
+
+// ErrExpired reports a link a source refused (401, 403, 404 or 410) on a
+// request that renews nothing: Once.Renew asks for a fresh one. It is an
+// ErrUnavailable.
+var ErrExpired = fmt.Errorf("%w: the link expired", ErrUnavailable)
+
+// StatusError is a source's answer with a status Mira does not read:
+// Kind is ErrUnavailable, ErrSlowDown or ErrExpired.
+type StatusError struct {
+	Status int
+	Kind   error
+	// Reply tells what the answer was, by its headers (see Reply), when
+	// they tell its media type or size; nil otherwise.
+	Reply *Reply
+}
+
+func (e *StatusError) Error() string {
+	if e.Reply != nil {
+		return fmt.Sprintf("%v: HTTP %d, %s", e.Kind, e.Status, e.Reply)
+	}
+	return fmt.Sprintf("%v: HTTP %d", e.Kind, e.Status)
+}
+
+// statusError is the StatusError of an answer whose status Mira does
+// not read, kind telling which (see StatusError): what the answer was is
+// told by its headers, its body unread.
+func statusError(response *http.Response, kind error) *StatusError {
+	e := &StatusError{Status: response.StatusCode, Kind: kind}
+	size, err := strconv.ParseInt(response.Header.Get("Content-Length"), 10, 64)
+	if err != nil || size < 0 {
+		size = -1
+	}
+	if contentType := response.Header.Get("Content-Type"); contentType != "" || size >= 0 {
+		e.Reply = &Reply{ContentType: contentType, Size: size}
+	}
+	return e
+}
+
+func (e *StatusError) Unwrap() error { return e.Kind }
+
+// errWrongRange reports an answer for another range than the one asked.
+var errWrongRange = errors.New("unexpected range")
+
+// errOtherFile reports an answer whose size is not the file's, known from
+// an earlier answer, from its analysis or from the size the addon
+// announced: a short error page some hosts send with HTTP 200, the error
+// file a host answers for every link (see ErrorFiles), or a link now
+// naming another file. Its body is not read as the file's.
+var errOtherFile = errors.New("an answer of another size than the file")
+
+// errNoAnswer reports a source that sent no headers in time.
+var errNoAnswer = fmt.Errorf("no headers in time: %w", context.DeadlineExceeded)
+
+// ErrStalled reports a connection that sent no bytes for a while, past its
+// tries. A source that only playbacks read, as a torrent's file, is tried
+// again at the next playback after it (see Urge).
+var ErrStalled = errors.New("the connection stalled")
+
+// Final marks an opener's error as the source's failure at once, without
+// the tries the cache makes: the opener already waited as long as the
+// source may take, as a torrent's start, and trying again would wait as
+// long again. The error reads as err.
+func Final(err error) error {
+	return &finalError{err}
+}
+
+type finalError struct{ err error }
+
+func (e *finalError) Error() string { return e.err.Error() }
+
+func (e *finalError) Unwrap() error { return e.err }
+
+// RouteFailure is the error of a route that carries a source's requests,
+// as the proxy or the tunnel of torrents (see torrent.RouteError): it
+// tells nothing of the source, which was not asked.
+type RouteFailure interface {
+	error
+	RouteFailure()
+}
+
+// Answer describes what a source answered to make a request fail, for
+// logs: its status, the range ignored, an answer cut short, or none. Never
+// the source's URL. A route failure tells the route: the source was not
+// asked.
+func Answer(err error) string {
+	var status *StatusError
+	var route RouteFailure
+	switch {
+	case errors.As(err, &route):
+		return "the route for torrents does not answer"
+	case errors.As(err, &status) && status.Reply != nil:
+		return "HTTP " + strconv.Itoa(status.Status) + ", " + status.Reply.String()
+	case errors.As(err, &status):
+		return "HTTP " + strconv.Itoa(status.Status)
+	case errors.Is(err, ErrRangesIgnored):
+		return "HTTP 200, the range asked ignored"
+	case errors.Is(err, errWrongRange):
+		return "HTTP 206, another range than the one asked"
+	case errors.Is(err, errBroken):
+		return "an answer cut short"
+	case errors.Is(err, ErrStalled):
+		return "an answer that stopped"
+	case errors.Is(err, errOtherFile):
+		return "an answer of another size than the file"
+	case errors.Is(err, context.DeadlineExceeded):
+		return "no answer in time"
+	case errors.Is(err, ErrUnavailable):
+		return "no answer"
+	}
+	return ""
+}
+
+// ErrRangesIgnored reports a source that answered without honoring the
+// range asked.
+var ErrRangesIgnored = errors.New("the source ignores ranges")
+
+// Location is where a source's bytes are fetched.
+type Location struct {
+	URL string
+	// Headers must be sent with every request.
+	Headers map[string]string
+	// Confined restricts requests to public addresses.
+	Confined bool
+	// Size is the file's size its addon announced, 0 when unknown, and
+	// Announcer that addon: an answer of another size is another file,
+	// refused at once, once the addon's sizes proved right (see
+	// Cache.sizeTrusted).
+	Size      int64
+	Announcer string
+	// Analyzed is the size the file's analysis found, 0 when unknown: an
+	// answer more than 1% off is another file, refused at its first byte
+	// whatever the addon's sizes are worth. It is given only where the
+	// addon's announced size agrees with it, so that an analysis of
+	// another file never refuses the file.
+	Analyzed int64
+	// Opener, when set, sends the source's requests in place of the
+	// cache's: one that signs them for the storage, or answers them from
+	// another protocol (see FileOpener), as a folder on an S3 bucket, an
+	// SFTP server or an rclone remote is read.
+	Opener Opener
+	// Playing, when set, is called as a playback starts reading the source
+	// (see Source.Urge), and what it returns as that playback stops: a
+	// torrent's swarm is joined only meanwhile. Such a source failing while
+	// no playback reads it failed for that alone: the next playback tries
+	// it again at once.
+	Playing func() (stop func())
+	// HeaderTimeout and StallTimeout, when set, replace the cache's wait
+	// for the source's headers and for a byte of a connection: a torrent's
+	// swarm takes longer to start, and to send a piece, than a host to
+	// answer.
+	HeaderTimeout, StallTimeout time.Duration
+	// Mirrors are other copies of the same file, byte for byte, read in
+	// their order once this one fails past the cache's tries (see
+	// Source.fail): the blocks cached stay valid, and the readers waiting
+	// get the blocks from the next copy rather than the failure.
+	Mirrors []Mirror
+	// Transient marks a source whose blocks are not kept across restarts,
+	// as a torrent's file, whose pieces are removed as it stops: the
+	// cache removes them as it closes (see Policy.Keep).
+	Transient bool
+}
+
+// Mirror is another copy of a source's file, where it is and how its link
+// is renewed (nil for never).
+type Mirror struct {
+	Location Location
+	Renew    Renewer
+}
+
+// Opener sends requests to sources; *stremio.Client is one.
+type Opener interface {
+	Open(ctx context.Context, method, target string, header http.Header, confined bool) (*http.Response, error)
+}
+
+// Renewer returns a fresh location for a source whose link expired.
+type Renewer func(ctx context.Context) (Location, error)
+
+// Cache keeps the sources being read and their blocks on disk, in files of
+// a chunk's blocks, within a size limit. The chunks read longest ago are
+// evicted first, of any source, those of a source played again later (see
+// Policy.Credit), which bounds the disk a long file read to its end takes;
+// chunks read lately are kept, as readers are on them. With a policy that
+// keeps them, the chunks stay across restarts (see persist.go).
+type Cache struct {
+	dir string
+	// policy gives the bytes the cache may keep and for how long, read at
+	// each use, so that a lower limit applies at the next write.
+	policy func() Policy
+	opener Opener
+	logger *slog.Logger
+	// chunkBlocks is how many blocks one file on disk holds; readahead how
+	// many blocks past the last one read a reader starting to stream has
+	// read ahead, and aheadBudget how many one that has streamed long has
+	// (see aheadBudget), so that a sequential reader rarely waits, and a
+	// connection stays busy while FFmpeg pauses; now the clock chunks are
+	// dated by,
+	// fetchInterval the time between two requests of Fetch and FetchRanges
+	// to a source, and attemptTime the time one of them may take before
+	// the bytes asked.
+	chunkBlocks, readahead int64
+	aheadBudget            func() int64
+	now                    func() time.Time
+	fetchInterval          time.Duration
+	attemptTime            time.Duration
+	// paced, when set, is told each instant the pacing of Fetch and
+	// FetchRanges lets a request go, as it does: tests check the pacing
+	// there, not where a host receives the request, a moment later.
+	paced func(time.Time)
+	// storing, when set, is called as a block is about to be written, a
+	// source's discard waiting meanwhile (see Source.store): tests hold a
+	// write there.
+	storing func()
+	// headerTimeout bounds the wait for a source's headers, stallTimeout
+	// the time a connection read may go without a byte, recoveryTimeout
+	// the wait for the headers of the connection replacing a stalled one,
+	// starveAfter the wait of an older reader's block behind the newest
+	// reader's window, and linger and attachedLinger how long an idle
+	// connection stays open for more, longer while a reader is attached;
+	// connections bounds the connections to a file, and hostConnections
+	// those to a host (see slots.go).
+	headerTimeout, stallTimeout, recoveryTimeout, starveAfter time.Duration
+	linger, attachedLinger                                    time.Duration
+	connections, hostConnections                              int
+
+	mu      sync.Mutex
+	sources map[accounts.ID]*Source
+	chunks  map[chunkKey]*chunkUse
+	used    int64
+	// others gives the bytes kept beside the cache within its limit, as
+	// the pieces of torrents (see Share); nil for none.
+	others func() int64
+	// stop ends the sweep of the chunks kept too long (see sweep).
+	stop chan struct{}
+
+	// hits and misses count the bytes readers read: misses those fetched
+	// since the start that no reader had read yet, waited for, read ahead
+	// or warmed alike, and hits the others, kept from before the start or
+	// read again.
+	hits, misses atomic.Int64
+	// free tells the space free on the disk of the cache's folder, and
+	// sleep waits between the pieces of a preload (see Preload): tests
+	// set their own.
+	free  func() (int64, bool)
+	sleep func(ctx context.Context, d time.Duration) error
+
+	// hosts and sizes are what the cache learned of hosts and of the sizes
+	// addons announce, under their own lock, taken with a source's or
+	// slotsMu; uncounted the sources whose answer counted in an addon's
+	// record was taken back, as a host's error file (see noteMisfit).
+	learned   sync.Mutex
+	hosts     map[string]*hostState
+	sizes     map[string]*sizeRecord
+	uncounted map[accounts.ID]bool
+	// recovered is told the sources refused for a host's error file once
+	// the host answers its files again (see OnRecovered).
+	recoveredMu sync.Mutex
+	recovered   func(sources []accounts.ID)
+
+	// slots are the connections held of each host, under slotsMu, which
+	// may take a source's lock, never the other way round.
+	slotsMu sync.Mutex
+	slots   map[string]*hostSlots
+	// received, when set, counts the bytes each source receives, by its
+	// identifier (see Count).
+	received *bandwidth.Meters
+}
+
+// protectedFor spares the chunks read lately from eviction.
+const protectedFor = 30 * time.Second
+
+type chunkKey struct {
+	source accounts.ID
+	index  int64
+}
+
+type chunkUse struct {
+	size    int64
+	touched time.Time
+}
+
+// New returns a cache keeping blocks in dir, as policy gives, read
+// whenever it is used. The blocks a previous run kept there are read back
+// when the policy keeps them (see Policy.Keep), and removed otherwise.
+func New(dir string, policy func() Policy, opener Opener, logger *slog.Logger) (*Cache, error) {
+	if err := os.MkdirAll(dir, 0o700); err != nil {
+		return nil, err
+	}
+	c := &Cache{dir: dir, policy: policy, opener: opener, logger: logger, chunkBlocks: 64, readahead: 32,
+		aheadBudget: func() int64 { return aheadBudget(policy().Limit) }, now: time.Now, fetchInterval: fetchInterval, attemptTime: attemptTime,
+		headerTimeout: headerTimeout, stallTimeout: stallTimeout, recoveryTimeout: recoveryTimeout, starveAfter: starveAfter,
+		linger: lingerDelay, attachedLinger: attachedLinger, connections: maxConnections, hostConnections: hostConnections,
+		sources: map[accounts.ID]*Source{}, chunks: map[chunkKey]*chunkUse{},
+		hosts: map[string]*hostState{}, sizes: map[string]*sizeRecord{}, uncounted: map[accounts.ID]bool{}, slots: map[string]*hostSlots{},
+		stop: make(chan struct{}), sleep: pause}
+	c.free = func() (int64, bool) {
+		free, _, _, ok := diskspace.Measure(c.dir)
+		return free, ok
+	}
+	if err := c.load(); err != nil {
+		return nil, err
+	}
+	go c.sweep(c.stop)
+	return c, nil
+}
+
+// aheadBudget is how many blocks a reader streaming long has read ahead:
+// 256 MiB, a minute or two of a 4K remux, within an eighth of the cache.
+func aheadBudget(limit int64) int64 {
+	return max(32, min(256<<20, limit/8)/blockSize)
+}
+
+// Count has the bytes each source receives from its origin, its mirrors,
+// its swarm or its storage counted in meters, by the source's identifier,
+// those kept from a previous run, which the cache made as it opened,
+// included. It is called before the cache is used.
+func (c *Cache) Count(meters *bandwidth.Meters) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.received = meters
+	for id, s := range c.sources {
+		if s.received == nil {
+			s.received = meters.Hold(id.String())
+		}
+	}
+}
+
+// Open returns the source identified by id, read from location, and
+// renewed by renew (which may be nil) when its link expires. A source is
+// shared by all its readers; each must Release it when done. A location
+// naming another URL replaces the one known, as addons hand out new links;
+// the same one keeps where it redirected to (see Source.target). A
+// location the source left for one of its mirrors (see Location.Mirrors)
+// leaves the source on that mirror: the next playback, or the next request
+// of a relayed app, does not wait for the copy that failed again.
+func (c *Cache) Open(id accounts.ID, location Location, renew Renewer) *Source {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	s := c.sources[id]
+	if s == nil {
+		s = c.newSource(id)
+		c.sources[id] = s
+	}
+	s.mu.Lock()
+	if !s.left[location.URL] {
+		if location.URL != s.origin.URL {
+			s.pinned = nil
+		}
+		s.origin, s.renew = location, renew
+		s.mirrors = slices.DeleteFunc(slices.Clone(location.Mirrors), func(m Mirror) bool { return s.left[m.Location.URL] })
+		s.origin.Mirrors = nil
+	}
+	s.transient, s.link = location.Transient, linkDigest(location.URL)
+	s.restore()
+	s.mu.Unlock()
+	s.refs++
+	return s
+}
+
+// newSource returns the source of id, with nothing read yet, counting
+// what it receives when the cache counts (see Count).
+func (c *Cache) newSource(id accounts.ID) *Source {
+	ctx, cancel := context.WithCancel(context.Background())
+	s := &Source{cache: c, id: id, dir: filepath.Join(c.dir, id.String()+".blocks"), ctx: ctx, cancel: cancel,
+		size: -1, wanted: map[int64]*want{}, wake: make(chan struct{}, 1), progress: make(chan struct{}),
+		failed: make(chan struct{}), learned: make(chan struct{}), unsynced: map[int64]bool{}}
+	if c.received != nil {
+		s.received = c.received.Hold(id.String())
+	}
+	return s
+}
+
+// Answered reports when the source of id last answered with content at
+// the URL given, its origin: zero when it did not, or is not open.
+func (c *Cache) Answered(id accounts.ID, origin string) time.Time {
+	c.mu.Lock()
+	s := c.sources[id]
+	c.mu.Unlock()
+	if s == nil {
+		return time.Time{}
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.origin.URL != origin {
+		return time.Time{}
+	}
+	return s.answeredAt
+}
+
+// Streamed reports whether a streaming reader reads the source of id now,
+// as FFmpeg does while it remuxes it.
+func (c *Cache) Streamed(id accounts.ID) bool {
+	c.mu.Lock()
+	s := c.sources[id]
+	c.mu.Unlock()
+	if s == nil {
+		return false
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.attached > 0
+}
+
+// Read reports whether a reader holds the source of id now.
+func (c *Cache) Read(id accounts.ID) bool {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	s := c.sources[id]
+	return s != nil && s.refs > 0
+}
+
+// Discard removes what the cache holds of the source of id, whose file
+// changed, unless a reader holds it: it reports whether nothing is left.
+func (c *Cache) Discard(id accounts.ID) bool {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	s := c.sources[id]
+	if s == nil {
+		return true
+	}
+	if s.refs > 0 {
+		return false
+	}
+	c.discardLocked(s)
+	return true
+}
+
+// discardLocked removes what the cache holds of source s, which no reader
+// holds. The cache's lock is held.
+func (c *Cache) discardLocked(s *Source) {
+	for key, use := range c.chunks {
+		if key.source == s.id {
+			delete(c.chunks, key)
+			c.used -= use.size
+		}
+	}
+	if err := s.discard(); err != nil {
+		c.logger.Warn("A cached source could not be removed", "error", err)
+	}
+	delete(c.sources, s.id)
+}
+
+// Usage is what the cache keeps, and how its reads went since the start.
+type Usage struct {
+	// Used is the bytes kept on disk, those Share counts included, and
+	// Limit those the policy allows.
+	Used, Limit int64
+	// Open counts the sources being read, and Kept those the cache holds
+	// blocks of.
+	Open, Kept int
+	// Misses counts the bytes readers read for the first time since they
+	// were fetched from the source, whether readers waited for them or
+	// they were read ahead, and Hits the bytes read again or kept from
+	// before the start.
+	Hits, Misses int64
+}
+
+// Usage tells what the cache keeps on disk, against its limit (the
+// settings' CacheSizeGB), and how its reads went.
+func (c *Cache) Usage() Usage {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	usage := Usage{Used: c.used + c.othersUsed(), Limit: c.policy().Limit, Hits: c.hits.Load(), Misses: c.misses.Load()}
+	kept := map[accounts.ID]bool{}
+	for key := range c.chunks {
+		kept[key.source] = true
+	}
+	usage.Kept = len(kept)
+	for _, s := range c.sources {
+		if s.refs > 0 {
+			usage.Open++
+		}
+	}
+	return usage
+}
+
+// Share has the cache count, within its limit and in its usage, the bytes
+// used gives, kept beside it by what keeps them within part of the limit,
+// as the pieces of torrents being played: the cache evicts its own chunks
+// to leave them room. used must not take the cache's lock.
+func (c *Cache) Share(used func() int64) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.others = used
+}
+
+// othersUsed is what Share counts. The cache's lock is held.
+func (c *Cache) othersUsed() int64 {
+	if c.others == nil {
+		return 0
+	}
+	return c.others()
+}
+
+// Close stops reading every source. Their blocks are kept for the next
+// start when the policy keeps them, but those of transient sources and of
+// sources of an unknown size; the others are removed.
+func (c *Cache) Close() error {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if c.stop != nil {
+		close(c.stop)
+		c.stop = nil
+	}
+	keep := c.policy().Keep > 0
+	var errs []error
+	for id, s := range c.sources {
+		if keep {
+			errs = append(errs, c.keep(s))
+		} else {
+			errs = append(errs, s.discard())
+		}
+		delete(c.sources, id)
+	}
+	clear(c.chunks)
+	c.used = 0
+	return errors.Join(errs...)
+}
+
+// touch records that a chunk was read.
+func (c *Cache) touch(key chunkKey) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if use := c.chunks[key]; use != nil {
+		use.touched = c.now()
+	}
+}
+
+// stored accounts for bytes written to a chunk, and evicts chunks until the
+// cache fits its limit (see fit). The cache's lock is held.
+func (c *Cache) stored(key chunkKey, size int64) {
+	use := c.chunks[key]
+	if use == nil {
+		use = &chunkUse{}
+		c.chunks[key] = use
+	}
+	use.size += size
+	use.touched = c.now()
+	c.used += size
+	c.fit()
+}
+
+// fit evicts chunks until the cache fits its limit, those whose score is
+// the oldest first (see score), but those read lately. The cache's lock is
+// held.
+func (c *Cache) fit() {
+	policy := c.policy()
+	protected := c.now().Add(-protectedFor)
+	for limit := policy.Limit - c.othersUsed(); c.used > limit; {
+		var oldest chunkKey
+		var found *chunkUse
+		var score time.Time
+		for key, use := range c.chunks {
+			if !use.touched.Before(protected) {
+				continue
+			}
+			if at := c.score(key, use, policy.Credit); found == nil || at.Before(score) {
+				oldest, found, score = key, use, at
+			}
+		}
+		if found == nil {
+			return
+		}
+		c.evict(oldest, found)
+	}
+}
+
+// evict removes a chunk from disk, and its source once nobody reads it and
+// it has nothing cached left.
+func (c *Cache) evict(key chunkKey, use *chunkUse) {
+	delete(c.chunks, key)
+	c.used -= use.size
+	s := c.sources[key.source]
+	if s == nil {
+		return
+	}
+	c.unclaim(s, key.index)
+	s.forget(key.index)
+	if err := os.Remove(s.chunkPath(key.index)); err != nil && !errors.Is(err, fs.ErrNotExist) {
+		c.logger.Warn("A cached chunk could not be removed", "error", err)
+	}
+	for other := range c.chunks {
+		if other.source == key.source {
+			return
+		}
+	}
+	if s.refs == 0 {
+		if err := s.discard(); err != nil {
+			c.logger.Warn("A cached source could not be removed", "error", err)
+		}
+		delete(c.sources, key.source)
+	}
+}
+
+// Source is a remote file read through the cache.
+type Source struct {
+	cache  *Cache
+	id     accounts.ID
+	dir    string
+	ctx    context.Context
+	cancel context.CancelFunc
+	// refs is guarded by the cache's lock, and so are plays, the plays of
+	// the source counted for its credit (see Policy.Credit), playedAt,
+	// when a playback last read it, and forgotten, which marks a source
+	// removed once its last reader releases it (see Cache.forget).
+	refs      int
+	plays     int
+	playedAt  time.Time
+	forgotten bool
+	// writing is held to read while a block is written into dir, or the
+	// state saved there, and to write while the source is discarded or
+	// kept as the cache closes, which then waits for it.
+	writing sync.RWMutex
+	// saveMu orders the writes of the source's state file, saved is what
+	// it holds, nil while it holds nothing, and evictions counts the
+	// chunks evicted (see persist.go).
+	saveMu    sync.Mutex
+	saved     *keptState
+	evictions atomic.Int64
+
+	mu sync.Mutex
+	// origin is where the addon said the file is, and pinned where the
+	// origin redirected the server's reads, nil when it did not or the
+	// address stopped working.
+	origin Location
+	pinned *pin
+	// mirrors are the copies of the file the source reads on from, in
+	// order, once the copy it reads fails, and left the URLs of the copies
+	// that failed so (see toMirror).
+	mirrors     []Mirror
+	left        map[string]bool
+	renew       Renewer
+	size        int64
+	contentType string
+	// status is the status of the first answer read as the source's
+	// content (200 or 206), 0 before; learned is closed once it is set.
+	status  int
+	learned chan struct{}
+	present []uint64
+	// unread holds, for each block fetched since the start, how many of
+	// its bytes no reader read yet: those count as misses once read (see
+	// firstRead). Blocks kept from before the start are not in it.
+	unread map[int64]int
+	// sizeChecked tells that the first answer was checked against the
+	// size the addon announced, and sizeNoted that it counted in the
+	// addon's record.
+	sizeChecked, sizeNoted bool
+	// readers are the readers open, oldest first; window is the
+	// read-ahead window of the newest streaming one; warms are the spans
+	// Warm keeps read; wanted are the blocks readers wait for.
+	readers []*Reader
+	window  window
+	warms   []*warmSpans
+	wanted  map[int64]*want
+	// conns are the connections reading the source, or about to.
+	conns []*conn
+	// wake tells a lingering connection that a reader wants more;
+	// progress is closed, and replaced, when a block is stored or the
+	// source fails.
+	wake     chan struct{}
+	progress chan struct{}
+	// rangeless marks a source that ignores ranges: it is read from its
+	// start, whatever block is wanted. ranged marks one that answered a
+	// range with it, which a whole file answered once does not make
+	// rangeless.
+	rangeless, ranged bool
+	// singleRanges marks a source that does not serve several ranges with
+	// one request: FetchRanges no longer asks it to.
+	singleRanges bool
+	// multiRanges marks a source that served several ranges with one
+	// request.
+	multiRanges bool
+	// nextFetch is when Fetch and FetchRanges may send their next request.
+	nextFetch time.Time
+	// failure is why the source failed, at failedAt; failed is closed
+	// while it is reported, and replaced once it is tried again. unplayed
+	// marks a failure of a source read only by playbacks (see Location's
+	// Playing) that came while none read it.
+	failure  error
+	failedAt time.Time
+	failed   chan struct{}
+	unplayed bool
+	// answeredAt is when the source last answered with content.
+	answeredAt time.Time
+	// attached counts the streaming readers open.
+	attached int
+	// urged counts the playbacks reading the source (see Urge);
+	// heldBack is when its host last asked it to slow down, or a
+	// connection of it stopped waiting for a slot, and slotWaits counts
+	// those waiting now.
+	urged     int
+	heldBack  time.Time
+	slotWaits int
+	// joined counts the playbacks whose location's Playing returned.
+	joined int
+	// transient marks a source whose blocks are not kept across restarts
+	// (see Location.Transient), and link the digest of the URL it was
+	// opened at last (see linkDigest).
+	transient bool
+	link      string
+	// pending are the blocks a previous run kept of the source, read back
+	// at start, until a location opens it at the link they were read
+	// from, or an answer tells the file's size: they are then the
+	// source's, or removed when the size is not the one kept (see
+	// restore and learn). kept is what that run kept of the source.
+	pending []uint64
+	kept    keptState
+	// unsynced are the chunks written since the source's state was last
+	// saved, and saveTimer the save to come, if any.
+	unsynced  map[int64]bool
+	saveTimer *time.Timer
+	// received counts the bytes the source receives, nil when the cache
+	// counts none (see Cache.Count). It is set once, as the source is
+	// made, or by Count for a source kept from a previous run.
+	received *bandwidth.Meter
+}
+
+// Urge has the source read for a playback until done is called, as a
+// remux, a relay, or the analysis of the version a play chose: its first
+// connection never waits for its host's other connections, and those of
+// background reads give way to it (see slots.go), and its location's
+// Playing runs meanwhile. Without, the source is read in the background.
+// Once Playing returns, a failure that came while no playback had it run
+// is forgotten, and so is a stall, a torrent's swarm that sent nothing for
+// a while: what reads the source next tries it again at once. A playback
+// coming replayGap or more after the last one counts as one more play of
+// the source (see Policy.Credit).
+func (s *Source) Urge() (done func()) {
+	s.cache.played(s)
+	s.mu.Lock()
+	s.urged++
+	s.nudgeConns()
+	playing := s.origin.Playing
+	s.mu.Unlock()
+	stop := func() {}
+	if playing != nil {
+		stop = playing()
+		s.mu.Lock()
+		s.joined++
+		if s.failure != nil && (s.unplayed || errors.Is(s.failure, ErrStalled)) {
+			s.failure, s.failed, s.unplayed = nil, make(chan struct{}), false
+		}
+		s.mu.Unlock()
+	}
+	var once sync.Once
+	return func() {
+		once.Do(func() {
+			s.mu.Lock()
+			s.urged--
+			if playing != nil {
+				s.joined--
+				if s.urged == 0 {
+					s.unurged()
+				}
+			}
+			s.mu.Unlock()
+			stop()
+		})
+	}
+}
+
+// unurged stops what reads a source only playbacks may read, a torrent's
+// file, once none urges it: its connections end, but those reading a block
+// a reader waits for or a span warmed, and none reads ahead or lingers
+// until a playback urges it again (see readsAhead), so that the swarm is
+// left at once. The source's lock is held.
+func (s *Source) unurged() {
+	for _, c := range slices.Clone(s.conns) {
+		if c.next < 0 || s.wanted[c.next] == nil && !s.inWarm(c.next) {
+			c.drop()
+			s.removeConn(c)
+		}
+	}
+}
+
+// readsAhead tells whether the source is read ahead of its readers, and
+// its connections linger for them: always, but for a source only
+// playbacks may read, while one urges it. The source's lock is held.
+func (s *Source) readsAhead() bool {
+	return s.origin.Playing == nil || s.urged > 0
+}
+
+// HeldBack reports whether the source's reads were held back since a
+// time, or are now: its host asked to slow down (429, 503), or they
+// waited for the host's other connections. What fails meanwhile, such as
+// an analysis out of time, tells nothing of the file.
+func (s *Source) HeldBack(since time.Time) bool {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.slotWaits > 0 || !s.heldBack.Before(since)
+}
+
+// slowedDown records that the source's host asked to slow down: it is
+// given fewer connections for a while.
+func (s *Source) slowedDown(host string) {
+	s.mu.Lock()
+	s.heldBack = time.Now()
+	s.mu.Unlock()
+	s.cache.crowd(host)
+}
+
+// waitingSlot counts a connection of the source starting (1) or ending
+// (-1) a wait for a slot.
+func (s *Source) waitingSlot(delta int) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.slotWaits += delta
+	s.heldBack = time.Now()
+}
+
+// slotState tells whether connection c reads for a playback, as the
+// first of a source urged, and whether it is to read nothing more.
+func (s *Source) slotState(c *conn) (playback, gone bool) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if c.dropped || s.ctx.Err() != nil {
+		return false, true
+	}
+	return s.urged > 0 && len(s.conns) > 0 && s.conns[0] == c, false
+}
+
+// nudgeConns has the connections waiting for a slot look again whether
+// they read for a playback. The source's lock is held.
+func (s *Source) nudgeConns() {
+	for _, c := range s.conns {
+		select {
+		case c.nudge <- struct{}{}:
+		default:
+		}
+	}
+}
+
+type want struct {
+	done chan struct{}
+	err  error
+	// waiters counts the readers waiting, since when the first did.
+	waiters int
+	since   time.Time
+}
+
+// Release tells the cache a reader is done with the source. The last one
+// has the source's state saved soon, with the chunks it read, or the
+// source removed when it was forgotten meanwhile.
+func (s *Source) Release() {
+	s.cache.mu.Lock()
+	defer s.cache.mu.Unlock()
+	if s.refs--; s.refs == 0 {
+		if s.forgotten {
+			s.cache.discardLocked(s)
+			return
+		}
+		s.mu.Lock()
+		s.cache.saveLater(s)
+		s.mu.Unlock()
+	}
+}
+
+// discard stops reading the source and removes its blocks, once the
+// block being written, if any, is (see halt). It runs under the cache's
+// lock: removing the folder outside the cache's lock would remove that of
+// the source opened anew under the same identifier.
+func (s *Source) discard() error {
+	s.halt()
+	if s.received != nil {
+		s.cache.received.Release(s.received)
+	}
+	defer s.writing.Unlock()
+	s.mu.Lock()
+	s.present, s.pending, s.unread = nil, nil, nil
+	s.mu.Unlock()
+	return os.RemoveAll(s.dir)
+}
+
+// halt stops reading the source, once the block being written, if any,
+// is (see store), and returns with the source's writing lock held, so that
+// nothing is written in its folder any more. The readers waiting for a
+// block get errDiscarded, and so does any read after it (see wait): no
+// connection fetches a block of a source halted, and they would wait for
+// good. It runs under the cache's lock, and may wait there for a write,
+// which never takes the cache's lock nor the source's (see store and
+// save): no wait can form a cycle.
+func (s *Source) halt() {
+	s.cancel()
+	s.writing.Lock()
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.saveTimer != nil {
+		s.saveTimer.Stop()
+		s.saveTimer = nil
+	}
+	for block, w := range s.wanted {
+		w.err = errDiscarded
+		delete(s.wanted, block)
+		close(w.done)
+	}
+	s.signal()
+}
+
+// errDiscarded reports a read of a source discarded: the cache was closed,
+// or the source evicted or discarded while a read was under way.
+var errDiscarded = fmt.Errorf("%w: the source was closed", ErrUnavailable)
+
+func (s *Source) chunkPath(index int64) string {
+	return filepath.Join(s.dir, strconv.FormatInt(index, 10))
+}
+
+// forget marks the blocks of an evicted chunk as no longer cached, those
+// kept from a previous run included.
+func (s *Source) forget(index int64) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	for block := index * s.cache.chunkBlocks; block < (index+1)*s.cache.chunkBlocks; block++ {
+		clearBit(s.present, block)
+		clearBit(s.pending, block)
+		delete(s.unread, block)
+	}
+}
+
+// Size returns the size of the source, reaching it if needed. A source that
+// does not announce it is read to its end.
+func (s *Source) Size(ctx context.Context) (int64, error) {
+	r := s.reader(false)
+	defer r.Close()
+	return r.Size(ctx)
+}
+
+// ContentType is the media type the source announced, once reached.
+func (s *Source) ContentType() string {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.contentType
+}
+
+func (s *Source) knownSize() (int64, bool) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.size, s.size >= 0
+}
+
+// ReadAt reads len(p) bytes at off, waiting for the blocks not cached yet
+// at most until ctx is done. It reads like a reader of its own, without
+// reading ahead: for the scattered reads of a container's index, which
+// must not move the window a stream reads ahead of.
+func (s *Source) ReadAt(ctx context.Context, p []byte, off int64) (int, error) {
+	r := s.reader(false)
+	defer r.Close()
+	return r.ReadAt(ctx, p, off)
+}
+
+// readChunk reads part of a chunk file at off.
+func (s *Source) readChunk(index int64, part []byte, off int64) (int, error) {
+	file, err := os.Open(s.chunkPath(index))
+	if err != nil {
+		return 0, err
+	}
+	defer file.Close()
+	s.cache.touch(chunkKey{s.id, index})
+	return file.ReadAt(part, off)
+}
+
+// firstRead counts n bytes read from block, and returns how many of them
+// no reader had read since the block was fetched.
+func (s *Source) firstRead(block int64, n int) int {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	left, ok := s.unread[block]
+	if !ok {
+		return 0
+	}
+	first := min(n, left)
+	if left -= first; left == 0 {
+		delete(s.unread, block)
+	} else {
+		s.unread[block] = left
+	}
+	return first
+}
+
+// wait waits until block is cached, asking for it to be fetched on behalf
+// of r. A streaming reader's read moves the window read ahead of it,
+// cached blocks included, when it is the newest one.
+func (s *Source) wait(ctx context.Context, r *Reader, block int64) error {
+	s.mu.Lock()
+	if r.streaming {
+		s.moveWindow(r, block)
+	}
+	cooling := s.coolingLocked()
+	if s.has(block) {
+		if r.streaming && !cooling && s.missingAhead() {
+			s.kick()
+		}
+		s.mu.Unlock()
+		return nil
+	}
+	if s.pastEnd(block) {
+		s.mu.Unlock()
+		return io.EOF
+	}
+	if cooling {
+		err := s.failure
+		s.mu.Unlock()
+		return err
+	}
+	if s.ctx.Err() != nil {
+		s.mu.Unlock()
+		return errDiscarded
+	}
+	w := s.wanted[block]
+	if w == nil {
+		w = &want{done: make(chan struct{}), since: time.Now()}
+		s.wanted[block] = w
+	}
+	w.waiters++
+	r.waiting = block
+	s.kick()
+	s.mu.Unlock()
+	select {
+	case <-w.done:
+		s.mu.Lock()
+		r.waiting = -1
+		s.mu.Unlock()
+		return w.err
+	case <-ctx.Done():
+		// The reader gave up: nobody else waiting, the block is no longer
+		// wanted.
+		s.mu.Lock()
+		r.waiting = -1
+		if w.waiters--; w.waiters == 0 && s.wanted[block] == w {
+			delete(s.wanted, block)
+		}
+		s.mu.Unlock()
+		return ctx.Err()
+	}
+}
+
+// coolingLocked reports whether a failure is reported to readers still;
+// one older is forgotten, and the source tried again, sooner when its
+// host asked to slow down. The source's lock is held.
+func (s *Source) coolingLocked() bool {
+	if s.failure == nil {
+		return false
+	}
+	wait := cooldown
+	if errors.Is(s.failure, ErrSlowDown) {
+		wait = slowCooldown
+	}
+	if time.Since(s.failedAt) < wait {
+		return true
+	}
+	s.failure, s.failed = nil, make(chan struct{})
+	return false
+}
+
+func (s *Source) has(block int64) bool {
+	word := block / 64
+	return word < int64(len(s.present)) && s.present[word]&(1<<(block%64)) != 0
+}
+
+// pastEnd reports whether block starts beyond the end of the source.
+func (s *Source) pastEnd(block int64) bool {
+	return s.size >= 0 && block*blockSize >= s.size
+}
+
+// missing reports whether block is to be fetched: in the file, not cached.
+func (s *Source) missing(block int64) bool {
+	return !s.has(block) && !s.pastEnd(block)
+}
+
+// blockLength is how many bytes block holds: a whole block, or what is
+// left of the source.
+func (s *Source) blockLength(block int64) int {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.size >= 0 {
+		return int(min(blockSize, s.size-block*blockSize))
+	}
+	return blockSize
+}
+
+func (s *Source) sizeUnknown() bool {
+	_, known := s.knownSize()
+	return !known
+}
+
+// store keeps a fetched block and wakes the readers waiting for it. last
+// marks the final, short block of a source whose size was unknown. A
+// source discarded writes nothing: discard waits for the write under way,
+// so that no file is written in its folder once it is removed. The cache
+// counts the block (see stored) under its lock, taken before the readers
+// are woken: whatever a reader of the block does next, as closing the
+// cache, which keeps the chunks it counts (see keep), finds it counted.
+func (s *Source) store(block int64, data []byte, last bool) error {
+	index := block / s.cache.chunkBlocks
+	s.writing.RLock()
+	if s.ctx.Err() != nil {
+		s.writing.RUnlock()
+		return errDiscarded
+	}
+	if hold := s.cache.storing; hold != nil {
+		hold()
+	}
+	err := s.write(index, block, data)
+	s.writing.RUnlock()
+	if err != nil {
+		return err
+	}
+	s.cache.mu.Lock()
+	defer s.cache.mu.Unlock()
+	s.mu.Lock()
+	added := 0
+	if !s.has(block) {
+		word := block / 64
+		if grow := word + 1 - int64(len(s.present)); grow > 0 {
+			s.present = append(s.present, make([]uint64, grow)...)
+		}
+		s.present[word] |= 1 << (block % 64)
+		if s.unread == nil {
+			s.unread = map[int64]int{}
+		}
+		s.unread[block] = len(data)
+		added = len(data)
+	}
+	if s.failure != nil {
+		s.failure, s.failed = nil, make(chan struct{})
+	}
+	if last {
+		s.size = block*blockSize + int64(len(data))
+	}
+	if w := s.wanted[block]; w != nil {
+		delete(s.wanted, block)
+		close(w.done)
+	}
+	if last {
+		s.wakePastEnd()
+	}
+	s.signal()
+	s.unsynced[index] = true
+	s.cache.saveLater(s)
+	s.mu.Unlock()
+	// A source halted meanwhile, under the cache's lock, keeps nothing
+	// more: its folder is gone, or its state was saved without the block.
+	if added > 0 && s.ctx.Err() == nil {
+		s.cache.stored(chunkKey{s.id, index}, int64(added))
+	}
+	return nil
+}
+
+// write writes a block into its chunk's file.
+func (s *Source) write(index, block int64, data []byte) error {
+	if err := os.MkdirAll(s.dir, 0o700); err != nil {
+		return err
+	}
+	file, err := os.OpenFile(s.chunkPath(index), os.O_RDWR|os.O_CREATE, 0o600)
+	if err != nil {
+		return err
+	}
+	_, err = file.WriteAt(data, (block%s.cache.chunkBlocks)*blockSize)
+	if closeErr := file.Close(); err == nil {
+		err = closeErr
+	}
+	return err
+}
+
+// signal tells whoever waits for progress that there is some. The source's
+// lock is held.
+func (s *Source) signal() {
+	close(s.progress)
+	s.progress = make(chan struct{})
+}
+
+// end records that the source ends at size, learned from a connection
+// that ended.
+func (s *Source) end(size int64) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.size = size
+	s.wakePastEnd()
+	s.signal()
+}
+
+// wakePastEnd answers the readers waiting for blocks past the end.
+func (s *Source) wakePastEnd() {
+	for block, w := range s.wanted {
+		if s.pastEnd(block) {
+			w.err = io.EOF
+			delete(s.wanted, block)
+			close(w.done)
+		}
+	}
+}
+
+// fail answers every waiting reader with err, stops every connection, and
+// reports err to readers for a while: Failed is closed first, so that
+// what watches it stops what reads the source before the readers see the
+// error. A source failing to answer, past its tries, with a mirror left
+// reads on from that mirror instead (see toMirror); once none is left,
+// it fails, and the next Open starts again from the location it gives.
+// The failure of connection c, once c was dropped, is ignored: c read a
+// copy the source left for a mirror meanwhile, which another connection
+// failing moved it to, and the mirror is read on from.
+func (s *Source) fail(c *conn, err error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if c.dropped {
+		return
+	}
+	if s.toMirror(err) {
+		return
+	}
+	s.left = nil
+	if s.failure == nil {
+		close(s.failed)
+	}
+	s.failure, s.failedAt = err, time.Now()
+	s.unplayed = s.origin.Playing != nil && s.joined == 0
+	for block, w := range s.wanted {
+		w.err = err
+		delete(s.wanted, block)
+		close(w.done)
+	}
+	for _, c := range s.conns {
+		c.drop()
+	}
+	s.conns = nil
+	s.signal()
+	s.cache.logger.Debug("A source could not be read", "source", s.id, "error", err)
+}
+
+// toMirror moves the source to its next mirror after its copy failed to
+// answer with err, and reports whether it did: the readers waiting keep
+// waiting, for the same blocks from the mirror, and the blocks cached
+// stay, as the mirror is the same file. Its size, once known, is checked
+// at the mirror's first answer, as an answer of another size is another
+// file (see learn), which fails it in turn. What the cache learned of the
+// host left, whether it ignores ranges or serves several at once, is
+// learned again of the mirror's. The source's lock is held.
+func (s *Source) toMirror(err error) bool {
+	if len(s.mirrors) == 0 || !errors.Is(err, ErrUnavailable) || s.ctx.Err() != nil {
+		return false
+	}
+	next := s.mirrors[0]
+	s.mirrors = s.mirrors[1:]
+	if s.left == nil {
+		s.left = map[string]bool{}
+	}
+	s.left[s.origin.URL] = true
+	s.origin, s.renew, s.pinned = next.Location, next.Renew, nil
+	s.origin.Mirrors = nil
+	s.rangeless, s.ranged, s.singleRanges, s.multiRanges = false, false, false, false
+	for _, c := range s.conns {
+		c.drop()
+	}
+	s.conns = nil
+	s.signal()
+	if len(s.wanted) > 0 {
+		s.kick()
+	}
+	s.cache.logger.Info("A source failed: reading on from another copy of the file", "source", s.id, "answer", Answer(err),
+		"copies left", len(s.mirrors))
+	return true
+}
+
+// Failed returns a channel closed once the source failed: its host did
+// not answer, refused it, or answers another file, past the retries the
+// cache makes. It stays closed while the failure is reported to readers
+// (Failure); a source tried again afterwards has a new one. Whatever reads
+// the source, such as ffprobe, is stopped when it closes rather than left
+// waiting.
+func (s *Source) Failed() <-chan struct{} {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.coolingLocked()
+	return s.failed
+}
+
+// Retry forgets the failure reported to readers, so that the next read
+// tries the source again at once, as when what it failed for, such as a
+// torrent's route, is back.
+func (s *Source) Retry() {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.failure != nil {
+		s.failure, s.failed = nil, make(chan struct{})
+	}
+}
+
+// Failure is why the source failed, while that is reported to readers;
+// nil otherwise. It is an ErrUnavailable, which Answer describes.
+func (s *Source) Failure() error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.coolingLocked() {
+		return s.failure
+	}
+	return nil
+}
+
+// learn records what a response host sent tells about the source: its
+// status, its total size, when known, and its media type. errOtherFile
+// when the size is not the one an earlier response told, is the error
+// file the host answers for other files (see noteAnswer), is more than 1%
+// from the one the file's analysis found, or the first one tells a size
+// more than 1% from the one its addon announced while that addon's sizes
+// are trusted: the response is not the file's, and nothing is recorded.
+// The first size told makes the blocks a previous run kept of the source
+// its own when it is the one kept, and removes them otherwise (see
+// restore): the link changed, and now names another file. Those blocks
+// stay for an answer that sides with neither them nor the addon, which
+// announced their size. An answer of the file's own size has the sources
+// refused for an error file the host answered tried again (see retry).
+// host is empty when unknown: the one the source's requests go to.
+func (s *Source) learn(host string, status int, total int64, contentType string) error {
+	s.mu.Lock()
+	dropped, recovered, err := s.learnLocked(host, status, total, contentType)
+	s.mu.Unlock()
+	if dropped != nil {
+		s.cache.dropKept(s, dropped)
+	}
+	s.cache.retry(recovered)
+	return err
+}
+
+// learnLocked is learn under the source's lock, which tells the chunks it
+// removed, those a previous run kept of another file, for the cache to
+// stop counting them, and the sources to try again.
+func (s *Source) learnLocked(host string, status int, total int64, contentType string) (dropped []int64, recovered recovery, err error) {
+	announced := total >= 0 && s.size < 0 && s.origin.Size > 0 && s.origin.Announcer != "" && !s.sizeChecked
+	// Trusted as before this answer counts.
+	trusted := announced && s.cache.sizeTrusted(s.origin.Announcer)
+	if total >= 0 {
+		var errorFile bool
+		if errorFile, recovered = s.noteAnswer(cmp.Or(host, s.host()), total); errorFile {
+			return nil, recovered, fmt.Errorf("%w: %d bytes, the error file its host answers for other files", errOtherFile, total)
+		}
+	}
+	if total >= 0 && s.size >= 0 && total != s.size {
+		return nil, recovered, fmt.Errorf("%w: %d bytes, not %d", errOtherFile, total, s.size)
+	}
+	if analyzed := s.origin.Analyzed; total >= 0 && s.size < 0 && analyzed > 0 && !nearSize(total, analyzed) {
+		return nil, recovered, fmt.Errorf("%w: %d bytes, not the %d analyzed", errOtherFile, total, analyzed)
+	}
+	otherThanKept := total >= 0 && s.size < 0 && s.pending != nil && total != s.kept.Size
+	if otherThanKept && s.origin.Size > 0 && nearSize(s.kept.Size, s.origin.Size) && !nearSize(total, s.origin.Size) {
+		return nil, recovered, fmt.Errorf("%w: %d bytes, not the %d kept, which its addon announced", errOtherFile, total, s.kept.Size)
+	}
+	if announced {
+		if err := s.checkAnnounced(total, trusted); err != nil {
+			return nil, recovered, err
+		}
+	}
+	if total >= 0 && s.size < 0 && s.pending != nil {
+		if otherThanKept {
+			dropped = s.dropPending()
+		} else {
+			s.adopt()
+		}
+	}
+	if total >= 0 {
+		s.size = total
+		// Readers waiting past the end, as for the first bytes of an
+		// empty answer, wait for nothing that will come.
+		s.wakePastEnd()
+	}
+	if s.contentType == "" {
+		s.contentType = contentType
+	}
+	if s.status == 0 && status != 0 {
+		s.status = status
+		close(s.learned)
+	}
+	return dropped, recovered, nil
+}
+
+// noteAnswer tells the cache what size host answered for the source, and
+// reports whether it is the error file the host answers for other files
+// (see noteMisfit): an answer too small for a video (errorMost), far
+// under the size the file is known or expected to have (errorShare), its
+// analyzed, announced or kept one, that the addon does not announce, is
+// noted as a misfit, and one of that size as the file's (see noteFit). A
+// misfit that is not the host's error file counts against the addon's
+// announced sizes as a first answer would. The
+// source's lock is held.
+func (s *Source) noteAnswer(host string, total int64) (bool, recovery) {
+	expected := s.expectedSize()
+	switch {
+	case expected <= 0:
+		return false, recovery{}
+	case total <= errorMost && total < expected/errorShare && (s.origin.Size <= 0 || !nearSize(total, s.origin.Size)):
+		announcer := ""
+		if s.size < 0 && s.origin.Size > 0 && s.origin.Announcer != "" && !s.sizeNoted {
+			announcer = s.origin.Announcer
+		}
+		errorFile := s.cache.noteMisfit(host, s.id, hostOf(s.origin.URL), total, announcer)
+		if announcer != "" && !errorFile {
+			s.sizeNoted = true
+		}
+		return errorFile, recovery{}
+	case total == s.size || s.size < 0 && nearSize(total, expected):
+		return false, s.cache.noteFit(host, total)
+	}
+	return false, recovery{}
+}
+
+// expectedSize is the size the source's file is known to have, else the
+// one its analysis found, its addon announced, or a previous run kept; 0
+// when none tells. The source's lock is held.
+func (s *Source) expectedSize() int64 {
+	switch {
+	case s.size >= 0:
+		return s.size
+	case s.origin.Analyzed > 0:
+		return s.origin.Analyzed
+	case s.origin.Size > 0:
+		return s.origin.Size
+	case s.pending != nil:
+		return s.kept.Size
+	}
+	return 0
+}
+
+// Learned returns a channel closed once an answer read as the source's
+// content told what it is: its size, or that it tells none (see
+// KnownSize), before any of its bytes are read.
+func (s *Source) Learned() <-chan struct{} {
+	return s.learned
+}
+
+// checkAnnounced compares the first size the source tells with the one
+// its addon announced, and refuses one more than 1% off while the
+// addon's sizes are trusted, trusted telling whether they were before
+// this answer. Within 1%, the size told is the file's. Each file counts
+// once in the addon's record, again when what it counted was taken back
+// (see noteMisfit). The source's lock is held.
+func (s *Source) checkAnnounced(total int64, trusted bool) error {
+	agrees := nearSize(total, s.origin.Size)
+	if !s.sizeNoted || s.cache.recount(s.id) {
+		s.sizeNoted = true
+		s.cache.noteSize(s.origin.Announcer, agrees)
+	}
+	if !agrees && trusted {
+		return fmt.Errorf("%w: %d bytes, not the %d its addon announced", errOtherFile, total, s.origin.Size)
+	}
+	s.sizeChecked = true
+	return nil
+}
+
+// nearSize reports whether a file's size is within sizeTolerance of the
+// one its addon announced.
+func nearSize(size, announced int64) bool {
+	return math.Abs(float64(size-announced)) <= sizeTolerance*float64(announced)
+}
+
+// backoff is how long to wait before the next attempt: what the source
+// asks for, up to maxWait, or a growing delay, up to maxBackoff.
+func backoff(attempt int, retryAfter string) time.Duration {
+	if seconds, err := strconv.Atoi(strings.TrimSpace(retryAfter)); err == nil && seconds >= 0 {
+		return min(time.Duration(seconds)*time.Second, maxWait)
+	}
+	return min(time.Duration(1<<min(attempt, 8))*250*time.Millisecond, maxBackoff)
+}
+
+// withoutURL is err without the request's URL, which may hold credentials.
+func withoutURL(err error) error {
+	var urlErr *url.Error
+	if errors.As(err, &urlErr) {
+		return urlErr.Err
+	}
+	return err
+}
+
+// contentRange reads "bytes start-end/total"; end is -1 for "*", total -1
+// when unknown.
+func contentRange(value string) (start, end, total int64, ok bool) {
+	spec, found := strings.CutPrefix(strings.TrimSpace(value), "bytes ")
+	if !found {
+		return 0, 0, 0, false
+	}
+	span, size, found := strings.Cut(spec, "/")
+	if !found {
+		return 0, 0, 0, false
+	}
+	total = -1
+	if size != "*" {
+		parsed, err := strconv.ParseInt(size, 10, 64)
+		if err != nil {
+			return 0, 0, 0, false
+		}
+		total = parsed
+	}
+	if span == "*" {
+		return 0, -1, total, true
+	}
+	first, last, found := strings.Cut(span, "-")
+	if !found {
+		return 0, 0, 0, false
+	}
+	start, err := strconv.ParseInt(first, 10, 64)
+	if err != nil {
+		return 0, 0, 0, false
+	}
+	end, err = strconv.ParseInt(last, 10, 64)
+	return start, end, total, err == nil
+}
+
+// ServeHTTP serves the source with byte ranges, for FFmpeg and ffprobe,
+// which read it from a loopback address, each request as a reader of its
+// own. A failed source is answered 502 at once while it is reported. One
+// failing while a body is sent is not cut at once: what reads it is
+// stopped on Failed, and a body cut short reads as the end of the file.
+func (s *Source) ServeHTTP(w http.ResponseWriter, r *http.Request) {
+	s.serveHTTP(w, r, true)
+}
+
+// ServeAsked is ServeHTTP without reading ahead: a request fetches the
+// blocks it reads, nothing more, for a read that must not fetch more than
+// it is sent, and the window a playback reads ahead of stays where it is.
+func (s *Source) ServeAsked(w http.ResponseWriter, r *http.Request) {
+	s.serveHTTP(w, r, false)
+}
+
+func (s *Source) serveHTTP(w http.ResponseWriter, r *http.Request, streaming bool) {
+	if sending, err := s.serve(w, r, streaming); err != nil && sending && r.Context().Err() == nil {
+		timer := time.NewTimer(failedHold)
+		defer timer.Stop()
+		select {
+		case <-r.Context().Done():
+		case <-timer.C:
+		}
+	}
+}
+
+// failedHold is how long the loopback holds a request whose source failed
+// before cutting it short, for what watches Failed to stop the reader.
+const failedHold = time.Second
+
+// Relay serves the source to a player with byte ranges, as ServeHTTP does:
+// from the cache, and through the address its origin redirected to. A
+// content type set on w is kept. The error, for logs, is what made the
+// answer fail or end early.
+func (s *Source) Relay(w http.ResponseWriter, r *http.Request) error {
+	_, err := s.serve(w, r, true)
+	return err
+}
+
+// serve answers a request for the source's bytes, read by a streaming
+// reader or not, and tells whether the error, if any, came once the answer
+// was being sent.
+func (s *Source) serve(w http.ResponseWriter, r *http.Request, streaming bool) (sending bool, err error) {
+	if err := s.Failure(); err != nil {
+		http.Error(w, "source unavailable", http.StatusBadGateway)
+		return false, err
+	}
+	reader := s.reader(streaming)
+	defer reader.Close()
+	size, err := reader.Size(r.Context())
+	if err != nil {
+		http.Error(w, "source unavailable", http.StatusBadGateway)
+		return false, err
+	}
+	if w.Header().Get("Content-Type") == "" {
+		contentType := s.ContentType()
+		if contentType == "" {
+			contentType = "application/octet-stream"
+		}
+		w.Header().Set("Content-Type", contentType)
+	}
+	served := &servedReader{reader: reader, ctx: r.Context()}
+	http.ServeContent(w, r, "", time.Time{}, io.NewSectionReader(served, 0, size))
+	return true, served.err
+}
+
+// servedReader reads a source on behalf of one request, and keeps the
+// first error.
+type servedReader struct {
+	reader *Reader
+	ctx    context.Context
+	err    error
+}
+
+func (r *servedReader) ReadAt(p []byte, off int64) (int, error) {
+	n, err := r.reader.ReadAt(r.ctx, p, off)
+	if err != nil && !errors.Is(err, io.EOF) && r.err == nil {
+		r.err = err
+	}
+	return n, err
+}

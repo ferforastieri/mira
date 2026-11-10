@@ -1,0 +1,868 @@
+package jellyfin
+
+import (
+	"context"
+	"encoding/json"
+	"fmt"
+	"net/http"
+	"net/http/httptest"
+	"os"
+	"path/filepath"
+	"slices"
+	"strings"
+	"testing"
+	"time"
+
+	"github.com/ferforastieri/mira/internal/accounts"
+	"github.com/ferforastieri/mira/internal/addons"
+	"github.com/ferforastieri/mira/internal/playback"
+	"github.com/ferforastieri/mira/internal/stremio"
+)
+
+// tracking browses the catalog addon as a member and finds its first movie
+// and its series' episodes, in order.
+type tracking struct {
+	testServer
+	token, user   string
+	views         map[string]string
+	movie, series string
+	episodes      []string
+	seasons       []string
+}
+
+func newTracking(t *testing.T) tracking {
+	t.Helper()
+	return trackingOn(t, newTestServer(t, 10))
+}
+
+// trackingOn is newTracking on a given test server.
+func trackingOn(t *testing.T, s testServer) tracking {
+	t.Helper()
+	s, token, views := browsingOn(t, s)
+	member, _ := s.store.Authenticate(t.Context(), "member", "correct horse")
+	tr := tracking{testServer: s, token: token, user: member.ID.String(), views: views}
+	var page QueryResult
+	s.get(t, "/Items?ParentId="+views["Top"], token, &page)
+	tr.movie = page.Items[0].Id
+	s.get(t, "/Items?ParentId="+views["Shows"], token, &page)
+	tr.series = page.Items[0].Id
+	s.get(t, "/Shows/"+tr.series+"/Episodes", token, &page)
+	for _, episode := range page.Items {
+		tr.episodes = append(tr.episodes, episode.Id)
+	}
+	s.get(t, "/Shows/"+tr.series+"/Seasons", token, &page)
+	for _, season := range page.Items {
+		tr.seasons = append(tr.seasons, season.Id)
+	}
+	return tr
+}
+
+func (tr tracking) report(t *testing.T, path string, body map[string]any) {
+	t.Helper()
+	if status, data := tr.call(http.MethodPost, path, app("tv", tr.token), body); status != http.StatusNoContent {
+		t.Fatalf("%s: %d %s", path, status, data)
+	}
+}
+
+func (tr tracking) userData(t *testing.T, id string) UserItemData {
+	t.Helper()
+	var item BaseItemDto
+	if status := tr.get(t, "/Users/"+tr.user+"/Items/"+id, tr.token, &item); status != http.StatusOK {
+		t.Fatalf("item %s: %d", id, status)
+	}
+	return item.UserData
+}
+
+func (tr tracking) mark(t *testing.T, method, path string) UserItemData {
+	t.Helper()
+	var data UserItemData
+	if status := tr.send(t, method, path, &data); status != http.StatusOK {
+		t.Fatalf("%s %s: %d", method, path, status)
+	}
+	return data
+}
+
+func (tr tracking) send(t *testing.T, method, path string, into any) int {
+	t.Helper()
+	status, body := tr.call(method, path, app("tv", tr.token), nil)
+	if into != nil && status == http.StatusOK {
+		if err := json.Unmarshal(body, into); err != nil {
+			t.Fatalf("%s %s: %v", method, path, err)
+		}
+	}
+	return status
+}
+
+func (tr tracking) list(t *testing.T, path string) []string {
+	t.Helper()
+	var page QueryResult
+	if status := tr.get(t, path, tr.token, &page); status != http.StatusOK {
+		t.Fatalf("%s: %d", path, status)
+	}
+	return itemIDs(page.Items)
+}
+
+func itemIDs(items []BaseItemDto) []string {
+	ids := make([]string, 0, len(items))
+	for _, item := range items {
+		ids = append(ids, item.Id)
+	}
+	return ids
+}
+
+func TestPlaybackReportsMoveTheResumePoint(t *testing.T) {
+	t.Parallel()
+	tr := newTracking(t)
+	// The movie runs 1h30, 54 000 000 000 ticks.
+	tr.report(t, "/Sessions/Playing", map[string]any{"ItemId": tr.movie, "PositionTicks": 0})
+	if data := tr.userData(t, tr.movie); data.PlayCount != 1 || data.LastPlayedDate == nil || data.Played || data.PlaybackPositionTicks != 0 {
+		t.Errorf("after starting: %+v", data)
+	}
+	tr.report(t, "/Sessions/Playing/Progress", map[string]any{"ItemId": tr.movie, "PositionTicks": int64(27_000_000_000)})
+	data := tr.userData(t, tr.movie)
+	if data.PlaybackPositionTicks != 27_000_000_000 || data.PlayedPercentage == nil || *data.PlayedPercentage != 50 {
+		t.Errorf("halfway: %+v", data)
+	}
+	if resume := tr.list(t, "/UserItems/Resume?mediaTypes=Video"); !slices.Equal(resume, []string{tr.movie}) {
+		t.Errorf("resume: %v", resume)
+	}
+	tr.report(t, "/Sessions/Playing/Stopped", map[string]any{"ItemId": tr.movie, "PositionTicks": int64(52_000_000_000)})
+	if data := tr.userData(t, tr.movie); !data.Played || data.PlaybackPositionTicks != 0 || data.PlayCount != 1 || data.PlayedPercentage != nil {
+		t.Errorf("stopped near the end: %+v", data)
+	}
+	if resume := tr.list(t, "/UserItems/Resume"); len(resume) != 0 {
+		t.Errorf("resume after the end: %v", resume)
+	}
+	// What one user did is theirs only.
+	tr.user2(t)
+}
+
+func TestPlayedAndResumePercentsMoveTheThresholds(t *testing.T) {
+	t.Parallel()
+	tr := newTracking(t)
+	if s := tr.store.Settings(); s.PlayedPercent != 90 || s.ResumePercent != 5 {
+		t.Fatalf("default thresholds: played %d, resume %d", s.PlayedPercent, s.ResumePercent)
+	}
+	tr.setting(t, func(s *accounts.Settings) { s.PlayedPercent, s.ResumePercent = 98, 20 })
+	// The movie runs 1h30, 54 000 000 000 ticks.
+	at := func(percent float64) map[string]any {
+		return map[string]any{"ItemId": tr.movie, "PositionTicks": int64(54_000_000_000 * percent / 100)}
+	}
+	tr.report(t, "/Sessions/Playing/Progress", at(15))
+	if data := tr.userData(t, tr.movie); data.PlaybackPositionTicks != 0 || data.Played {
+		t.Errorf("15%%, below the resume threshold: %+v", data)
+	}
+	tr.report(t, "/Sessions/Playing/Progress", at(25))
+	if data := tr.userData(t, tr.movie); data.PlaybackPositionTicks != 13_500_000_000 || data.Played {
+		t.Errorf("25%%, past the resume threshold: %+v", data)
+	}
+	tr.report(t, "/Sessions/Playing/Progress", at(96))
+	if data := tr.userData(t, tr.movie); data.PlaybackPositionTicks != 51_840_000_000 || data.Played {
+		t.Errorf("96%%, below the played threshold: %+v", data)
+	}
+	if resume := tr.list(t, "/UserItems/Resume"); !slices.Equal(resume, []string{tr.movie}) {
+		t.Errorf("resume at 96%%: %v", resume)
+	}
+	tr.report(t, "/Sessions/Playing/Stopped", at(99))
+	if data := tr.userData(t, tr.movie); data.PlaybackPositionTicks != 0 || !data.Played {
+		t.Errorf("99%%, past the played threshold: %+v", data)
+	}
+}
+
+func TestPlaybackReportsAreRecordedWhenTheAppHangsUp(t *testing.T) {
+	t.Parallel()
+	tr := newTracking(t)
+	device, user, err := tr.store.DeviceByToken(t.Context(), tr.token, "127.0.0.1")
+	if err != nil {
+		t.Fatal(err)
+	}
+	// The app closed as soon as it sent its stop: its request is canceled.
+	ctx, cancel := context.WithCancel(context.WithValue(t.Context(), callerKey{}, caller{User: user, Device: device, Token: tr.token}))
+	cancel()
+	r := httptest.NewRequestWithContext(ctx, http.MethodPost, "/Sessions/Playing/Stopped", nil)
+	// The movie runs 1h30: the stop at 45 minutes leaves a resume point.
+	tr.handler.record(r, playbackStopped, playback.PlayState{Item: mustID(t, tr.movie), Position: 45 * time.Minute}, true)
+	if data := tr.userData(t, tr.movie); data.PlaybackPositionTicks != 27_000_000_000 || data.Played {
+		t.Errorf("after a stop the app hung up on: %+v", data)
+	}
+}
+
+// user2 checks that another user of the server sees none of the member's
+// data.
+func (tr tracking) user2(t *testing.T) {
+	t.Helper()
+	tr.testServer.user("other", nil)
+	token := tr.signIn("other", "phone")
+	var item BaseItemDto
+	tr.get(t, "/Items/"+tr.movie, token, &item)
+	if item.UserData.Played || item.UserData.PlayCount != 0 || item.UserData.LastPlayedDate != nil {
+		t.Errorf("another user sees %+v", item.UserData)
+	}
+}
+
+func TestMarkingASeriesPlayedMarksItsEpisodes(t *testing.T) {
+	t.Parallel()
+	tr := newTracking(t)
+	data := tr.mark(t, http.MethodPost, "/UserPlayedItems/"+tr.series)
+	if !data.Played || data.UnplayedItemCount == nil || *data.UnplayedItemCount != 0 || data.ItemId != tr.series {
+		t.Errorf("series marked played: %+v", data)
+	}
+	var page QueryResult
+	tr.get(t, "/Shows/"+tr.series+"/Episodes", tr.token, &page)
+	for _, episode := range page.Items {
+		if !episode.UserData.Played {
+			t.Errorf("episode %s not played", episode.Name)
+		}
+	}
+	// Unmarking one episode leaves its season and series with one to play.
+	tr.mark(t, http.MethodDelete, "/UserPlayedItems/"+tr.episodes[0])
+	tr.get(t, "/Shows/"+tr.series+"/Seasons", tr.token, &page)
+	first := page.Items[0].UserData
+	if first.Played || first.UnplayedItemCount == nil || *first.UnplayedItemCount != 1 || first.PlayedPercentage == nil || *first.PlayedPercentage != 50 {
+		t.Errorf("first season: %+v", first)
+	}
+	if series := tr.userData(t, tr.series); series.Played || *series.UnplayedItemCount != 1 {
+		t.Errorf("series: %+v", series)
+	}
+	data = tr.mark(t, http.MethodDelete, "/Users/"+tr.user+"/PlayedItems/"+tr.seasons[1])
+	if data.Played || *data.UnplayedItemCount != 1 {
+		t.Errorf("second season unmarked: %+v", data)
+	}
+}
+
+func TestNextUpFollowsTheFurthestPlayedEpisode(t *testing.T) {
+	t.Parallel()
+	tr := newTracking(t)
+	nextUp := func(query string) []string { return tr.list(t, "/Shows/NextUp?"+query) }
+	if got := nextUp(""); len(got) != 0 {
+		t.Errorf("before watching: %v", got)
+	}
+	// A series asked for opens on its first episode.
+	if got := nextUp("seriesId=" + tr.series); !slices.Equal(got, tr.episodes[:1]) {
+		t.Errorf("series never watched: %v", got)
+	}
+	// The last episode of a season leads to the next season, even when an
+	// earlier episode is played afterwards.
+	tr.mark(t, http.MethodPost, "/UserPlayedItems/"+tr.episodes[1])
+	tr.mark(t, http.MethodPost, "/UserPlayedItems/"+tr.episodes[0])
+	if got := nextUp(""); !slices.Equal(got, tr.episodes[2:3]) {
+		t.Errorf("after the first season: %v", got)
+	}
+	// Only libraries narrow Next Up down: a series does not.
+	if got := nextUp("parentId=" + tr.views["Shows"]); !slices.Equal(got, tr.episodes[2:3]) {
+		t.Errorf("in the series library: %v", got)
+	}
+	for _, parent := range []string{tr.views["Top"], tr.series} {
+		if got := nextUp("parentId=" + parent); len(got) != 0 {
+			t.Errorf("under %s: %v", parent, got)
+		}
+	}
+	// jellyfin-web's home page sends a date only; series played before it
+	// are left out.
+	if got := nextUp("nextUpDateCutoff=2099-01-01"); len(got) != 0 {
+		t.Errorf("after the cutoff: %v", got)
+	}
+	if got := nextUp("nextUpDateCutoff=2020-01-01&enableTotalRecordCount=false"); !slices.Equal(got, tr.episodes[2:3]) {
+		t.Errorf("before the cutoff: %v", got)
+	}
+	var page QueryResult
+	tr.get(t, "/Shows/NextUp?enableTotalRecordCount=false", tr.token, &page)
+	if page.TotalRecordCount != 0 {
+		t.Errorf("total without counting: %d", page.TotalRecordCount)
+	}
+	// An episode under way is next up, unless resumable ones are left out:
+	// then the series is.
+	tr.report(t, "/Sessions/Playing/Stopped", map[string]any{"ItemId": tr.episodes[2], "PositionTicks": int64(10_000_000_000)})
+	if got := nextUp("enableResumable=false"); len(got) != 0 {
+		t.Errorf("without resumable episodes: %v", got)
+	}
+	if got := nextUp(""); !slices.Equal(got, tr.episodes[2:3]) {
+		t.Errorf("with the episode under way: %v", got)
+	}
+	tr.mark(t, http.MethodPost, "/UserPlayedItems/"+tr.episodes[2])
+	if got := nextUp(""); len(got) != 0 {
+		t.Errorf("after the last episode: %v", got)
+	}
+}
+
+// TestNextUpFollowsARewatch checks enableRewatching against Jellyfin
+// 12.4's rules (TVSeriesManager.GetNextUpBatched): the next played episode
+// after the one played last, beside the next unplayed one.
+func TestNextUpFollowsARewatch(t *testing.T) {
+	t.Parallel()
+	// played marks episodes played on the given days of January 2026.
+	played := func(t *testing.T, tr tracking, marks ...any) {
+		t.Helper()
+		for i := 0; i < len(marks); i += 2 {
+			tr.mark(t, http.MethodPost, fmt.Sprintf("/UserPlayedItems/%s?datePlayed=2026-01-%02dT20:00:00Z", marks[i], marks[i+1]))
+		}
+	}
+	nextUp := func(t *testing.T, tr tracking, query string) []string {
+		t.Helper()
+		return tr.list(t, "/Shows/NextUp?"+query)
+	}
+	t.Run("a series watched to the end and started again", func(t *testing.T) {
+		t.Parallel()
+		tr := newTracking(t)
+		if len(tr.episodes) != 3 {
+			t.Fatalf("episodes: %v", tr.episodes)
+		}
+		played(t, tr, tr.episodes[0], 1, tr.episodes[1], 2, tr.episodes[2], 3, tr.episodes[0], 4)
+		if got := nextUp(t, tr, ""); len(got) != 0 {
+			t.Errorf("without rewatching: %v", got)
+		}
+		if got := nextUp(t, tr, "enableRewatching=false"); len(got) != 0 {
+			t.Errorf("rewatching off: %v", got)
+		}
+		if got := nextUp(t, tr, "enableRewatching=true&enableResumable=false"); !slices.Equal(got, tr.episodes[1:2]) {
+			t.Errorf("rewatching: %v", got)
+		}
+		// A series asked for follows the parameter too, as in Jellyfin.
+		if got := nextUp(t, tr, "seriesId="+tr.series+"&enableRewatching=true"); !slices.Equal(got, tr.episodes[1:2]) {
+			t.Errorf("the series, rewatching: %v", got)
+		}
+	})
+	t.Run("a rewatch before the end lists both episodes", func(t *testing.T) {
+		t.Parallel()
+		tr := newTracking(t)
+		played(t, tr, tr.episodes[0], 1, tr.episodes[1], 2, tr.episodes[0], 3)
+		if got := nextUp(t, tr, ""); !slices.Equal(got, tr.episodes[2:3]) {
+			t.Errorf("without rewatching: %v", got)
+		}
+		// Each dated with the play it follows: the rewatch, played last,
+		// first.
+		if got := nextUp(t, tr, "enableRewatching=true"); !slices.Equal(got, []string{tr.episodes[1], tr.episodes[2]}) {
+			t.Errorf("rewatching: %v", got)
+		}
+	})
+	t.Run("a rewatch episode under way is left out", func(t *testing.T) {
+		t.Parallel()
+		tr := newTracking(t)
+		played(t, tr, tr.episodes[0], 1, tr.episodes[1], 2, tr.episodes[2], 3)
+		// The second episode, played, keeps a resume point from an older
+		// play.
+		if status, body := tr.call(http.MethodPost, "/UserItems/"+tr.episodes[1]+"/UserData", app("tv", tr.token),
+			map[string]any{"PlaybackPositionTicks": int64(10_000_000_000)}); status != http.StatusOK {
+			t.Fatalf("a resume point: %d %s", status, body)
+		}
+		played(t, tr, tr.episodes[0], 4)
+		if got := nextUp(t, tr, "enableRewatching=true"); len(got) != 0 {
+			t.Errorf("rewatch under way: %v", got)
+		}
+		// Finishing it moves the rewatch on.
+		played(t, tr, tr.episodes[1], 5)
+		if got := nextUp(t, tr, "enableRewatching=true"); !slices.Equal(got, tr.episodes[2:3]) {
+			t.Errorf("rewatch past the second episode: %v", got)
+		}
+	})
+}
+
+// startedAddon serves a catalog of five series of 45-minute episodes, a
+// special and three regular ones each, aired long ago: Arc, Bend, Cove
+// (the only horror one), Dune and Eden.
+func startedAddon(t *testing.T) string {
+	t.Helper()
+	var shows []stremio.Meta
+	for i, name := range []string{"Arc", "Bend", "Cove", "Dune", "Eden"} {
+		id := fmt.Sprintf("tt05%02d", i)
+		genre := "Drama"
+		if name == "Cove" {
+			genre = "Horror"
+		}
+		show := stremio.Meta{ID: id, Type: "series", Name: name, Genres: []string{genre}, Runtime: "45min"}
+		show.Videos = append(show.Videos, stremio.Video{ID: id + ":0:1", Title: name + " special", Season: 0, Episode: 1,
+			Released: "2019-12-01T00:00:00.000Z", Runtime: "45min"})
+		for episode := 1; episode <= 3; episode++ {
+			show.Videos = append(show.Videos, stremio.Video{ID: fmt.Sprintf("%s:1:%d", id, episode), Title: fmt.Sprintf("%s %d", name, episode),
+				Season: 1, Episode: stremio.Number(episode), Released: fmt.Sprintf("2020-01-%02dT00:00:00.000Z", episode), Runtime: "45min"})
+		}
+		shows = append(shows, show)
+	}
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		path := r.URL.EscapedPath()
+		switch {
+		case path == "/manifest.json":
+			_ = json.NewEncoder(w).Encode(stremio.Manifest{ID: "started", Name: "Started", Version: "1", Types: []string{"series"},
+				Resources: []stremio.Resource{{Name: "catalog"}, {Name: "meta"}},
+				Catalogs:  []stremio.Catalog{{Type: "series", ID: "series", Name: "Series"}}})
+		case strings.HasPrefix(path, "/catalog/series/series"):
+			previews := make([]stremio.Meta, 0, len(shows))
+			for _, show := range shows {
+				show.Videos = nil
+				previews = append(previews, show)
+			}
+			_ = json.NewEncoder(w).Encode(map[string]any{"metas": previews})
+		case strings.HasPrefix(path, "/meta/series/"):
+			id := strings.TrimSuffix(strings.TrimPrefix(path, "/meta/series/"), ".json")
+			for _, show := range shows {
+				if show.ID == id {
+					_ = json.NewEncoder(w).Encode(map[string]any{"meta": show})
+					return
+				}
+			}
+			http.NotFound(w, r)
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	t.Cleanup(server.Close)
+	return server.URL + "/manifest.json"
+}
+
+// As in Jellyfin 12.4, a series one of whose episodes was only started,
+// none played, is in Next Up with its first unplayed episode, after the
+// series with a played episode, and the cutoff looks at the latest
+// episode played or started.
+func TestNextUpTakesSeriesOnlyStarted(t *testing.T) {
+	t.Parallel()
+	s := newTestServer(t, 10)
+	member := s.user("member", nil)
+	addon, err := s.addons.Install(t.Context(), addons.Shared(), startedAddon(t), false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := s.addons.SetLibraries(t.Context(), addons.Shared(), []addons.LibraryChoice{
+		{AddonID: addon.ID, CatalogType: "series", CatalogID: "series"},
+	}); err != nil {
+		t.Fatal(err)
+	}
+	token := s.signIn("member", "tv")
+	tr := tracking{testServer: s, token: token, user: member.ID.String(), views: map[string]string{}}
+	var page QueryResult
+	s.get(t, "/UserViews", token, &page)
+	for _, view := range page.Items {
+		tr.views[view.Name] = view.Id
+	}
+	series := map[string]string{}
+	episodes := map[string]string{}
+	s.get(t, "/Items?ParentId="+tr.views["Series"], token, &page)
+	for _, show := range page.Items {
+		series[show.Name] = show.Id
+		var listed QueryResult
+		s.get(t, "/Shows/"+show.Id+"/Episodes", token, &listed)
+		for _, episode := range listed.Items {
+			episodes[episode.Name] = episode.Id
+		}
+	}
+	if len(series) != 5 || len(episodes) != 20 {
+		t.Fatalf("series %v, episodes %d", series, len(episodes))
+	}
+	named := func(names ...string) []string {
+		ids := make([]string, 0, len(names))
+		for _, name := range names {
+			ids = append(ids, episodes[name])
+		}
+		return ids
+	}
+	minute := int64(60 * 10_000_000)
+	play := func(name string, stoppedAt int64) {
+		tr.report(t, "/Sessions/Playing", map[string]any{"ItemId": episodes[name], "PositionTicks": 0})
+		tr.report(t, "/Sessions/Playing/Stopped", map[string]any{"ItemId": episodes[name], "PositionTicks": stoppedAt})
+	}
+	nextUp := func(query string) []string { return tr.list(t, "/Shows/NextUp?"+query) }
+
+	// Arc's first episode was played long ago.
+	tr.mark(t, http.MethodPost, "/UserPlayedItems/"+episodes["Arc 1"]+"?datePlayed=2021-01-02T03:04:05Z")
+	// Bend's second, Cove's second and Eden's first are under way; Dune's
+	// first was stopped before the resume threshold, keeping no resume
+	// point. Arc's second was just started the same way.
+	play("Bend 2", 15*minute)
+	play("Dune 1", minute)
+	play("Cove 2", 15*minute)
+	play("Eden 1", 15*minute)
+	play("Arc 2", minute)
+
+	// The series with a played episode first; then those only started, the
+	// latest first, each from its first episode. Eden's is under way: the
+	// web player's home, leaving such episodes out, leaves Eden out.
+	web := "enableResumable=false"
+	if got, want := nextUp(web), named("Arc 2", "Cove 1", "Dune 1", "Bend 1"); !slices.Equal(got, want) {
+		t.Errorf("as the web player asks: %v, want %v", got, want)
+	}
+	if got, want := nextUp(""), named("Arc 2", "Eden 1", "Cove 1", "Dune 1", "Bend 1"); !slices.Equal(got, want) {
+		t.Errorf("with episodes under way: %v, want %v", got, want)
+	}
+	// Arc was played before the cutoff, but started after it.
+	if got, want := nextUp(web+"&nextUpDateCutoff=2025-01-01"), named("Arc 2", "Cove 1", "Dune 1", "Bend 1"); !slices.Equal(got, want) {
+		t.Errorf("after a cutoff before today: %v, want %v", got, want)
+	}
+	if got := nextUp(web + "&nextUpDateCutoff=2099-01-01"); len(got) != 0 {
+		t.Errorf("after a cutoff to come: %v", got)
+	}
+
+	// A hidden series, and one of a blocked genre, are left out; the
+	// hidden one still opens on its page.
+	if status, body := s.call(http.MethodPost, "/Mira/UserItems/"+series["Bend"]+"/Hidden", app("tv", token), nil); status != http.StatusNoContent {
+		t.Fatalf("hiding Bend: %d %s", status, body)
+	}
+	if got, want := nextUp(web), named("Arc 2", "Cove 1", "Dune 1"); !slices.Equal(got, want) {
+		t.Errorf("with Bend hidden: %v, want %v", got, want)
+	}
+	if got, want := nextUp("seriesId="+series["Bend"]), named("Bend 1"); !slices.Equal(got, want) {
+		t.Errorf("Bend's own: %v, want %v", got, want)
+	}
+	if _, err := s.store.UpdateUser(t.Context(), member.ID, accounts.UserChanges{BlockedGenres: &[]string{"Horror"}}, nil); err != nil {
+		t.Fatal(err)
+	}
+	if got, want := nextUp(web), named("Arc 2", "Dune 1"); !slices.Equal(got, want) {
+		t.Errorf("with horror blocked: %v, want %v", got, want)
+	}
+}
+
+// airingAddon serves a movie catalog and a catalog of three series whose
+// episodes air around now: Bravo, Alpha and Charlie.
+func airingAddon(t *testing.T) string {
+	t.Helper()
+	now := time.Now().UTC()
+	at := func(offset time.Duration) string { return now.Add(offset).Format(time.RFC3339) }
+	day := 24 * time.Hour
+	shows := []stremio.Meta{
+		{ID: "tt0200", Type: "series", Name: "Bravo", Videos: []stremio.Video{
+			{ID: "tt0200:1:1", Title: "Bravo long ago", Season: 1, Episode: 1, Released: at(-10 * day)},
+			{ID: "tt0200:1:2", Title: "Bravo two days ago", Season: 1, Episode: 2, Released: at(-50 * time.Hour)},
+			{ID: "tt0200:1:3", Title: "Bravo hours ago", Season: 1, Episode: 3, Released: at(-12 * time.Hour)},
+			{ID: "tt0200:1:4", Title: "Bravo tomorrow", Season: 1, Episode: 4, Released: at(day)},
+			{ID: "tt0200:1:5", Title: "Bravo next week", Season: 1, Episode: 5, Released: at(7 * day)},
+			{ID: "tt0200:0:1", Title: "Bravo special", Season: 0, Episode: 1, Released: at(day)},
+		}},
+		{ID: "tt0201", Type: "series", Name: "Alpha", Videos: []stremio.Video{
+			{ID: "tt0201:1:1", Title: "Alpha next week", Season: 1, Episode: 1, Released: at(7 * day)},
+			{ID: "tt0201:1:2", Title: "Alpha undated", Season: 1, Episode: 2},
+		}},
+		{ID: "tt0202", Type: "series", Name: "Charlie", Videos: []stremio.Video{
+			{ID: "tt0202:1:1", Title: "Charlie tomorrow", Season: 1, Episode: 1, Released: at(day)},
+		}},
+	}
+	movie := stremio.Meta{ID: "tt0300", Type: "movie", Name: "Feature", Released: "2020-04-10T00:00:00.000Z"}
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		path := r.URL.EscapedPath()
+		switch {
+		case path == "/manifest.json":
+			_ = json.NewEncoder(w).Encode(stremio.Manifest{ID: "airing", Name: "Airing", Version: "1", Types: []string{"movie", "series"},
+				Resources: []stremio.Resource{{Name: "catalog"}, {Name: "meta"}},
+				Catalogs:  []stremio.Catalog{{Type: "movie", ID: "movies", Name: "Movies"}, {Type: "series", ID: "tonight", Name: "Tonight"}}})
+		case strings.HasPrefix(path, "/catalog/movie/movies"):
+			_ = json.NewEncoder(w).Encode(map[string]any{"metas": []stremio.Meta{movie}})
+		case strings.HasPrefix(path, "/catalog/series/tonight"):
+			previews := make([]stremio.Meta, 0, len(shows))
+			for _, show := range shows {
+				show.Videos = nil
+				previews = append(previews, show)
+			}
+			_ = json.NewEncoder(w).Encode(map[string]any{"metas": previews})
+		case path == "/meta/movie/tt0300.json":
+			_ = json.NewEncoder(w).Encode(map[string]any{"meta": movie})
+		case strings.HasPrefix(path, "/meta/series/"):
+			id := strings.TrimSuffix(strings.TrimPrefix(path, "/meta/series/"), ".json")
+			for _, show := range shows {
+				if show.ID == id {
+					_ = json.NewEncoder(w).Encode(map[string]any{"meta": show})
+					return
+				}
+			}
+			http.NotFound(w, r)
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	t.Cleanup(server.Close)
+	return server.URL + "/manifest.json"
+}
+
+func TestUpcomingListsComingEpisodesOfWatchedAndFavoriteSeries(t *testing.T) {
+	t.Parallel()
+	s := newTestServer(t, 10)
+	s.user("member", nil)
+	addon, err := s.addons.Install(t.Context(), addons.Shared(), airingAddon(t), false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := s.addons.SetLibraries(t.Context(), addons.Shared(), []addons.LibraryChoice{
+		{AddonID: addon.ID, CatalogType: "movie", CatalogID: "movies"},
+		{AddonID: addon.ID, CatalogType: "series", CatalogID: "tonight"},
+	}); err != nil {
+		t.Fatal(err)
+	}
+	token := s.signIn("member", "tv")
+	tr := tracking{testServer: s, token: token, views: map[string]string{}}
+	var page QueryResult
+	s.get(t, "/UserViews", token, &page)
+	for _, view := range page.Items {
+		tr.views[view.Name] = view.Id
+	}
+	series := map[string]string{}
+	s.get(t, "/Items?ParentId="+tr.views["Tonight"], token, &page)
+	for _, show := range page.Items {
+		series[show.Name] = show.Id
+	}
+	episodes := map[string]string{}
+	for _, id := range series {
+		s.get(t, "/Shows/"+id+"/Episodes", token, &page)
+		for _, episode := range page.Items {
+			episodes[episode.Name] = episode.Id
+		}
+	}
+	named := func(names ...string) []string {
+		ids := make([]string, 0, len(names))
+		for _, name := range names {
+			ids = append(ids, episodes[name])
+		}
+		return ids
+	}
+	upcoming := func(query string) []string { return tr.list(t, "/Shows/Upcoming?"+query) }
+	if got := upcoming(""); len(got) != 0 {
+		t.Errorf("before watching: %v", got)
+	}
+	// A played episode makes its series watched: its episodes aired from
+	// yesterday on come, specials included, by date and then season.
+	tr.mark(t, http.MethodPost, "/UserPlayedItems/"+episodes["Bravo long ago"])
+	if got, want := upcoming(""), named("Bravo hours ago", "Bravo special", "Bravo tomorrow", "Bravo next week"); !slices.Equal(got, want) {
+		t.Errorf("watching Bravo: %v, want %v", got, want)
+	}
+	// A favorite series counts without being watched; a favorite movie is
+	// no series. Episodes of the same date come in series order.
+	tr.mark(t, http.MethodPost, "/UserFavoriteItems/"+series["Alpha"])
+	s.get(t, "/Items?ParentId="+tr.views["Movies"], token, &page)
+	tr.mark(t, http.MethodPost, "/UserFavoriteItems/"+page.Items[0].Id)
+	all := named("Bravo hours ago", "Bravo special", "Bravo tomorrow", "Alpha next week", "Bravo next week")
+	if got := upcoming(""); !slices.Equal(got, all) {
+		t.Errorf("with Alpha a favorite: %v, want %v", got, all)
+	}
+	// Only libraries narrow the list down: a series does not.
+	if got := upcoming("parentId=" + tr.views["Tonight"]); !slices.Equal(got, all) {
+		t.Errorf("in the series library: %v", got)
+	}
+	for _, parent := range []string{tr.views["Movies"], series["Bravo"]} {
+		if got := upcoming("parentId=" + parent); len(got) != 0 {
+			t.Errorf("under %s: %v", parent, got)
+		}
+	}
+	// The total is what the page holds, as Jellyfin counts it.
+	tr.get(t, "/Shows/Upcoming?startIndex=1&limit=2", token, &page)
+	if got := itemIDs(page.Items); !slices.Equal(got, all[1:3]) || page.TotalRecordCount != 2 || page.StartIndex != 1 {
+		t.Errorf("second page: %v, total %d, start %d", got, page.TotalRecordCount, page.StartIndex)
+	}
+	// An unknown user is answered as Next Up answers it.
+	unknown := "?userId=00000000000000000000000000000001"
+	nextUp, _ := tr.call(http.MethodGet, "/Shows/NextUp"+unknown, app("tv", token), nil)
+	if status, body := tr.call(http.MethodGet, "/Shows/Upcoming"+unknown, app("tv", token), nil); status != nextUp || status == http.StatusOK {
+		t.Errorf("unknown user: %d %s, Next Up %d", status, body, nextUp)
+	}
+}
+
+func TestPlayedMarksCountPlays(t *testing.T) {
+	t.Parallel()
+	tr := newTracking(t)
+	first := tr.mark(t, http.MethodPost, "/UserPlayedItems/"+tr.movie)
+	again := tr.mark(t, http.MethodPost, "/UserPlayedItems/"+tr.movie)
+	if first.PlayCount != 1 || again.PlayCount != 1 || first.LastPlayedDate == nil || again.LastPlayedDate == nil ||
+		time.Time(*again.LastPlayedDate) != time.Time(*first.LastPlayedDate) {
+		t.Errorf("undated marks: %+v then %+v", first, again)
+	}
+	// jellyfin-web dates its marks: each one counts.
+	dated := tr.mark(t, http.MethodPost, "/Users/"+tr.user+"/PlayedItems/"+tr.movie+"?DatePlayed=2021-05-06")
+	if dated.PlayCount != 2 || time.Time(*dated.LastPlayedDate) != time.Date(2021, 5, 6, 0, 0, 0, 0, time.UTC) {
+		t.Errorf("dated mark: %+v", dated)
+	}
+	if unplayed := tr.mark(t, http.MethodDelete, "/UserPlayedItems/"+tr.movie); unplayed.Played || unplayed.PlayCount != 0 || unplayed.LastPlayedDate != nil {
+		t.Errorf("unmarked: %+v", unplayed)
+	}
+}
+
+func TestFavoritesAreListed(t *testing.T) {
+	t.Parallel()
+	tr := newTracking(t)
+	if data := tr.mark(t, http.MethodPost, "/UserFavoriteItems/"+tr.movie); !data.IsFavorite {
+		t.Errorf("favorite: %+v", data)
+	}
+	tr.mark(t, http.MethodPost, "/Users/"+tr.user+"/FavoriteItems/"+tr.series)
+	all := "/Items?Filters=IsFavorite&Recursive=true"
+	if got := tr.list(t, all+"&IncludeItemTypes=Movie"); !slices.Equal(got, []string{tr.movie}) {
+		t.Errorf("favorite movies: %v", got)
+	}
+	if got := tr.list(t, all+"&IncludeItemTypes=Series&ParentId="+tr.views["Shows"]); !slices.Equal(got, []string{tr.series}) {
+		t.Errorf("favorite series of the series library: %v", got)
+	}
+	if got := tr.list(t, all+"&ParentId="+tr.views["Top"]); !slices.Equal(got, []string{tr.movie}) {
+		t.Errorf("favorites of the movie library: %v", got)
+	}
+	tr.mark(t, http.MethodDelete, "/UserFavoriteItems/"+tr.movie)
+	if got := tr.list(t, "/Items?isFavorite=true&Recursive=true"); !slices.Equal(got, []string{tr.series}) {
+		t.Errorf("after removing the movie: %v", got)
+	}
+}
+
+func TestPlayedTitlesLeaveUnplayedListings(t *testing.T) {
+	t.Parallel()
+	tr := newTracking(t)
+	before := tr.list(t, "/Items?ParentId="+tr.views["Top"])
+	tr.mark(t, http.MethodPost, "/UserPlayedItems/"+tr.movie)
+	unplayed := tr.list(t, "/Items?Filters=IsUnplayed&ParentId="+tr.views["Top"])
+	if want := slices.DeleteFunc(slices.Clone(before), func(id string) bool { return id == tr.movie }); !slices.Equal(unplayed, want) {
+		t.Errorf("unplayed: %v, want %v", unplayed, want)
+	}
+	if played := tr.list(t, "/Items?Filters=IsPlayed&Recursive=true&IncludeItemTypes=Movie"); !slices.Equal(played, []string{tr.movie}) {
+		t.Errorf("played: %v", played)
+	}
+	var latest []BaseItemDto
+	tr.get(t, "/Items/Latest?ParentId="+tr.views["Top"], tr.token, &latest)
+	if slices.Contains(itemIDs(latest), tr.movie) {
+		t.Error("a played title is among the latest")
+	}
+}
+
+func TestUserDataCanBeReadAndChanged(t *testing.T) {
+	t.Parallel()
+	tr := newTracking(t)
+	// Apps upload what was played offline as it is: a position near the end
+	// stays a position.
+	status, body := tr.call(http.MethodPost, "/UserItems/"+tr.movie+"/UserData", app("tv", tr.token),
+		map[string]any{"PlaybackPositionTicks": int64(52_000_000_000), "IsFavorite": true, "PlayedPercentage": 12.5, "LastPlayedDate": nil})
+	var data UserItemData
+	if status != http.StatusOK {
+		t.Fatalf("update: %d %s", status, body)
+	}
+	if err := json.Unmarshal(body, &data); err != nil {
+		t.Fatal(err)
+	}
+	if data.PlaybackPositionTicks != 52_000_000_000 || !data.IsFavorite || data.Played || data.PlayCount != 0 || data.LastPlayedDate != nil {
+		t.Errorf("updated: %+v", data)
+	}
+	// The movie runs 1h30.
+	var read UserItemData
+	if status := tr.send(t, http.MethodGet, "/UserItems/"+tr.movie+"/UserData", &read); status != http.StatusOK ||
+		read.PlaybackPositionTicks != data.PlaybackPositionTicks || !read.IsFavorite || read.PlayedPercentage == nil ||
+		int(*read.PlayedPercentage) != 96 {
+		t.Errorf("read back: %d %+v", status, read)
+	}
+	if liked := tr.mark(t, http.MethodPost, "/UserItems/"+tr.movie+"/Rating?likes=true"); liked.Likes == nil || !*liked.Likes || *liked.Rating != 10 {
+		t.Errorf("liked: %+v", liked)
+	}
+	if disliked := tr.mark(t, http.MethodPost, "/Users/"+tr.user+"/Items/"+tr.movie+"/Rating?likes=false"); *disliked.Likes || *disliked.Rating != 1 {
+		t.Errorf("disliked: %+v", disliked)
+	}
+	if forgotten := tr.mark(t, http.MethodPost, "/UserItems/"+tr.movie+"/Rating"); forgotten.Likes != nil || forgotten.Rating != nil {
+		t.Errorf("rating removed: %+v", forgotten)
+	}
+}
+
+func TestUserDataRequestsAreChecked(t *testing.T) {
+	t.Parallel()
+	tr := newTracking(t)
+	for _, path := range []string{"/UserPlayedItems/00000000000000000000000000000001", "/UserFavoriteItems/00000000000000000000000000000001"} {
+		if status := tr.send(t, http.MethodPost, path, nil); status != http.StatusNotFound {
+			t.Errorf("%s: %d", path, status)
+		}
+	}
+	tr.testServer.user("other", nil)
+	other, _ := tr.store.Authenticate(t.Context(), "other", "correct horse")
+	for _, path := range []string{"/UserFavoriteItems/" + tr.movie + "?userId=" + other.ID.String(), "/Users/" + other.ID.String() + "/PlayedItems/" + tr.movie} {
+		if status, body := tr.call(http.MethodPost, path, app("tv", tr.token), nil); status != http.StatusForbidden || string(body) != "Error processing request." {
+			t.Errorf("%s for another user: %d %s", path, status, body)
+		}
+	}
+	if status, body := tr.call(http.MethodPost, "/UserItems/"+tr.movie+"/Rating?likes=maybe", app("tv", tr.token), nil); status != http.StatusBadRequest {
+		t.Errorf("likes=maybe: %d %s", status, body)
+	}
+}
+
+func TestFavoritePeopleAreListed(t *testing.T) {
+	t.Parallel()
+	tr := newTracking(t)
+	var movie BaseItemDto
+	tr.get(t, "/Users/"+tr.user+"/Items/"+tr.movie, tr.token, &movie)
+	actor := (*movie.People)[0]
+	tr.mark(t, http.MethodPost, "/UserFavoriteItems/"+actor.Id)
+	tr.mark(t, http.MethodPost, "/UserFavoriteItems/"+tr.movie)
+	if got := tr.list(t, "/Persons?isFavorite=true&userId="+tr.user); !slices.Equal(got, []string{actor.Id}) {
+		t.Errorf("favorite people: %v", got)
+	}
+	if got := tr.list(t, "/Persons?isFavorite=false"); len(got) != 0 {
+		t.Errorf("people not marked favorite: %v", got)
+	}
+}
+
+// TestUserDataResponsesMatchJellyfin compares user data responses with those
+// recorded from Jellyfin 12.2 by scripts/jellyfin-fixtures.sh, after the same
+// marks and resume points.
+func TestUserDataResponsesMatchJellyfin(t *testing.T) {
+	t.Parallel()
+	tr := newTracking(t)
+	user, signed := tr.user, app("tv", tr.token)
+	var page QueryResult
+	tr.get(t, "/Items?ParentId="+tr.views["Top"], tr.token, &page)
+	favorite, unplayed := page.Items[1].Id, page.Items[2].Id
+	ago := func(d time.Duration) string { return time.Now().Add(-d).UTC().Format(time.RFC3339) }
+	// A resume point at 40% of the item's runtime, last played some time ago.
+	resumeAt := func(id string, d time.Duration) {
+		t.Helper()
+		var item BaseItemDto
+		tr.get(t, "/Users/"+user+"/Items/"+id, tr.token, &item)
+		if status, body := tr.call(http.MethodPost, "/UserItems/"+id+"/UserData?userId="+user, signed,
+			map[string]any{"PlaybackPositionTicks": *item.RunTimeTicks * 2 / 5, "LastPlayedDate": ago(d)}); status != http.StatusOK {
+			t.Fatalf("resume point: %d %s", status, body)
+		}
+	}
+	_, played := tr.call(http.MethodPost, "/UserPlayedItems/"+tr.movie+"?userId="+user, signed, nil)
+	_, favorited := tr.call(http.MethodPost, "/UserFavoriteItems/"+favorite+"?userId="+user, signed, nil)
+	tr.call(http.MethodPost, "/Users/"+user+"/PlayedItems/"+tr.episodes[0]+"?DatePlayed="+ago(2*time.Hour), signed, nil)
+	resumeAt(unplayed, time.Hour)
+	resumeAt(tr.episodes[0], 2*time.Minute)
+	resumeAt(tr.episodes[2], time.Minute)
+	_, resume := tr.call(http.MethodGet, "/UserItems/Resume?userId="+user+"&limit=12&fields=PrimaryImageAspectRatio&mediaTypes=Video"+
+		"&imageTypeLimit=1&enableImageTypes=Primary&enableImageTypes=Backdrop&enableImageTypes=Thumb&enableTotalRecordCount=false", signed, nil)
+	_, nextUp := tr.call(http.MethodGet, "/Shows/NextUp?userId="+user+"&limit=24&fields=PrimaryImageAspectRatio&fields=DateCreated&fields=Path"+
+		"&fields=MediaSourceCount&imageTypeLimit=1&enableImageTypes=Primary&enableImageTypes=Backdrop&enableImageTypes=Thumb"+
+		"&nextUpDateCutoff="+time.Now().AddDate(-1, 0, 0).Format("2006-01-02")+"&enableTotalRecordCount=false&enableResumable=false&enableRewatching=false", signed, nil)
+	_, favorites := tr.call(http.MethodGet, "/Users/"+user+"/Items?SortBy=SeriesSortName%2CSortName&SortOrder=Ascending&Filters=IsFavorite"+
+		"&Recursive=true&Fields=PrimaryImageAspectRatio&CollapseBoxSetItems=false&ExcludeLocationTypes=Virtual&EnableTotalRecordCount=false"+
+		"&Limit=20&IncludeItemTypes=Movie", signed, nil)
+	_, series := tr.call(http.MethodGet, "/Users/"+user+"/Items/"+tr.series, signed, nil)
+	_, episodes := tr.call(http.MethodGet, "/Shows/"+tr.series+"/Episodes?userId="+user+
+		"&Fields=ItemCounts,PrimaryImageAspectRatio,CanDelete,MediaSourceCount,Overview", signed, nil)
+	for fixture, body := range map[string][]byte{
+		"user-item-data":       played,
+		"favorite-user-data":   favorited,
+		"resume-items":         resume,
+		"next-up":              nextUp,
+		"favorites":            favorites,
+		"series-in-progress":   series,
+		"episodes-in-progress": episodes,
+	} {
+		raw, err := os.ReadFile(filepath.Join("testdata", "jellyfin-12.2", fixture+".json"))
+		if err != nil {
+			t.Fatal(err)
+		}
+		var want, got any
+		if err := json.Unmarshal(raw, &want); err != nil {
+			t.Fatal(err)
+		}
+		if err := json.Unmarshal(body, &got); err != nil {
+			t.Fatalf("%s: %v in %s", fixture, err, body)
+		}
+		for _, difference := range compareShapes(fixture, want, got, userDataShapes) {
+			t.Error(difference)
+		}
+	}
+}
+
+// userDataShapes lists what Mira cannot match in the user data fixtures.
+var userDataShapes = shapeRules{
+	dynamic: []string{"ImageTags", "ImageBlurHashes", "ProviderIds"},
+	absent: map[string][]string{
+		// Mira has no files, and the test addon has no streams.
+		"Path": {"*"}, "Container": {"*"},
+		// Metadata addons do not provide these.
+		"OriginalLanguage": {"*"}, "CommunityRating": {"episodes-in-progress", "next-up"},
+		// The test addon gives these episodes no still.
+		"PrimaryImageAspectRatio": {"next-up", "resume-items"},
+	},
+	returned: map[string][]string{
+		// The recorded episode had no air date.
+		"PremiereDate": {"resume-items"}, "ProductionYear": {"resume-items"},
+		// The test addon gives the series' actor a photo in the movie, opened
+		// before: the series' cast shows it, as Jellyfin shows a person's
+		// image wherever they are credited. The recorded actor had none.
+		"PrimaryImageTag": {"series-in-progress"},
+	},
+}

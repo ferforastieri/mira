@@ -1,0 +1,524 @@
+package jellyfin
+
+import (
+	"cmp"
+	"context"
+	"net/http"
+	"net/url"
+	"path"
+	"slices"
+	"strconv"
+	"strings"
+	"sync"
+
+	"github.com/ferforastieri/mira/internal/accounts"
+	"github.com/ferforastieri/mira/internal/basepath"
+	"github.com/ferforastieri/mira/internal/library"
+	"github.com/ferforastieri/mira/internal/media"
+	"github.com/ferforastieri/mira/internal/playback"
+)
+
+// MediaSourceInfo is a version of a video as Jellyfin describes it. Field
+// order follows Jellyfin's.
+type MediaSourceInfo struct {
+	Protocol                            string
+	Id                                  string
+	Path                                string `json:",omitempty"`
+	Type                                string
+	Container                           string
+	Size                                *int64 `json:",omitempty"`
+	Name                                string
+	IsRemote                            bool
+	ETag                                string
+	RunTimeTicks                        *int64 `json:",omitempty"`
+	ReadAtNativeFramerate               bool
+	IgnoreDts                           bool
+	IgnoreIndex                         bool
+	GenPtsInput                         bool
+	SupportsTranscoding                 bool
+	SupportsDirectStream                bool
+	SupportsDirectPlay                  bool
+	IsInfiniteStream                    bool
+	UseMostCompatibleTranscodingProfile bool
+	RequiresOpening                     bool
+	RequiresClosing                     bool
+	RequiresLooping                     bool
+	SupportsProbing                     bool
+	VideoType                           string `json:",omitempty"`
+	HasSegments                         bool
+	MediaStreams                        []playback.MediaStream
+	MediaAttachments                    []MediaAttachment
+	Formats                             []string
+	Bitrate                             *int64 `json:",omitempty"`
+	// RequiredHttpHeaders is always empty: players ignore it, and sources
+	// that need headers are relayed.
+	RequiredHttpHeaders        map[string]string
+	TranscodingUrl             string `json:",omitempty"`
+	TranscodingSubProtocol     string
+	TranscodingContainer       string `json:",omitempty"`
+	DefaultAudioStreamIndex    *int   `json:",omitempty"`
+	DefaultSubtitleStreamIndex *int   `json:",omitempty"`
+}
+
+// playable is a movie or an episode with its versions and the subtitle
+// files addons offer for it, and the track preferences of the user it is
+// described for.
+type playable struct {
+	item      library.Item
+	versions  []library.Version
+	subtitles []library.ExternalSubtitle
+	tracks    trackPreferences
+	// unstarted tells a torrent version left out for a while, as it could
+	// not start (see playback.Service.Unstarted).
+	unstarted bool
+}
+
+// playable gathers a title's versions and subtitles, both asked of the
+// addons at once. Versions that recently failed are left out, and the
+// others are offered as the version rules and the user's quality group
+// have them (see offered); so are subtitles that cannot be listed.
+func (h *Handler) playable(ctx context.Context, user accounts.User, item library.Item) (playable, error) {
+	p := playable{item: item, tracks: h.titleTracks(ctx, user, item)}
+	if item.Kind == library.KindRecording {
+		p.versions = h.recordingVersions(ctx, item)
+		return p, nil
+	}
+	var versionsErr error
+	var wg sync.WaitGroup
+	wg.Go(func() { p.versions, versionsErr = h.Library.Versions(ctx, user, item.ID) })
+	wg.Go(func() {
+		if subtitles, err := h.Library.Subtitles(ctx, user, item.ID); err == nil {
+			p.subtitles = subtitles
+		}
+	})
+	wg.Wait()
+	p.versions = h.offered(ctx, user, item, p.versions)
+	h.keepSubtitles(user, item.ID, p.subtitles)
+	return p, versionsErr
+}
+
+// knownPlayable is what item details show of a movie or an episode: the
+// versions and subtitles known now, stale lists' included, without waiting
+// for addons, which are asked for the others in the background (see
+// library.Service.VersionsNow). complete reports whether every addon's
+// versions were known, and none asked again. Like playable, it offers the
+// versions as the rules and the user's group have them, and the page keeps
+// the versions it lists in place (see keptInPlace).
+// The page, opened as opened, is told of the versions as they come (see
+// versionsChanged). RemuxDB, when on, is asked about the versions it was
+// not asked about lately, for a moment at most (see remuxdb.Describe).
+func (h *Handler) knownPlayable(ctx context.Context, user accounts.User, item library.Item, opened accounts.ID) (playable, bool, error) {
+	p := playable{item: item, tracks: h.titleTracks(ctx, user, item)}
+	versions, complete, err := h.Library.VersionsNow(ctx, user, item.ID)
+	if err == nil {
+		h.watch(user, item.ID, opened)
+	}
+	h.RemuxDB.Describe(ctx, versions)
+	p.versions = h.offered(ctx, user, item, versions)
+	if err == nil {
+		h.watched.show(user.ID, item.ID, p.versions, h.pageKey(ctx, user))
+	}
+	if subtitles, listed, err := h.Library.SubtitlesNow(ctx, user, item.ID); err == nil {
+		p.subtitles = subtitles
+		if listed {
+			h.keepSubtitles(user, item.ID, subtitles)
+		}
+	}
+	return p, complete, err
+}
+
+// cachedPlayable is what listings show of a title's versions: only what is
+// already known, stale lists included, as asking addons for every listed
+// title is too costly. Like playable, it offers them as the rules and the
+// user's group have them.
+func (h *Handler) cachedPlayable(ctx context.Context, user accounts.User, item library.Item) playable {
+	p := playable{item: item, tracks: h.titleTracks(ctx, user, item)}
+	if item.Kind == library.KindRecording {
+		p.versions = h.recordingVersions(ctx, item)
+		return p
+	}
+	if versions, ok := h.Library.CachedVersions(ctx, user, item.ID); ok {
+		p.versions = h.offered(ctx, user, item, versions)
+	}
+	p.subtitles, _ = h.keptSubtitles(user, item.ID)
+	return p
+}
+
+// offered leaves out of item's versions those that recently failed, but
+// the torrents that did not start in time (see playback.Unstarted), which
+// stay in place for the user to pick, a play that picks none skipping
+// them (see choose); and, with the version rules or the user's quality
+// group, or versions naming another title, those they hide, ordering the
+// others (see ordered), for the app asking (see appOrder). The version an
+// administrator pinned for the title comes first (see pinnedFirst).
+func (h *Handler) offered(ctx context.Context, user accounts.User, item library.Item, versions []library.Version) []library.Version {
+	versions = slices.DeleteFunc(versions, func(v library.Version) bool { return h.Playback.Failed(v.ID) && !h.didNotStart(v) })
+	if h.reordered(ctx, user) || slices.ContainsFunc(versions, elsewhere) {
+		versions = h.ordered(ctx, user, item, versions)
+	}
+	return h.pinnedFirst(ctx, versions)
+}
+
+// pinnedFirst moves the version an administrator pinned for the title
+// first among its versions, the others keeping their order. A pin moves
+// only a version offered: it brings back none that failed lately, that a
+// rule hides or that the user's quality group leaves out, and a pinned
+// file no addon lists any more leaves the order as it is.
+func (h *Handler) pinnedFirst(ctx context.Context, versions []library.Version) []library.Version {
+	if len(versions) < 2 {
+		return versions
+	}
+	pin, ok := h.Library.PinnedVersion(ctx, versions[0].Item)
+	if !ok {
+		return versions
+	}
+	if i := slices.IndexFunc(versions, func(v library.Version) bool { return v.ID == pin.Version }); i > 0 {
+		pinned := versions[i]
+		copy(versions[1:i+1], versions[:i])
+		versions[0] = pinned
+	}
+	return versions
+}
+
+// externals are the subtitle files a version offers as streams: its
+// title's, then its own (see versionFiles).
+func (h *Handler) externals(ctx context.Context, p playable, version library.Version) []playback.ExternalSubtitle {
+	return externalStreams(h.versionFiles(ctx, p.subtitles, version))
+}
+
+// versionFiles lists the subtitle files of a version, which come first
+// among its streams: its title's, files, those users added then the
+// addons', followed by its own: beside a local file or listed with its
+// stream, then inside its torrent (see playback.Service.TorrentSubtitles).
+func (h *Handler) versionFiles(ctx context.Context, files []library.ExternalSubtitle, version library.Version) []library.ExternalSubtitle {
+	inside := h.Playback.TorrentSubtitles(ctx, version)
+	if len(version.Subtitles) == 0 && len(inside) == 0 {
+		return files
+	}
+	return slices.Concat(files, version.Subtitles, inside)
+}
+
+// currentFile returns the subtitle file at index among files, version's
+// (see versionFiles), to serve now: one of the version's own as it is now,
+// as the links an addon lists with a stream expire with its version list
+// (see library.Service.VersionSubtitle). A file inside a torrent is served
+// as it is.
+func (h *Handler) currentFile(ctx context.Context, version library.Version, files []library.ExternalSubtitle, index int) (library.ExternalSubtitle, error) {
+	file := files[index]
+	if file.Torrent != nil || index < len(files)-len(version.Subtitles)-insideTorrent(files) {
+		return file, nil
+	}
+	return h.Library.VersionSubtitle(ctx, version, file)
+}
+
+// insideTorrent counts the files inside a version's torrent, which come
+// last among its subtitle files.
+func insideTorrent(files []library.ExternalSubtitle) int {
+	n := 0
+	for n < len(files) && files[len(files)-1-n].Torrent != nil {
+		n++
+	}
+	return n
+}
+
+// pictureCodecs are the codecs of the picture subtitle files beside local
+// files, by their format, as Jellyfin names them: PGS files, and VobSub
+// pairs, by their .idx file.
+var pictureCodecs = map[string]string{"sup": "PGSSUB", "idx": "DVDSUB"}
+
+// pictureFile reports whether a subtitle file is pictures, which Mira
+// serves as they are or burns in, but never converts.
+func pictureFile(file library.ExternalSubtitle) bool {
+	return pictureCodecs[file.Format] != ""
+}
+
+// externalStreams describes subtitle files as the streams they are.
+func externalStreams(files []library.ExternalSubtitle) []playback.ExternalSubtitle {
+	result := make([]playback.ExternalSubtitle, len(files))
+	for i, subtitle := range files {
+		// Addon files are served as SubRip whatever they are; a file a user
+		// added or a local file keeps its format, as Jellyfin names its
+		// external files.
+		codec := "subrip"
+		if subtitle.Format != "" {
+			codec = cmp.Or(subtitleCodecs[subtitle.Format], pictureCodecs[subtitle.Format])
+		}
+		result[i] = playback.ExternalSubtitle{Language: subtitle.Language, Title: subtitle.Title, Codec: codec,
+			Forced: subtitle.Forced, HearingImpaired: subtitle.HearingImpaired, Default: subtitle.Default}
+	}
+	return result
+}
+
+// openedIndex is the index, among versions, of the version an item opened
+// as opened stands for: the version of that identifier, else the first,
+// for the title's own identifier or a version no longer listed.
+func openedIndex(opened accounts.ID, versions []library.Version) int {
+	return max(slices.IndexFunc(versions, func(v library.Version) bool { return v.ID == opened }), 0)
+}
+
+// sourceID names a version as a media source: the version the item was
+// opened as (see openedIndex) carries the identifier it was opened with,
+// as Jellyfin names a single version after its item and apps look for the
+// source carrying the item's id; the others carry their own. A title
+// opened by its own identifier thus names its first version after itself.
+func sourceID(opened accounts.ID, version library.Version, stands bool) accounts.ID {
+	if stands {
+		return opened
+	}
+	return version.ID
+}
+
+// mediaSources describes an item's versions for item details and listings,
+// where Jellyfin evaluates no device profile: every version is playable,
+// and named, when the setting is on, for the last PlaybackInfo profile of
+// the device asking (see detailsNamer). opened is the identifier the item
+// was asked by. The versions keep their order whatever version the item was
+// opened as: Jellyfin 12.2 puts the source of a version opened as an item
+// first, which jellyfin-web's version menu, opening the version picked,
+// shows as the list reordering itself.
+func (h *Handler) mediaSources(r *http.Request, p playable, opened accounts.ID) []MediaSourceInfo {
+	at := openedIndex(opened, p.versions)
+	n := h.detailsNamer(r, p.item)
+	sources := make([]MediaSourceInfo, len(p.versions))
+	for i, version := range p.versions {
+		sources[i] = h.describedSource(r, p, version, sourceID(opened, version, i == at), n)
+	}
+	return sources
+}
+
+// describedSource describes a version as item details do, without a
+// device profile: playable as it is, unless it is not one file, its tracks
+// as far as it was analyzed, or, until it is, as RemuxDB describes its
+// file. With n, a version whose tracks are known is named for n's profile
+// (see playName).
+func (h *Handler) describedSource(r *http.Request, p playable, version library.Version, id accounts.ID, n *versionNamer) MediaSourceInfo {
+	analysis, analyzed := h.Playback.Analyzed(r.Context(), version.ID)
+	known := analyzed
+	if !known {
+		analysis, known = h.RemuxDB.Described(version)
+	}
+	source := h.baseSource(r, p, version, id, analysis, known)
+	if analyzed {
+		source.MediaStreams = h.withTextCopies(r.Context(), p, version, analysis, source.MediaStreams)
+	}
+	whole := !h.Playback.ReadsInput(version)
+	source.SupportsDirectPlay, source.SupportsDirectStream = whole, whole
+	if known {
+		source.Container = playback.DisplayContainer(analysis, version.Filename)
+		source.DefaultAudioStreamIndex = p.tracks.audio(source.MediaStreams)
+		if n != nil {
+			source.Name = h.playName(n, p, version, source.MediaStreams, analysis)
+		}
+	}
+	source.DefaultSubtitleStreamIndex = p.tracks.subtitle(source.MediaStreams, source.DefaultAudioStreamIndex)
+	return source
+}
+
+// placeholderSource stands for a title's versions in a listing or its
+// details when none is known yet: its identifier is the item's, which plays
+// the first version.
+func (h *Handler) placeholderSource(r *http.Request, item library.Item) MediaSourceInfo {
+	version := library.Version{ID: item.ID, Item: item.ID, Name: item.Name, Runtime: item.Runtime}
+	source := h.baseSource(r, playable{item: item}, version, item.ID, media.Analysis{}, false)
+	source.SupportsDirectPlay, source.SupportsDirectStream = true, true
+	return source
+}
+
+// baseSource fills what every description of a version shares. analysis
+// tells the version's tracks when known: its analysis, or RemuxDB's
+// description of its file.
+func (h *Handler) baseSource(r *http.Request, p playable, version library.Version, id accounts.ID, analysis media.Analysis, known bool) MediaSourceInfo {
+	source := MediaSourceInfo{
+		Protocol:               "Http",
+		Id:                     id.String(),
+		Type:                   "Default",
+		Container:              containerOfName(version.Filename),
+		Name:                   version.Name,
+		IsRemote:               true,
+		ETag:                   version.ID.String(),
+		SupportsProbing:        true,
+		VideoType:              "VideoFile",
+		MediaAttachments:       []MediaAttachment{},
+		Formats:                []string{},
+		RequiredHttpHeaders:    map[string]string{},
+		TranscodingSubProtocol: "http",
+	}
+	source.Path = h.streamURL(r, p.item.ID, id, version, source.Container, mustRelay(r, version) || h.boostRelay(r))
+	// jellyfin-web asks for the segments of the version it plays only when
+	// the version says it has some: movies and episodes may, while the skip
+	// buttons are on and a segment database is asked, or the version's own
+	// chapters name an intro, a recap, a preview or credits (see
+	// versionSegments), or an intro or credits were found in the audio of
+	// an episode's local file (see audioSegments); recordings may when
+	// commercial breaks were found in them (see package commercials).
+	switch p.item.Kind {
+	case library.KindMovie, library.KindEpisode:
+		source.HasSegments = h.Accounts.Settings().SkipButtons && (h.Segments.Asks() || known && len(chapterSegments(analysis)) > 0 ||
+			p.item.Kind == library.KindEpisode && h.foundInAudio(r.Context(), version))
+	case library.KindRecording:
+		source.HasSegments = h.Commercials.Has(r.Context(), p.item.ID)
+	}
+	size, runtime := version.Size, version.Runtime
+	source.MediaStreams = h.sourceStreams(r.Context(), p, version, analysis, known)
+	if known {
+		source.MediaAttachments = mediaAttachments(analysis)
+		size = cmp.Or(analysis.Size, size)
+		runtime = cmp.Or(analysis.Duration, runtime)
+		if analysis.Bitrate > 0 {
+			source.Bitrate = new(analysis.Bitrate)
+		}
+	}
+	if size > 0 {
+		source.Size = new(size)
+	}
+	if runtime > 0 {
+		source.RunTimeTicks = new(int64(runtime / 100))
+		if source.Bitrate == nil && size > 0 {
+			source.Bitrate = new(int64(float64(size*8) / runtime.Seconds()))
+		}
+	}
+	return source
+}
+
+// sourceStreams lists a version's streams as baseSource describes them:
+// the subtitle files, then its tracks when analysis tells them.
+func (h *Handler) sourceStreams(ctx context.Context, p playable, version library.Version, analysis media.Analysis, known bool) []playback.MediaStream {
+	language := h.Accounts.Settings().Language
+	if known {
+		return playback.MediaStreams(analysis, h.externals(ctx, p, version), language)
+	}
+	return playback.ExternalStreams(h.externals(ctx, p, version), language)
+}
+
+// versionStreams lists a version's streams as describedSource describes
+// them, with the text copies of its picture subtitles.
+func (h *Handler) versionStreams(ctx context.Context, p playable, version library.Version) []playback.MediaStream {
+	analysis, analyzed := h.Playback.Analyzed(ctx, version.ID)
+	known := analyzed
+	if !known {
+		analysis, known = h.RemuxDB.Described(version)
+	}
+	streams := h.sourceStreams(ctx, p, version, analysis, known)
+	if analyzed {
+		streams = h.withTextCopies(ctx, p, version, analysis, streams)
+	}
+	return streams
+}
+
+// withTextCopies lists after a version's streams the text copies of its
+// picture subtitles that were read (see playback.Service.TextCopies).
+// They follow the version's own analysis, never RemuxDB's description.
+func (h *Handler) withTextCopies(ctx context.Context, p playable, version library.Version, analysis media.Analysis,
+	streams []playback.MediaStream) []playback.MediaStream {
+	copies := h.Playback.TextCopies(ctx, version, analysis, h.versionFiles(ctx, p.subtitles, version))
+	if len(copies) == 0 {
+		return streams
+	}
+	return playback.AppendTextCopies(streams, copies, h.Accounts.Settings().Language)
+}
+
+// textCopyOf is the index of the text copy of the subtitle of index
+// index among streams, -1 when it has none.
+func textCopyOf(streams []playback.MediaStream, index int) int {
+	for _, stream := range streams {
+		if stream.CopyOf != nil && *stream.CopyOf == index {
+			return stream.Index
+		}
+	}
+	return -1
+}
+
+// streamURL is the address players fetch a version from when they use a
+// media source's Path. Players send no credentials with it, so it carries a
+// grant signed for the caller, which tells whether Mira must relay the
+// source rather than redirect the player to it; a relayed one also says
+// so in relayParameter, for Mira's script (see boostRelay). The grant
+// names the caller's device: the bytes of the address are that device's
+// playback's (see mediaDevice).
+func (h *Handler) streamURL(r *http.Request, item, sourceID accounts.ID, version library.Version, container string, relay bool) string {
+	caller := callerFrom(r.Context())
+	grant := h.Playback.Signer().Sign(playback.Grant{Version: version.ID, User: caller.User.ID, Device: caller.Device.ID, Relay: relay})
+	query := url.Values{
+		"static":        {"true"},
+		"mediaSourceId": {sourceID.String()},
+		"Tag":           {version.ID.String()},
+		grantParameter:  {grant},
+	}
+	if relay {
+		query.Set(relayParameter, "1")
+	}
+	extension := container
+	if container == "hls" {
+		// Players recognize HLS by the extension.
+		extension = "m3u8"
+	}
+	return baseURL(r) + "/Videos/" + item.String() + "/stream." + extension + "?" + query.Encode()
+}
+
+// grantParameter carries a signed grant in the URLs Mira makes.
+const grantParameter = "MiraGrant"
+
+// relayParameter marks the address of a version Mira relays rather
+// than redirecting the player to its source.
+const relayParameter = "MiraRelay"
+
+// mustRelay reports whether a player cannot follow a redirect to the
+// version's source. Findroid's ExoPlayer refuses redirects from http to
+// https, so a server reached over http relays https sources to it.
+func mustRelay(r *http.Request, version library.Version) bool {
+	device := callerFrom(r.Context()).Device
+	return strings.Contains(strings.ToLower(device.Client), "findroid") &&
+		requestScheme(r) == "http" && strings.HasPrefix(version.URL, "https:")
+}
+
+// baseURL is the address the player reached Mira at, with the base
+// path it came under (see basepath): a reverse proxy that forwards only
+// /jellyfin to Mira then receives the requests to the addresses
+// Mira builds on it, as Jellyfin's own addresses carry its BaseUrl.
+func baseURL(r *http.Request) string {
+	host := r.Host
+	if forwarded := r.Header.Get("X-Forwarded-Host"); forwarded != "" {
+		host, _, _ = strings.Cut(forwarded, ",")
+	}
+	return requestScheme(r) + "://" + strings.TrimSpace(host) + basepath.Of(r)
+}
+
+func requestScheme(r *http.Request) string {
+	if r.TLS != nil || strings.EqualFold(strings.TrimSpace(r.Header.Get("X-Forwarded-Proto")), "https") {
+		return "https"
+	}
+	return "http"
+}
+
+// containerOfName guesses a container from a file name until the version
+// is analyzed.
+func containerOfName(filename string) string {
+	switch strings.ToLower(strings.TrimPrefix(path.Ext(filename), ".")) {
+	case "mp4", "m4v":
+		return "mp4"
+	case "webm":
+		return "webm"
+	case "avi":
+		return "avi"
+	case "mov":
+		return "mov"
+	case "ts", "m2ts", "mts", "m2t", "tp", "trp":
+		return "ts"
+	case "mpg", "mpeg", "vob":
+		return "mpeg"
+	case "m3u8":
+		return "hls"
+	default:
+		return "mkv"
+	}
+}
+
+// subtitleURL is a subtitle's DeliveryUrl: relative, with the caller's
+// token, as Jellyfin writes it.
+func subtitleURL(r *http.Request, item, sourceID accounts.ID, index int, format string) string {
+	target := "/Videos/" + hyphenated(item) + "/" + sourceID.String() + "/Subtitles/" + strconv.Itoa(index) + "/0/Stream." + format
+	if token := callerFrom(r.Context()).Token; token != "" {
+		target += "?ApiKey=" + url.QueryEscape(token)
+	}
+	return target
+}

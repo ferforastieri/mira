@@ -1,0 +1,75 @@
+package playback
+
+import (
+	"context"
+	"encoding/json"
+	"slices"
+
+	"github.com/ferforastieri/mira/internal/library"
+	"github.com/ferforastieri/mira/internal/media"
+)
+
+// LearnMasteringDisplay learns whether the PQ video of a version carries
+// its mastering display (see media.Stream.MasteringDisplay), when only
+// that kept conversion, the video's planned conversion, from the tone
+// mapping of Intel's GPUs, through VAAPI or QSV: an analysis made before
+// Mira recorded it. ffprobe reads the
+// first frame of such a track once, and the answer is kept with the
+// analysis; it reports true with the analysis then known, after which the
+// conversion is planned again. A frame that cannot be read leaves the
+// version on the processor, and is not read again for a while. Other GPUs,
+// and video Intel would not tone map anyway, read nothing. A version read
+// from its input (see LocalInputs) has ffprobe read the input itself.
+func (s *Service) LearnMasteringDisplay(ctx context.Context, version library.Version, analysis media.Analysis, conversion *VideoConversion) (media.Analysis, bool) {
+	if conversion == nil || !conversion.ToneMapOnCPU || !conversion.Hardware.NeedsMasteringDisplay() || !s.settings().GPUToneMapping ||
+		version.HoldsConnection || !slices.ContainsFunc(analysis.Streams, media.NeedsMasteringProbe) {
+		return analysis, false
+	}
+	if _, failed := s.unmastered.Get(version.ID); failed {
+		return analysis, false
+	}
+	result, _, _ := s.flight.Do("mastering "+version.ID.String(), func() (any, error) {
+		// The answer is kept even once the request that asked for it is
+		// canceled, as an analysis is.
+		ctx := context.WithoutCancel(ctx)
+		in, release, err := s.probeInput(ctx, version)
+		if err != nil {
+			s.logger.Info("The first frame of an HDR video could not be read: the processor tone maps it", "addon", version.Addon, "error", err)
+			s.unmaster(version, err)
+			return analysis, nil
+		}
+		defer release()
+		learned := analysis
+		learned.Streams = slices.Clone(analysis.Streams)
+		for i, stream := range learned.Streams {
+			if !media.NeedsMasteringProbe(stream) {
+				continue
+			}
+			found, err := s.ffprobe().MasteringDisplay(ctx, in, stream.Index)
+			if err != nil {
+				s.logger.Info("The first frame of an HDR video could not be read: the processor tone maps it", "addon", version.Addon, "error", err)
+				s.unmaster(version, err)
+				return analysis, nil
+			}
+			learned.Streams[i].MasteringDisplay = &found
+		}
+		if data, err := json.Marshal(learned); err == nil {
+			if _, err := s.db.Exec(ctx, "UPDATE media_analyses SET analysis = $2 WHERE version_id = $1", version.ID, data); err != nil {
+				s.logger.Warn("Saving a media analysis failed", "error", err)
+			}
+		}
+		s.analyses.Put(version.ID, learned)
+		return learned, nil
+	})
+	learned := result.(media.Analysis)
+	return learned, !slices.ContainsFunc(learned.Streams, media.NeedsMasteringProbe)
+}
+
+// unmaster keeps err as why the first frame of a version's HDR video could
+// not be read, so that it is not read again for a while; a torrent that
+// did not send in time is read again at the next play (see passing).
+func (s *Service) unmaster(version library.Version, err error) {
+	if !passing(version, err) {
+		s.unmastered.Put(version.ID, err)
+	}
+}

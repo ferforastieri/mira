@@ -1,0 +1,128 @@
+package admin
+
+import (
+	"encoding/json"
+	"maps"
+	"net/http"
+	"strings"
+	"testing"
+
+	"github.com/ferforastieri/mira/internal/accounts"
+)
+
+func TestTrackingSettingsKeepTheSecret(t *testing.T) {
+	t.Parallel()
+	api := newTestAPI(t, 10)
+	administrator := api.signedIn("admin", true)
+	member := api.signedIn("member", false)
+	status, body, _ := administrator.call(http.MethodGet, "/settings", nil)
+	if status != http.StatusOK || body["traktClientId"] != "" || body["traktClientSecretSet"] != false || body["simklClientId"] != "" ||
+		body["lastFmApiKey"] != "" || body["lastFmSecretSet"] != false {
+		t.Fatalf("defaults: %d %v", status, body)
+	}
+	for _, secret := range []string{"traktClientSecret", "lastFmSecret"} {
+		if _, ok := body[secret]; ok {
+			t.Errorf("the field %s is sent", secret)
+		}
+	}
+	base := map[string]any{"serverName": "Mira", "quickConnectEnabled": true, "language": "en"}
+	set := maps.Clone(base)
+	set["traktClientId"], set["traktClientSecret"], set["simklClientId"] = "trakt-id", "trakt-secret-value", "simkl-id"
+	set["lastFmApiKey"], set["lastFmSecret"] = "lastfm-key", "lastfm-secret-value"
+	status, body, _ = administrator.call(http.MethodPut, "/settings", set)
+	encoded, _ := json.Marshal(body)
+	if status != http.StatusOK || body["traktClientId"] != "trakt-id" || body["traktClientSecretSet"] != true || body["simklClientId"] != "simkl-id" ||
+		body["lastFmApiKey"] != "lastfm-key" || body["lastFmSecretSet"] != true ||
+		strings.Contains(string(encoded), "trakt-secret-value") || strings.Contains(string(encoded), "lastfm-secret-value") {
+		t.Fatalf("saved: %d %s", status, encoded)
+	}
+	// Left out, they stay; the Set flag is not a field to write.
+	kept := maps.Clone(base)
+	kept["traktClientSecretSet"], kept["lastFmSecretSet"] = false, false
+	if status, body, _ := administrator.call(http.MethodPut, "/settings", kept); status != http.StatusOK || body["traktClientSecretSet"] != true ||
+		body["traktClientId"] != "trakt-id" || body["lastFmSecretSet"] != true || body["lastFmApiKey"] != "lastfm-key" {
+		t.Errorf("left out: %d %v", status, body)
+	}
+	if got := api.store.Settings(); got.TraktClientSecret != "trakt-secret-value" || got.LastFMSecret != "lastfm-secret-value" || !got.LastFMAvailable() {
+		t.Errorf("secrets: %q %q", got.TraktClientSecret, got.LastFMSecret)
+	}
+	for field, code := range map[string]string{"traktClientId": "invalid_trakt_app", "traktClientSecret": "invalid_trakt_app", "simklClientId": "invalid_simkl_app",
+		"lastFmApiKey": "invalid_lastfm_app", "lastFmSecret": "invalid_lastfm_app"} {
+		for _, value := range []string{"with space", "é", strings.Repeat("a", accounts.MaxTrackingAppBytes+1)} {
+			refused := maps.Clone(base)
+			refused[field] = value
+			if status, body, _ := administrator.call(http.MethodPut, "/settings", refused); status != http.StatusBadRequest || body["error"] != code {
+				t.Errorf("%s %q: %d %v", field, value, status, body)
+			}
+		}
+	}
+	if status, _, _ := member.call(http.MethodPut, "/settings", set); status != http.StatusForbidden {
+		t.Errorf("member: %d", status)
+	}
+	cleared := maps.Clone(base)
+	cleared["traktClientSecret"], cleared["simklClientId"], cleared["lastFmSecret"] = "", "", ""
+	if status, body, _ := administrator.call(http.MethodPut, "/settings", cleared); status != http.StatusOK || body["traktClientSecretSet"] != false ||
+		body["simklClientId"] != "" || body["traktClientId"] != "trakt-id" || body["lastFmSecretSet"] != false || body["lastFmApiKey"] != "lastfm-key" {
+		t.Errorf("cleared: %d %v", status, body)
+	}
+}
+
+func TestAnimeListAppsKeepTheirSecrets(t *testing.T) {
+	t.Parallel()
+	api := newTrackingAPI(t)
+	administrator := api.signedIn("admin", true)
+	status, body, _ := administrator.call(http.MethodGet, "/settings", nil)
+	if status != http.StatusOK || body["aniListClientId"] != "" || body["aniListClientSecretSet"] != false ||
+		body["myAnimeListClientId"] != "" || body["myAnimeListClientSecretSet"] != false {
+		t.Fatalf("defaults: %d %v", status, body)
+	}
+	base := map[string]any{"serverName": "Mira", "quickConnectEnabled": true, "language": "en"}
+	set := maps.Clone(base)
+	set["aniListClientId"], set["aniListClientSecret"] = "12345", "anilist-secret-value"
+	set["myAnimeListClientId"], set["myAnimeListClientSecret"] = "mal-id", "mal-secret-value"
+	status, body, _ = administrator.call(http.MethodPut, "/settings", set)
+	encoded, _ := json.Marshal(body)
+	if status != http.StatusOK || body["aniListClientId"] != "12345" || body["aniListClientSecretSet"] != true ||
+		body["myAnimeListClientId"] != "mal-id" || body["myAnimeListClientSecretSet"] != true ||
+		strings.Contains(string(encoded), "anilist-secret-value") || strings.Contains(string(encoded), "mal-secret-value") {
+		t.Fatalf("saved: %d %s", status, encoded)
+	}
+	if got := api.store.Settings(); !got.AniListAvailable() || !got.MyAnimeListAvailable() {
+		t.Errorf("not available: %+v", got)
+	}
+	// The eye reads a secret again.
+	if status, body, _ := administrator.call(http.MethodPost, "/settings/secrets/aniListClientSecret/reveal", nil); status != http.StatusOK ||
+		body["value"] != "anilist-secret-value" {
+		t.Errorf("reveal: %d %v", status, body)
+	}
+	for field, code := range map[string]string{"aniListClientId": "invalid_anilist_app", "aniListClientSecret": "invalid_anilist_app",
+		"myAnimeListClientId": "invalid_myanimelist_app", "myAnimeListClientSecret": "invalid_myanimelist_app"} {
+		refused := maps.Clone(base)
+		refused[field] = "with space"
+		if status, body, _ := administrator.call(http.MethodPut, "/settings", refused); status != http.StatusBadRequest || body["error"] != code {
+			t.Errorf("%s: %d %v", field, status, body)
+		}
+	}
+	// Users are offered both, AniList by its code, MyAnimeList by the
+	// address its site sends them back to.
+	status, body, _ = administrator.call(http.MethodGet, "/account/tracking", nil)
+	services, _ := body["services"].([]any)
+	connections := map[string]any{}
+	for _, s := range services {
+		service, _ := s.(map[string]any)
+		if service["available"] == true {
+			connections[service["service"].(string)] = service["connection"]
+		}
+	}
+	if status != http.StatusOK || connections["anilist"] != "pin" || connections["myanimelist"] != "redirect" {
+		t.Errorf("tracking: %d %v", status, connections)
+	}
+	// A code for no connection started is refused.
+	if status, body, _ := administrator.call(http.MethodPost, "/account/tracking/myanimelist/code", map[string]string{"code": "x"}); status != http.StatusBadRequest ||
+		body["error"] != "invalid_code" {
+		t.Errorf("code: %d %v", status, body)
+	}
+	if status, _, _ := administrator.call(http.MethodPost, "/account/tracking/trakt/code", map[string]string{"code": "x"}); status != http.StatusNotFound {
+		t.Errorf("code for Trakt: %d", status)
+	}
+}

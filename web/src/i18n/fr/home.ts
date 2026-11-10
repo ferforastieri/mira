@@ -1,0 +1,350 @@
+import type en from '../en/home'
+
+/** The GPU methods, as the server names them. */
+const gpuMethodNames: Record<string, string> = {
+  cuda: 'NVIDIA',
+  vaapi: 'VAAPI',
+  videotoolbox: 'VideoToolbox',
+  qsv: 'QSV',
+  amf: 'AMF',
+}
+
+const home: typeof en = {
+  quickConnect: {
+    title: 'Quick Connect',
+    description:
+      'Connectez une application TV ou mobile sans saisir votre mot de passe\u202f: choisissez Quick Connect dans une application Jellyfin, ou ouvrez l’application de Silo sur une TV, puis saisissez le code qu’elle affiche.',
+    code: 'Code Quick Connect',
+    codeHint: 'Les codes expirent au bout de 10 minutes.',
+    lookingUp: 'Recherche de l’appareil…',
+    requestTitle: 'Appareil en attente d’autorisation',
+    device: 'Appareil',
+    app: 'Application',
+    requested: 'Demande',
+    approve: 'Autoriser et connecter cet appareil',
+    approving: 'Autorisation…',
+    approved: (device: string, user: string) =>
+      `${device} est maintenant connecté avec le compte ${user}.`,
+    another: 'Autoriser un autre appareil',
+    steps: [
+      'Sur l’appareil, choisissez Quick Connect dans une application Jellyfin, ou ouvrez l’application de Silo sur une TV.',
+      'Saisissez ici le code qu’elle affiche\u202f: 6 chiffres pour Jellyfin, 8 pour Silo.',
+      'Vérifiez l’appareil, puis autorisez-le.',
+    ],
+    stepsLabel: 'Comment ça marche',
+  },
+  notFound: {
+    title: 'Page introuvable',
+    description: 'Cette page n’existe pas.',
+    home: 'Retour à l’accueil',
+  },
+  dashboard: {
+    overview: {
+      greeting: (hour: number, name: string) =>
+        `${hour >= 18 || hour < 5 ? 'Bonsoir' : 'Bonjour'}, ${name}`,
+      summary: (playing: number, problems: number) =>
+        `${playing === 0 ? 'Rien en lecture' : playing === 1 ? 'Une lecture en cours' : `${playing} lectures en cours`}${
+          problems === 0
+            ? ' et rien à regarder. Tout tourne normalement.'
+            : problems === 1
+              ? ', et un point à regarder.'
+              : `, et ${problems} points à regarder.`
+        }`,
+      description: 'Ce qui est en lecture sur le serveur, et ce qui s’est passé récemment.',
+      conversions: 'Conversions vidéo',
+      conversionsOf: (count: number, limit: number) =>
+        limit > 0 ? `${count} sur ${limit}` : `${count}, sans limite`,
+      bandwidth: 'Bande passante',
+      sentToApps: 'envoyés aux applis',
+      receivedFromSources: 'reçus des sources',
+      uptime: 'En marche depuis',
+      problems: 'À regarder',
+      problemsEmpty: 'Rien à regarder',
+      problemsEmptyHelp:
+        'Mira surveille ses disques, sources, guides, sauvegardes et tâches. Ce qui demande votre attention apparaît ici.',
+      /** The kind word of the tile of a new version, in To look at. */
+      updateKind: 'Nouvelle version',
+      update: (version: string, running: string) =>
+        `Mira ${version} est disponible. Ce serveur est en version ${running}.`,
+      releaseNotes: 'Notes de version',
+      open: 'Ouvrir',
+      openHealth: 'Ouvrir Santé',
+      serverTitle: 'État du serveur',
+      version: 'Version',
+      database: 'Base de données',
+      databaseSize: (size: string) => `${size} sur le disque`,
+      cache: 'Cache',
+      cacheOf: (limit: string) => `sur ${limit}`,
+      cacheNoLimit: 'sans limite',
+      cacheOff: 'Désactivé',
+      cacheUnit: 'Cache utilisé',
+      graphics: 'Carte graphique',
+      graphicsNone: 'Aucune',
+      graphicsCpu: 'Les conversions passent par le processeur',
+      toneMapping: 'tone mapping',
+    },
+    getStarted: {
+      title: 'Bien démarrer',
+      progress: (done: number, total: number) =>
+        `${done} étape${done > 1 ? 's' : ''} sur ${total} faite${done > 1 ? 's' : ''}`,
+      next: 'Ensuite',
+      showSteps: (count: number) => `Les ${count} étapes`,
+      hideSteps: 'Masquer les étapes',
+      dismiss: 'Masquer',
+      done: 'Fait',
+      todo: 'À faire',
+      steps: {
+        metadata: {
+          title: 'Ajouter un addon de métadonnées',
+          help: 'Il donne aux titres leurs affiches, leurs résumés et leurs épisodes.',
+        },
+        library: {
+          title: 'Choisir vos bibliothèques',
+          help: 'Les catalogues de vos sources que les applis montrent comme bibliothèques.',
+        },
+        users: {
+          title: 'Créer des utilisateurs ou un lien d’invitation',
+          help: 'Un compte pour chaque personne avec qui vous partagez Mira.',
+        },
+        backups: {
+          title: 'Sauvegarder la base de données chaque jour',
+          help: 'Une copie des comptes, des réglages et de ce que chacun a regardé.',
+        },
+        secretKey: {
+          title: 'Définir MIRA_SECRET_KEY',
+          help: 'Elle chiffre les clés et mots de passe que Mira garde. Définissez-la, puis redémarrez.',
+        },
+        address: {
+          title: 'Servir HTTPS ou indiquer une adresse publique',
+          help: 'Les applis hors de chez vous se connectent en sécurité, et les notifications mènent à Mira.',
+        },
+        discovery: {
+          title: 'Laisser les applis de votre réseau trouver Mira',
+          help: 'Répondre à la découverte sur le réseau local avec l’adresse que les applis joignent.',
+        },
+      },
+    },
+    server: {
+      restart: 'Redémarrer',
+      updateNow: 'Mettre à jour maintenant',
+      install: (version: string) => `Installer Mira ${version}`,
+      downloading: (percent: number) => `Téléchargement\u202f: ${percent} %`,
+      confirmWith: 'Confirmer avec',
+      withPassword: 'Mot de passe',
+      withCode: 'Code en deux étapes',
+      password: 'Votre mot de passe',
+      code: 'Code de votre appli, ou un code de secours',
+      identityHelp: 'Chacune de ces actions le redemande.',
+      restartTitle: 'Redémarrer Mira',
+      restartText:
+        'Mira arrête ce qu’il fait, lectures et enregistrements compris, et se termine. Les applis se reconnectent dès qu’il répond.',
+      restartBy: {
+        desktop: 'Mira Desktop le relance de lui-même.',
+        confirmed:
+          'La politique de redémarrage de son conteneur, ou son gestionnaire de services, le relance, comme confirmé dans Paramètres › Général.',
+      },
+      unknownTitle: 'Mira pourrait ne pas revenir',
+      unknown: {
+        container:
+          'Mira ne voit pas la politique de redémarrage de son conteneur. Sans une politique qui le relance, comme unless-stopped ou always, Mira reste arrêté jusqu’à ce qu’on le démarre sur l’hôte.',
+        other:
+          'Mira ne sait pas si un gestionnaire de services le relance. Sans lui, Mira reste arrêté jusqu’à ce qu’on le démarre sur l’hôte.',
+      },
+      unknownHelp:
+        'Une fois que c’est en place, activez «\u202fMira est redémarré quand il s’arrête\u202f» dans Paramètres › Général, et cet avertissement disparaît.',
+      restartConfirm: 'Redémarrer',
+      restartAnyway: 'Redémarrer quand même',
+      restarting: 'Redémarrage…',
+      waitingTitle: 'Mira redémarre',
+      waiting: 'En attente de la réponse de Mira…',
+      waitingLong: (seconds: number) =>
+        `Mira ne répond plus depuis ${seconds} secondes. Si rien ne le relance, démarrez-le sur l’hôte.`,
+      installTitle: (version: string) => `Installer Mira ${version}`,
+      installText:
+        'Mira Desktop télécharge la nouvelle version et la vérifie, puis arrête Mira, l’installe et la démarre, comme «\u202fInstaller Mira\u202f» dans son menu. Les lectures et les enregistrements s’arrêtent pendant ce temps.',
+      installConfirm: 'Installer',
+      installing: 'Demande en cours…',
+      installWaitingTitle: (version: string) => `Installation de Mira ${version}`,
+      installStopping:
+        'Mira s’arrête pour installer la nouvelle version. En attente de sa réponse…',
+      installFailed:
+        'Mira Desktop n’a pas pu installer la mise à jour\u202f: le dossier des journaux dit pourquoi. Mira continue comme avant.',
+      updateTitle: 'Mettre à jour maintenant',
+      updateText:
+        'Mira demande à l’outil de mise à jour réglé dans Paramètres › Général de mettre à jour maintenant. La suite dépend de l’outil\u202f: s’il remplace le conteneur de Mira, Mira s’arrête un moment.',
+      updateConfirm: 'Envoyer la demande',
+      sending: 'Envoi…',
+      answer: (status: number) => `L’outil de mise à jour a répondu HTTP ${status}.`,
+      answerEmpty: 'Sa réponse ne contient pas de texte.',
+      watching:
+        'Si l’outil remplace le conteneur de Mira, cette page se recharge dès que Mira répond de nouveau.',
+      gone: 'Mira s’est arrêté avant la réponse de l’outil\u202f: l’outil est sans doute en train de le remplacer. En attente de la réponse de Mira…',
+      tooSoon: 'Cette action a été demandée il y a moins d’une minute. Réessayez dans un instant.',
+      close: 'Fermer',
+    },
+    live: {
+      title: 'Lecture en cours',
+      empty: 'Rien n’est en lecture pour le moment.',
+      emptyHelp: 'Les lectures depuis les applis Jellyfin apparaissent ici en quelques secondes.',
+      autoRefresh: 'Mise à jour toutes les 3 secondes.',
+      paused: 'En pause',
+      unknownTitle: 'Titre introuvable',
+      movie: (year: number) => (year > 0 ? `Film, ${year}` : 'Film'),
+      liveChannel: 'Direct',
+      progress: (title: string) => `Position de lecture de ${title}`,
+      remaining: (time: string) => `reste ${time}`,
+      /** After the position: "of 1:44:00". */
+      ofRuntime: (time: string) => `sur ${time}`,
+      startedAt: (time: string) => `Commencé ${time}`,
+      appOn: (app: string, device: string) => (app ? `${app} sur ${device}` : device),
+      sharedLink: 'Lien partagé',
+      /** A converted download, in place of the app and device. */
+      downloadOn: (app: string, device: string) =>
+        app ? `Téléchargement, ${app} sur ${device}` : 'Téléchargement',
+      downloading: 'Téléchargement',
+      downloadProgress: (title: string) => `Avancement du téléchargement de ${title}`,
+      downloadNotControllable:
+        'Un téléchargement converti pour être vu hors ligne. Il s’arrête si l’appli l’interrompt.',
+      howItPlays: 'Comment c’est lu',
+      details: 'Détails',
+      delivery: {
+        directPlay: 'Lecture directe',
+        remux: 'Remux',
+        conversion: 'Conversion',
+        stream: 'Diffusion',
+      },
+      deliveryHelp: {
+        directPlay: 'L’appli lit le fichier tel quel.',
+        remux: 'Mira réemballe le fichier pour l’appli, sans le réencoder.',
+        conversion: 'Mira réencode ce que l’appli ne sait pas lire.',
+        stream:
+          'Mira diffuse le fichier à l’appli. Le détail revient dès que l’appli demande la suite.',
+      },
+      why: 'Pourquoi',
+      source: 'Source',
+      sent: 'Envoyé',
+      encoder: 'Encodeur',
+      gpu: (method: string) => `GPU (${gpuMethodNames[method] ?? method})`,
+      gpuMethod: (method: string) => gpuMethodNames[method] ?? method,
+      cpu: 'Processeur',
+      copied: 'Copié',
+      toneMapped: 'HDR vers SDR',
+      burned: 'Sous-titres incrustés',
+      qualityGroup: 'Groupe de qualité',
+      original: 'Originale',
+      sizeLimit: 'Plus petit que la source',
+      /** Shown when the app may switch between several qualities of converted video. */
+      qualityPlayed: 'Qualité lue',
+      switchedVersion: 'Version de relais',
+      bandwidth: {
+        sent: (rate: string) => `${rate} vers l’appli`,
+        received: (rate: string) => `${rate} depuis la source`,
+        redirected: 'L’appli lit la source elle-même',
+      },
+      origins: {
+        addon: 'Addon',
+        torrent: 'Torrent',
+        localFolder: 'Dossier local',
+        networkShare: 'Partage réseau',
+        iptv: 'IPTV',
+      } as Record<string, string>,
+      peers: (count: number) => (count === 1 ? '1 pair' : `${count} pairs`),
+      qualityAmong: (played: string, offered: string) => `${played}, parmi ${offered}`,
+      sizeLimits: {
+        steppedDown: (height: string) => `L’appli est passée sous ${height}`,
+        gpu: (height: string) => `${height} au plus\u202f: converti par la carte graphique`,
+        processor: (height: string) => `${height} au plus\u202f: converti par le processeur`,
+        toneMapping: (height: string) => `${height} au plus\u202f: HDR converti par le processeur`,
+        gpuToneMapping: (height: string) =>
+          `${height} au plus\u202f: la carte graphique ne convertit le HDR à temps que jusque-là`,
+        qualityGroup: (height: string) => `Groupe de qualité\u202f: ${height}`,
+        serverMax: (height: string) => `Qualité max des vidéos converties\u202f: ${height}`,
+        app: (height: string) => `Qualité permise par l’appli\u202f: ${height}`,
+        appBitrate: (rate: string) => `Débit permis par l’appli\u202f: ${rate}`,
+        userBitrate: (rate: string) => `Qualité maximale de l’utilisateur\u202f: ${rate}`,
+      },
+      unknown: 'Inconnu',
+      stop: 'Arrêter',
+      stopFor: (user: string) => `Arrêter la lecture de ${user}`,
+      stopTitle: 'Arrêter cette lecture\u202f?',
+      stopConfirm: (user: string, title: string) =>
+        `Arrêter «\u202f${title}\u202f» sur l’appareil de ${user}\u202f? La lecture s’arrête tout de suite.`,
+      stopped: 'L’appli a reçu l’ordre d’arrêter.',
+      message: 'Envoyer un message',
+      messageTo: (user: string) => `Envoyer un message à ${user}`,
+      messageLabel: (device: string) => `Message à afficher sur ${device}`,
+      messageHint: 'Affiché 10 secondes sur l’appareil. 500 caractères au plus.',
+      send: 'Envoyer',
+      messageSent: 'Message envoyé.',
+      notControllable: 'Cette appli n’accepte pas le contrôle à distance.',
+      sharedNotControllable:
+        'Un invité qui regarde grâce à un lien de partage. Révoquer le lien, sur la page de l’utilisateur, l’arrête.',
+    },
+    reasons: {
+      ContainerNotSupported: 'Format de fichier non pris en charge',
+      VideoCodecNotSupported: 'Codec vidéo non pris en charge',
+      AudioCodecNotSupported: 'Codec audio non pris en charge',
+      SubtitleCodecNotSupported: 'Format de sous-titres non pris en charge',
+      AudioIsExternal: 'Audio dans un fichier à part',
+      SecondaryAudioNotSupported: 'Deuxième piste audio non prise en charge',
+      VideoProfileNotSupported: 'Profil vidéo non pris en charge',
+      VideoLevelNotSupported: 'Niveau vidéo non pris en charge',
+      VideoResolutionNotSupported: 'Résolution trop élevée',
+      VideoBitDepthNotSupported: 'Profondeur de couleur non prise en charge',
+      VideoFramerateNotSupported: 'Fréquence d’images non prise en charge',
+      RefFramesNotSupported: 'Trop d’images de référence',
+      AnamorphicVideoNotSupported: 'Vidéo anamorphique non prise en charge',
+      InterlacedVideoNotSupported: 'Vidéo entrelacée non prise en charge',
+      VideoCodecTagNotSupported: 'Étiquette de codec vidéo non prise en charge',
+      VideoBitrateNotSupported: 'Débit vidéo trop élevé',
+      AudioChannelsNotSupported: 'Trop de canaux audio',
+      AudioProfileNotSupported: 'Profil audio non pris en charge',
+      AudioSampleRateNotSupported: 'Fréquence audio non prise en charge',
+      AudioBitDepthNotSupported: 'Résolution audio non prise en charge',
+      AudioBitrateNotSupported: 'Débit audio trop élevé',
+      ContainerBitrateExceedsLimit: 'Au-dessus de la limite de débit',
+      UnknownVideoStreamInfo: 'Vidéo non décrite',
+      UnknownAudioStreamInfo: 'Audio non décrit',
+      DirectPlayError: 'Échec de la lecture directe',
+      VideoRangeTypeNotSupported: 'HDR non pris en charge',
+      StreamCountExceedsLimit: 'Trop de pistes',
+    },
+    /** A member's Home. */
+    member: {
+      /** The member in their own playback's tile. */
+      you: 'Vous',
+      /** The lede while the member plays one title. */
+      watching: (title: string, device: string) => `Vous regardez ${title} sur ${device}.`,
+      lede: 'Approuvez un appareil avec Quick Connect, choisissez vos sources et réglez votre compte.',
+      sourceCount: (count: number) =>
+        count === 0 ? 'Aucune pour l’instant' : count === 1 ? '1 source' : `${count} sources`,
+    },
+    activity: {
+      title: 'Activité récente',
+      openLog: 'Ouvrir le journal',
+      empty: 'Aucune activité pour l’instant.',
+      emptyHelp:
+        'Les connexions, les lectures et les changements sur le serveur apparaissent ici au fil de l’eau.',
+      warning: 'Avertissement',
+      error: 'Erreur',
+      filter: 'Afficher',
+      filters: {
+        all: 'Tout',
+        problems: 'Problèmes',
+        signIns: 'Connexions',
+        playback: 'Lectures',
+        users: 'Utilisateurs',
+        server: 'Serveur et addons',
+        recordings: 'Enregistrements',
+      },
+      search: 'Chercher dans les événements affichés',
+      listLabel: 'Derniers événements',
+      noMatch: 'Aucun événement ne correspond.',
+      noMatchHelp: 'Choisissez un autre filtre ou videz la recherche.',
+      count: (shown: number, total: number) => `${shown} événements sur ${total}.`,
+      autoRefresh: 'Mise à jour toutes les 15 secondes.',
+    },
+  },
+}
+
+export default home

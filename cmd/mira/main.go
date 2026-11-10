@@ -1,0 +1,1458 @@
+// Command mira runs the Mira server.
+package main
+
+import (
+	"context"
+	"errors"
+	"fmt"
+	"io"
+	"log/slog"
+	"net"
+	"net/http"
+	"os"
+	"os/exec"
+	"os/signal"
+	"path/filepath"
+	"runtime"
+	"sync"
+	"syscall"
+	"time"
+
+	"github.com/ferforastieri/mira/internal/accounts"
+	"github.com/ferforastieri/mira/internal/activity"
+	"github.com/ferforastieri/mira/internal/addons"
+	"github.com/ferforastieri/mira/internal/admin"
+	"github.com/ferforastieri/mira/internal/anime"
+	"github.com/ferforastieri/mira/internal/appimport"
+	"github.com/ferforastieri/mira/internal/appimport/nuvio"
+	stremioimport "github.com/ferforastieri/mira/internal/appimport/stremio"
+	"github.com/ferforastieri/mira/internal/audiosegments"
+	"github.com/ferforastieri/mira/internal/backup"
+	"github.com/ferforastieri/mira/internal/bandwidth"
+	"github.com/ferforastieri/mira/internal/boxset"
+	"github.com/ferforastieri/mira/internal/collections"
+	"github.com/ferforastieri/mira/internal/commercials"
+	"github.com/ferforastieri/mira/internal/config"
+	"github.com/ferforastieri/mira/internal/crashes"
+	"github.com/ferforastieri/mira/internal/database"
+	"github.com/ferforastieri/mira/internal/desktop/tools"
+	"github.com/ferforastieri/mira/internal/discovery"
+	"github.com/ferforastieri/mira/internal/dlna"
+	"github.com/ferforastieri/mira/internal/forwarded"
+	"github.com/ferforastieri/mira/internal/hls"
+	"github.com/ferforastieri/mira/internal/homerows"
+	"github.com/ferforastieri/mira/internal/importlinks"
+	"github.com/ferforastieri/mira/internal/iptv"
+	"github.com/ferforastieri/mira/internal/jellyfin"
+	"github.com/ferforastieri/mira/internal/jellyfinimport"
+	"github.com/ferforastieri/mira/internal/letterboxd"
+	"github.com/ferforastieri/mira/internal/library"
+	"github.com/ferforastieri/mira/internal/localfiles"
+	"github.com/ferforastieri/mira/internal/logs"
+	"github.com/ferforastieri/mira/internal/loudness"
+	"github.com/ferforastieri/mira/internal/lyrics"
+	"github.com/ferforastieri/mira/internal/media"
+	"github.com/ferforastieri/mira/internal/mediasegments"
+	"github.com/ferforastieri/mira/internal/metrics"
+	"github.com/ferforastieri/mira/internal/notifications"
+	"github.com/ferforastieri/mira/internal/ocr"
+	"github.com/ferforastieri/mira/internal/playback"
+	"github.com/ferforastieri/mira/internal/playlists"
+	"github.com/ferforastieri/mira/internal/plays"
+	"github.com/ferforastieri/mira/internal/preferences"
+	"github.com/ferforastieri/mira/internal/process"
+	"github.com/ferforastieri/mira/internal/quickconnect"
+	"github.com/ferforastieri/mira/internal/ratings"
+	"github.com/ferforastieri/mira/internal/recordings"
+	"github.com/ferforastieri/mira/internal/reminders"
+	"github.com/ferforastieri/mira/internal/remuxdb"
+	"github.com/ferforastieri/mira/internal/secrets"
+	"github.com/ferforastieri/mira/internal/server"
+	"github.com/ferforastieri/mira/internal/silo"
+	"github.com/ferforastieri/mira/internal/smartlists"
+	"github.com/ferforastieri/mira/internal/source"
+	"github.com/ferforastieri/mira/internal/stremio"
+	"github.com/ferforastieri/mira/internal/tasks"
+	"github.com/ferforastieri/mira/internal/taste"
+	"github.com/ferforastieri/mira/internal/themecopy"
+	"github.com/ferforastieri/mira/internal/throttle"
+	"github.com/ferforastieri/mira/internal/thumbnails"
+	"github.com/ferforastieri/mira/internal/tmdb"
+	"github.com/ferforastieri/mira/internal/torrent"
+	"github.com/ferforastieri/mira/internal/trackers"
+	"github.com/ferforastieri/mira/internal/updates"
+	"github.com/ferforastieri/mira/internal/updatetool"
+	"github.com/ferforastieri/mira/internal/userdata"
+	"github.com/ferforastieri/mira/internal/virtualtv"
+	"github.com/ferforastieri/mira/internal/watchlist"
+	webui "github.com/ferforastieri/mira/web"
+)
+
+// version is set at build time with -ldflags "-X main.version=…".
+var version = "dev"
+
+const (
+	readHeaderTimeout = 10 * time.Second
+	shutdownTimeout   = 15 * time.Second
+	// Failed password and setup code attempts allowed per client address.
+	signInFailures = 10
+	signInWindow   = 15 * time.Minute
+)
+
+const usage = `Usage: mira [command]
+
+Commands:
+  serve        Start the server (default)
+  healthcheck  Exit 0 when the server at MIRA_LISTEN answers /healthz within 3 seconds, 1 otherwise
+  version      Print the version
+  help         Show this help
+
+Environment:
+  MIRA_DATABASE_URL  PostgreSQL URL (required)
+  MIRA_SECRET_KEY    key the stored keys and tokens are encrypted with: 32 bytes in base64, from openssl rand -base64 32 (default: none, stored unencrypted)
+  MIRA_DATA_DIR      absolute path of the folder Mira keeps its files in: the cache, and the default recordings and backups folders (default: a mira folder in the system's temporary folder)
+  MIRA_LISTEN        HTTP address (default :8096)
+  MIRA_FFPROBE       ffprobe executable (default ffprobe, from PATH)
+  MIRA_FFMPEG        FFmpeg executable (default ffmpeg, from PATH)
+  MIRA_TESSERACT     Tesseract executable picture subtitles are read into text with (default tesseract, from PATH)
+  MIRA_TESSDATA_DIR  folder of Tesseract .traineddata files for languages Tesseract's own data lacks (default: none)
+  MIRA_FONTS_DIR     fallback fonts for subtitles and generated images (default /usr/share/fonts)
+  MIRA_WEB_DIR       jellyfin-web, served at /web/ (default /usr/share/mira/jellyfin-web)
+
+Every other option is a setting of the admin app.
+`
+
+// exitRestart is the exit code of a restart asked in the admin app,
+// EX_TEMPFAIL: not 0, so that a restart policy that restarts only what
+// failed starts Mira again.
+const exitRestart = 75
+
+// errRestart is serve's end when an administrator restarted Mira.
+var errRestart = errors.New("restart")
+
+func main() {
+	command := "serve"
+	if len(os.Args) > 1 {
+		command = os.Args[1]
+	}
+	switch command {
+	case "serve":
+		ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
+		var restore pendingRestore
+		err := serve(ctx, &restore)
+		// A restart from the admin app exits once Mira has stopped, as
+		// on a signal, with exitRestart: Docker's restart policies, on-failure
+		// included, systemd's Restart=on-failure and Mira Desktop start a
+		// process that failed again, where 0 would leave on-failure down.
+		if errors.Is(err, errRestart) {
+			stop()
+			fmt.Fprintln(os.Stderr, "mira: stopped to restart, as an administrator asked: exit code", exitRestart)
+			os.Exit(exitRestart)
+		}
+		// A stop requested while waiting for PostgreSQL is not a failure.
+		interrupted := ctx.Err() != nil && errors.Is(err, context.Canceled)
+		// Mira stopped to restore a backup: it starts again afterwards,
+		// unless asked to stop meanwhile.
+		restart := err == nil && restore.plan != nil && ctx.Err() == nil
+		if restart {
+			restoreBackup(ctx, restore)
+			restart = ctx.Err() == nil
+		}
+		stop()
+		if err != nil && !interrupted {
+			fmt.Fprintln(os.Stderr, "mira:", err)
+			os.Exit(1)
+		}
+		if restart {
+			err := startAgain()
+			fmt.Fprintln(os.Stderr, "mira: start again after the restore:", err)
+			os.Exit(1)
+		}
+	case "healthcheck":
+		if err := healthcheck(os.Getenv, healthcheckTimeout); err != nil {
+			fmt.Fprintln(os.Stderr, "mira: healthcheck:", err)
+			os.Exit(1)
+		}
+	case "version":
+		fmt.Println(version)
+	case "help", "-h", "--help":
+		fmt.Print(usage)
+	default:
+		fmt.Fprintf(os.Stderr, "mira: unknown command %q\n\n%s", command, usage)
+		os.Exit(2)
+	}
+}
+
+// serve runs Mira until ctx ends, until an administrator restores a
+// backup, or restarts Mira: restore then holds what Restore needs, once
+// every part of Mira has stopped, and errRestart tells a restart.
+func serve(ctx context.Context, restore *pendingRestore) error {
+	started := time.Now()
+	// Everything Mira runs in the background ends with ctx, or when it
+	// stops to restore a backup.
+	ctx, stopAll := context.WithCancel(ctx)
+	defer stopAll()
+	cfg, err := config.Load(os.Getenv)
+	if err != nil {
+		return err
+	}
+	// The level is info, and follows the settings' detailed log once they
+	// are loaded. The recent lines are also kept, redacted, for
+	// administrators to read from Jellyfin apps.
+	level := new(slog.LevelVar)
+	recent := logs.NewRing(logs.Capacity)
+	logger := slog.New(slog.NewTextHandler(io.MultiWriter(os.Stderr, recent), &slog.HandlerOptions{Level: level}))
+	for _, warning := range cfg.Warnings {
+		logger.Warn("A variable copied into the settings has a value that is not valid: it is not copied", "error", warning)
+	}
+	for _, retired := range cfg.Retired {
+		logger.Info(retired.Name+" is no longer read: its value is a setting, under "+retired.Section, "variable", retired.Name)
+	}
+	// The programs Mira runs, FFmpeg above all, end with it even when it
+	// is killed (see process.KillChildrenOnExit).
+	if err := process.KillChildrenOnExit(); err != nil {
+		logger.Warn("The programs Mira runs may outlive it if it is killed", "error", err)
+	}
+	// A crash of this run is written to the data folder too, for the next
+	// start to tell; the last run's, if any, is told once the notifications
+	// are made, below.
+	var crashed *crashes.Report
+	if err := os.MkdirAll(cfg.DataDir, 0o755); err != nil {
+		logger.Warn("A crash of Mira would not be kept: the data folder cannot be made", "error", err)
+	} else if crashed, err = crashes.Watch(cfg.DataDir); err != nil {
+		logger.Warn("A crash of Mira would not be kept", "error", err)
+	}
+	adminApp, err := webui.Assets()
+	if err != nil {
+		return err
+	}
+
+	pool, err := database.Connect(ctx, cfg.DatabaseURL, logger)
+	if err != nil {
+		return fmt.Errorf("connect to PostgreSQL: %w", err)
+	}
+	defer pool.Close()
+	if err := database.Migrate(ctx, pool); err != nil {
+		return fmt.Errorf("migrate the database: %w", err)
+	}
+	serverID, err := database.ServerID(ctx, pool)
+	if err != nil {
+		return err
+	}
+	box, err := secrets.New(cfg.SecretKey)
+	if err != nil {
+		return fmt.Errorf("MIRA_SECRET_KEY: %w", err)
+	}
+	if err := box.Prepare(ctx, pool, logger); err != nil {
+		return fmt.Errorf("seal the stored secrets: %w", err)
+	}
+	store, err := accounts.Open(ctx, pool, accounts.Sealing(box))
+	if err != nil {
+		return fmt.Errorf("load settings: %w", err)
+	}
+	// The variables that were options are copied into the settings once;
+	// the settings decide from then on.
+	if err := store.AdoptEnvironment(ctx, cfg.Environment); err != nil {
+		return fmt.Errorf("copy the environment variables into the settings: %w", err)
+	}
+	store.FollowLogLevel(level, slog.LevelInfo)
+	prepareFolders(store.Settings(), cfg.DataDir, logger)
+	var setupCode string
+	if required, err := store.SetupRequired(ctx); err != nil {
+		return err
+	} else if required {
+		setupCode = admin.NewSetupCode()
+		logger.Warn("No administrator yet: open /admin/ and create one with this setup code", "setup_code", setupCode)
+	}
+
+	listener, err := net.Listen("tcp", cfg.Listen)
+	if err != nil {
+		return err
+	}
+	quickConnect := quickconnect.New()
+	signIns := throttle.New(signInFailures, signInWindow)
+	// The client of a request is read behind the known proxies, for every
+	// route; System › Health names the proxies missing from them. Their
+	// host names are resolved now, at each change of the settings, every
+	// minute, and when an unknown address forwards requests.
+	proxies := forwarded.New(store.KnownProxies, nil)
+	proxies.Watch(ctx, store.KnownProxyNames, store.SettingsChanged)
+	// Jellyfin apps that look for servers on the local network find this
+	// one, while the settings turn it on; a port another server uses is
+	// told in System › Health, and never stops the start.
+	localDiscovery := discovery.Start(ctx, discovery.Options{
+		Port:     cfg.DiscoveryPort,
+		HTTP:     listener.Addr().(*net.TCPAddr),
+		ServerID: serverID,
+		Settings: func() discovery.Settings {
+			settings := store.Settings()
+			return discovery.Settings{Enabled: settings.LocalDiscovery, Name: settings.ServerName, Address: settings.LocalAddress}
+		},
+		Changed:     store.SettingsChanged,
+		InContainer: discovery.InContainer(),
+		Logger:      logger,
+	})
+	// HTTPS is served next to HTTP while the settings turn it on, on a
+	// port of its own, from the start of the HTTP server on; a port it
+	// cannot listen on, certificate files it cannot read and renewals that
+	// fail are told in System › Health, and HTTP keeps working whatever
+	// happens to them.
+	secure := newHTTPS(cfg, store, pool, box, logger)
+	addonClient := stremio.NewClient(version)
+	addonStore := addons.New(pool, addonClient)
+	// Addons and libraries are answered from memory while their changes
+	// are followed.
+	go addonStore.Watch(ctx, logger)
+	secret, err := database.Secret(ctx, pool)
+	if err != nil {
+		return err
+	}
+	if _, err := exec.LookPath(cfg.FFprobe); err != nil {
+		logger.Warn("ffprobe was not found: nothing can be played until it is installed", "ffprobe", cfg.FFprobe)
+	}
+	if _, err := exec.LookPath(cfg.FFmpeg); err != nil {
+		logger.Warn("FFmpeg was not found: apps that cannot play a file as it is cannot play it", "ffmpeg", cfg.FFmpeg)
+	}
+	// The segments of conversions, the files being read and the cache go
+	// in the folders the settings chose, read once, now: a folder chosen
+	// applies at the next start. One Mira cannot write into is told in
+	// System › Health, and the cache in the data folder takes its place
+	// meanwhile. The folders of that cache this run leaves unused are
+	// removed, those chosen before left as they are.
+	work := config.ChooseFolders(cfg.DataDir, store.Settings())
+	for _, unwritable := range work.Unwritable {
+		logger.Warn("A folder the settings choose cannot be written into: the data folder's cache is used instead until the next start",
+			"folder", unwritable.Name, "path", unwritable.Folder, "error", unwritable.Err)
+	}
+	if err := work.ClearUnused(cfg.DataDir); err != nil {
+		logger.Warn("The folders of the data folder's cache left unused could not be removed", "error", err)
+	}
+	sources, err := source.New(work.Sources(), func() source.Policy { return playback.SourcePolicy(store.Settings()) }, addonClient, logger)
+	if err != nil {
+		return fmt.Errorf("prepare the source cache: %w", err)
+	}
+	defer sources.Close()
+	segments, err := hls.NewManager(cfg.FFmpeg, work.Segments(), logger)
+	if err != nil {
+		return fmt.Errorf("prepare the segment directory: %w", err)
+	}
+	defer segments.Close()
+	// NVENC with an NVIDIA driver older than 610 takes the FFmpeg built for
+	// such drivers, downloaded into the data folder's tools when it needs
+	// it, where Mira Desktop keeps its own FFmpeg too.
+	if manifest, ok, err := tools.OlderDriverManifest(runtime.GOOS, runtime.GOARCH); err != nil {
+		logger.Warn("The manifest of the FFmpeg for NVIDIA drivers older than 610 cannot be read", "variable", tools.OlderDriverVariable, "error", err)
+	} else if ok {
+		segments.UseOlderDriverFFmpeg(tools.OlderDriver(filepath.Join(cfg.DataDir, "tools"), manifest))
+	}
+	settings := store.Settings()
+	segments.SelectHardware(settings.HardwareAcceleration, settings.VAAPIDevice)
+	lib := library.New(pool, addonStore, addonClient, logger, store.Settings)
+	// A removal deletes, in its transaction, what the addon brought to the
+	// library and settings beyond its own tables.
+	addonStore.SetCleanup(lib.CleanRemoved)
+	channels := iptv.New(pool, addonStore, addonClient, logger, store.Settings)
+	lib.UseIPTV(channels)
+	// Anime named by AniDB, Kitsu or MyAnimeList, as Simkl's history and
+	// anime addons name them, are mapped to IMDb and TVDB from two lists
+	// kept in the data folder. Stream addons that accept other identifiers
+	// than a title's are asked by those the mapping gives.
+	animeMapping := anime.New(anime.Options{Dir: filepath.Join(cfg.DataDir, "anime"), Version: version, Logger: logger})
+	defer animeMapping.Close()
+	lib.UseAnime(animeMapping)
+	channels.OnChange(lib.LineupChanged)
+	// Find tuners asks the local networks for HDHomeRun tuners on their
+	// port, or only the addresses MIRA_HDHOMERUN_ADDRESSES gives.
+	channels.UseTunerDiscovery(cfg.HDHomeRunPort, cfg.HDHomeRunAddresses...)
+	// Movies and series show the ratings MDBList gives them while the
+	// settings hold the server's key, looked up in the background.
+	titleRatings := ratings.New(pool, ratings.MDBList, version, logger, store.Settings)
+	defer titleRatings.Close()
+	lib.UseRatings(titleRatings)
+	// Edit images searches TMDB's images, and people are looked up on TMDB,
+	// while the settings hold the server's TMDB key.
+	imageSearch := tmdb.New(tmdb.API, tmdb.Images, version, store.Settings)
+	lib.UseTMDB(imageSearch)
+	// Silo's apps show the TMDB collections of movies as box sets, learnt
+	// in the background while the settings hold the server's TMDB key.
+	// What Mira learns from TMDB in the background waits its turn in one
+	// queue, at TMDB's pace: box sets, and titles' credits, which make
+	// their people.
+	tmdbLookups := tmdb.NewQueue(imageSearch, tmdb.QueueOptions{Logger: logger})
+	defer tmdbLookups.Close()
+	movieCollections := boxset.New(pool, imageSearch, boxset.Options{Catalog: lib, Queue: tmdbLookups, Logger: logger})
+	defer movieCollections.Close()
+	lib.UseTitleCredits(tmdbLookups)
+	// Local folders match their files through the library's searches of
+	// the metadata addons, and TMDB's when every addon's search fails.
+	folders := localfiles.New(pool, addonStore, lib, logger, store.Settings, box)
+	defer folders.Close()
+	lib.UseLocal(folders)
+	folders.UseTMDB(imageSearch)
+	folders.UseTools(cfg.FFprobe, cfg.FFmpeg)
+	// The loudness of songs without a gain is measured two at a time, those
+	// of local folders and those of music addons together.
+	meter := loudness.NewMeter(cfg.FFmpeg)
+	folders.UseMeter(meter)
+	folders.UseToneMapping(segments.HasFilters("zscale", "tonemap"))
+	folders.Watch()
+	if err := lib.SpoolGuidesIn(work.Guides()); err != nil {
+		return fmt.Errorf("prepare the guide directory: %w", err)
+	}
+	activityLog := activity.New(pool, store.Settings, logger)
+	registry := tasks.New(logger)
+	registerTasks(registry, store, activityLog, lib, channels, logger)
+	registry.Register(emptySourceCacheTask(sources, store.Settings, logger))
+	player, err := playback.New(pool, addonClient, cfg.FFprobe, playback.NewSigner(secret), sources, segments, lib.Renew, logger, store.Settings)
+	if err != nil {
+		return err
+	}
+	defer player.Close()
+	// What playbacks receive from sources and send to apps, sampled every
+	// second for Now playing (see the bandwidth package).
+	received, sent := bandwidth.New(), bandwidth.New()
+	player.CountReceived(received)
+	go received.Run(ctx)
+	go sent.Run(ctx)
+	// The files of local folders are read through the loopback interface,
+	// as the addons' files are; FFmpeg reads their discs and disc images
+	// itself.
+	folders.UseFiles(player.LocalFiles(folders.Open), player.LocalInputs(folders))
+	player.LocalSources(folders.Source)
+	// The channels Mira airs from the library's titles are listed with
+	// the other channels, and play their playout, which airs their
+	// programmes from what the server's addons and local folders list.
+	ownChannels := virtualtv.New(pool)
+	lib.UseVirtual(virtualChannels{store: ownChannels, player: player})
+	player.UsePlayouts(playouts{store: ownChannels, lib: lib})
+	// Torrent streams are read from their swarms while they play, over the
+	// route the settings set alone, their pieces within a quarter of the
+	// source cache's space, which counts them. DHT lookups start from the
+	// bootstrap nodes clients use, over a route that carries UDP.
+	torrents, err := torrent.New(torrent.Config{Settings: func() torrent.Settings { return playback.TorrentSettings(store.Settings()) },
+		Dir: work.Torrents(), Budget: func() int64 { return playback.SourcePolicy(store.Settings()).Limit / 4 },
+		Bootstrap: torrent.BootstrapNodes, Logger: logger})
+	if err != nil {
+		return fmt.Errorf("prepare the torrent directory: %w", err)
+	}
+	defer torrents.Close()
+	sources.Share(torrents.Usage)
+	player.Torrents(torrents)
+	// A disc image whose UDF file system is laid out in a way Mira does
+	// not read, as those of rewritable and write-once media are, is read
+	// through FFmpeg to tell a Blu-ray disc's.
+	folders.UseProbe(player.ProbesInput)
+	// A folder whose address, credentials or host key changed has its
+	// versions that could not be read tried again at once.
+	folders.UseRetry(player.Retry)
+	// Picture subtitles are read into text with Tesseract, as the settings
+	// ask: those of the versions played, and of the videos scans find. The
+	// files written meanwhile go in the cache folder, emptied at start, as
+	// the system's temporary folder is read-only in the image's container.
+	ocrDir := work.OCR()
+	if err := errors.Join(os.RemoveAll(ocrDir), os.MkdirAll(ocrDir, 0o700)); err != nil {
+		return fmt.Errorf("prepare the OCR directory: %w", err)
+	}
+	player.UseTesseract(cfg.FFmpeg, ocrDir, &ocr.Tesseract{Path: cfg.Tesseract, DataDir: cfg.TessdataDir, TempDir: ocrDir})
+	// The data of the languages Tesseract lacks is downloaded into
+	// MIRA_TESSDATA_DIR from Health, or by itself as the settings ask.
+	player.FetchLanguagesWith(&ocr.Downloader{Dir: cfg.TessdataDir, URL: cfg.TessdataURL})
+	folders.UseScanned(player.QueueScanned)
+	if _, err := exec.LookPath(cfg.Tesseract); err != nil && store.Settings().SubtitleOCR != "off" {
+		logger.Warn("Tesseract was not found: picture subtitles are not read into text", "tesseract", cfg.Tesseract)
+	}
+	registerLocalFoldersTask(registry, folders)
+	registerCleanupTask(registry, lib, folders, logger)
+	// Channel streams of IPTV sources share their account's connections,
+	// and how they answer orders them.
+	player.LiveSources(channels.Connections, func(ctx context.Context, v library.Version, failure string) {
+		if err := channels.ReportStream(ctx, v.Origin.Addon, v.Origin.ID, v.URL, failure); err != nil {
+			logger.Warn("A channel's stream health could not be saved", "error", err)
+		}
+	})
+	// A channel whose streams an administrator asks to try again has those
+	// that failed to play tried again at once.
+	channels.UseRetry(player.RetryItem)
+	images := thumbnails.New(thumbnails.Options{
+		DB:          pool,
+		FFmpeg:      cfg.FFmpeg,
+		Hardware:    player.DecodingHardware,
+		ToneMapping: segments.HasFilters("zscale", "tonemap"),
+		Settings:    store.Settings,
+		Open:        func(v library.Version) thumbnails.Source { return player.OpenSource(v).Once() },
+		Analyzed:    player.Analyzed,
+		// During a play, thumbnails are made of what it read, unless a
+		// conversion runs on the processor.
+		Cached: func(v library.Version) (thumbnails.Cached, bool) {
+			cached, ok := player.CachedSource(v)
+			return cached, ok
+		},
+		Converting: player.ConvertsOnProcessor,
+		Logger:     logger,
+	})
+	defer images.Close()
+	// Recording and backups follow the settings, which turn them on and
+	// choose their folders. Recordings that end are told to the
+	// notifications, made below, before any recording starts, and have
+	// their commercial breaks looked for in the background. Finished
+	// recordings are converted to HEVC as the settings ask, on the GPU
+	// conversions use, a recording being played replaced once the
+	// playbacks followed below and its encodings stop.
+	var notifier *notifications.Service
+	var breaks *commercials.Service
+	var playbacks *plays.Tracker
+	recorder := recordings.New(recordings.Config{DB: pool, Folder: func() string { return store.Settings().RecordingsDir(cfg.DataDir) },
+		Guide: lib, Recorder: player, Users: store, Logger: logger,
+		Ended: func(ctx context.Context, ended recordings.Ended) {
+			notifier.RecordingEnded(ctx, ended)
+			breaks.Ended(ctx, ended)
+		},
+		Converter: segments, Prober: media.Prober{Path: cfg.FFprobe, Timeout: time.Minute},
+		InUse: func(id accounts.ID) bool { return player.FileInUse(id) || playbacks.Playing(id) }})
+	if recorder.Available() {
+		logger.Info("Live TV recording is on", "folder", recorder.Dir())
+	}
+	breaks = commercials.New(commercials.Options{DB: pool, FFmpeg: cfg.FFmpeg, FFprobe: cfg.FFprobe, Recordings: recorder,
+		Settings: store.Settings, Logger: logger})
+	defer breaks.Close()
+	registerRecordingTasks(registry, recorder, breaks)
+	// The destinations' passwords and keys are sealed as the other secrets,
+	// and so is the passphrase that encrypts the backups: one the key
+	// cannot open fails the backups rather than leave them unencrypted. A
+	// backup sent from the setup page is written to the default folder.
+	backups := backup.New(backup.Config{Folder: func() string { return store.Settings().BackupDir(cfg.DataDir) }, DatabaseURL: cfg.DatabaseURL,
+		DB: pool, Secrets: box, Settings: store.Settings, PassphraseUnreadable: func() bool { return store.SecretUnreadable("backupPassphrase") },
+		SetupFolder: accounts.DefaultBackupFolder(cfg.DataDir), Logger: logger})
+	if backups.Available() {
+		logger.Info("Database backups are on", "folder", backups.Dir())
+		if _, err := exec.LookPath(backups.PgDump()); err != nil {
+			logger.Warn("pg_dump was not found: database backups fail until it is installed", "pg_dump", backups.PgDump())
+		}
+		if _, err := exec.LookPath(backups.PgRestore()); err != nil {
+			logger.Warn("pg_restore was not found: backups cannot be restored from the admin app until it is installed", "pg_restore",
+				backups.PgRestore())
+		}
+	}
+	// Backups downloaded, sent or decrypted to be restored, and never
+	// restored, go.
+	backups.RemoveRestoreLeftovers()
+	registerBackupTask(registry, backups)
+	webClient := server.WebClientFiles(cfg.WebDir)
+	switch {
+	case webClient != nil:
+		logger.Info("The web client is served at /web/", "folder", cfg.WebDir)
+	case cfg.WebDir != config.DefaultWebDir:
+		logger.Warn("No web client: MIRA_WEB_DIR holds no index.html", "folder", cfg.WebDir)
+	}
+	skipSegments := mediasegments.New(pool, mediasegments.Sources(accounts.SegmentSources), version, logger, store.Settings)
+	// Local episodes played without an intro or credits have them looked
+	// for in their season's audio, a season at a time, read through the
+	// loopback interface.
+	audioSegments := audiosegments.New(audiosegments.Options{DB: pool, FFmpeg: cfg.FFmpeg, FFprobe: cfg.FFprobe, Files: folders,
+		Settings: store.Settings, Logger: logger})
+	defer audioSegments.Close()
+	userData := userdata.New(pool)
+	// The imports fill the users' watchlists: a title a list newly holds
+	// becomes entries of their watchlist playlist, a series its aired
+	// episodes, once its episodes are known and one aired (see
+	// registerWatchlistTasks).
+	lists := watchlist.New(pool).WithEntries(func(ctx context.Context, id, title accounts.ID) (watchlist.Made, error) {
+		user, err := store.User(ctx, id)
+		if err != nil {
+			return watchlist.Made{}, err
+		}
+		return lib.WatchlistEntries(library.Background(ctx), user, title)
+	})
+	// The titles every import did not find are kept, each with what it
+	// would import, and a user may link one to its IMDb or TMDB title:
+	// the link applies at once, and again at each later import that
+	// meets the entry.
+	importTitles := importlinks.New(importlinks.Options{DB: pool, Settings: store.Settings, Titles: lib, UserData: userData,
+		Watchlist: lists, Logger: logger})
+	// Imported watch histories find their titles in the library and add to
+	// the users' data. A connection a service stops is told to the
+	// notifications, made below, as recordings are.
+	tracking := trackers.New(trackers.Options{DB: pool, Watchlist: lists, Settings: store.Settings, Secrets: box, Version: version, Logger: logger,
+		Titles: lib, UserData: userData, Anime: animeMapping, Links: importTitles,
+		Stopped: func(user accounts.ID, service string) {
+			notifier.ConnectionStopped(user, notifications.ConnectionTracking, service)
+		}})
+	defer tracking.Close()
+	// Users and their watch data imported from a Jellyfin server find
+	// their titles and merge the same way. A user signing in to Plex to
+	// import their own watch data brings their Plex Watchlist too, and
+	// Mira names itself to Plex by one identifier, kept with the
+	// server's identity.
+	plexClient, err := database.PlexClient(ctx, pool)
+	if err != nil {
+		return err
+	}
+	fromJellyfin := jellyfinimport.New(jellyfinimport.Options{Settings: store.Settings, Titles: lib, UserData: userData, Version: version,
+		Logger: logger, Watchlist: lists, Collections: collections.New(pool), Playlists: playlists.New(pool),
+		PlexClient: plexClient, Links: importTitles})
+	defer fromJellyfin.Close()
+	// The watch data of accounts on apps built on addons, Nuvio's and
+	// Stremio's, finds its titles and merges the same way; the accounts'
+	// addons become their users' own, and their libraries go on their
+	// watchlists. A series of Stremio's tells its episodes watched by
+	// their places in the list its metadata addons give, which the
+	// server's addons give again. The users who stay connected keep what
+	// reads their accounts again, sealed; a connection its app stops is
+	// told to the notifications.
+	fromNuvio := nuvio.New(nuvio.Options{Anime: animeMapping, Version: version})
+	fromStremio := stremioimport.New(stremioimport.Options{Anime: animeMapping, Metas: lib, Version: version})
+	fromApps := appimport.New(appimport.Options{Settings: store.Settings, Titles: lib, UserData: userData, Addons: addonStore,
+		Activity: activityLog, Logger: logger, DB: pool, Secrets: box,
+		Sources:   map[string]appimport.Source{nuvio.App: fromNuvio, stremioimport.App: fromStremio},
+		Stopped:   func(user accounts.ID, app string) { notifier.ConnectionStopped(user, notifications.ConnectionApp, app) },
+		Watchlist: lists, Links: importTitles})
+	defer fromApps.Close()
+	// Letterboxd exports name their movies by name and year only: they are
+	// searched in the server's metadata addons, then merge the same way,
+	// their watchlist going on the users' watchlists.
+	fromLetterboxd := letterboxd.New(letterboxd.Options{Titles: lib, UserData: userData, Watchlist: lists, Logger: logger,
+		Links: importTitles})
+	defer fromLetterboxd.Close()
+	// Deleting a user signs out, in the background, the sessions Mira
+	// opened for them at apps and tracking services, and stops their
+	// Letterboxd import.
+	store.OnDelete(tracking.Leaving)
+	store.OnDelete(fromApps.Leaving)
+	store.OnDelete(fromLetterboxd.Leaving)
+	// The playbacks apps report are followed: the history keeps the videos
+	// that stop, and the notifications, made below, tell every change.
+	history := plays.NewHistory(pool, store.Settings, logger)
+	registerPlaybackHistoryTask(registry, history, logger)
+	playbacks = plays.NewTracker(func(c plays.Change) {
+		history.Record(context.Background(), c)
+		notifier.Playback(c)
+	})
+	// The daily check for a new version tells administrators through the
+	// notifications, made below.
+	updateCheck := updates.New(updates.Options{DB: pool, Version: version, Logger: logger,
+		Enabled:     func() bool { return store.Settings().UpdateCheck },
+		Prereleases: func() bool { return store.Settings().IncludePrereleases },
+		Notify:      func(release updates.Release) { notifier.NewVersion(release.Version, release.URL) }})
+	// The songs of music addons are measured after their first play, read
+	// as playback reads them; their measures end before playback closes.
+	songLoudness := loudness.New(pool, meter, logger, store.Settings)
+	defer songLoudness.Close()
+	homeRows := homerows.New(pool)
+	// Each user's taste profile, built in the background.
+	tastes := taste.New(pool, store, userData, lib, logger)
+	registerTasteTask(registry, tastes)
+	jellyfinAPI := jellyfin.New(jellyfin.Options{
+		ServerID:     serverID,
+		Sent:         sent,
+		Accounts:     store,
+		QuickConnect: quickConnect,
+		SignIns:      signIns,
+		// Blocked accounts and sign-ins on new devices are told through the
+		// notifications, made below.
+		AccountBlocked: func(user accounts.User, attempt accounts.DeviceInfo) { notifier.AccountBlocked(user, attempt) },
+		NewDevice:      func(user accounts.User, device accounts.Device) { notifier.NewDevice(user, device) },
+		WebSocketPort:  listener.Addr().(*net.TCPAddr).Port,
+		Library:        lib,
+		IPTV:           channels,
+		Stremio:        addonClient,
+		Playback:       player,
+		Preferences:    preferences.New(pool),
+		UserData:       userData,
+		Segments:       skipSegments,
+		AudioSegments:  audioSegments,
+		RemuxDB:        remuxdb.New(serverID, version, logger, store.Settings),
+		Lyrics:         lyrics.New(pool, lyrics.LRCLIB, version, logger, store.Settings),
+		TMDB:           imageSearch,
+		BoxSets:        movieCollections,
+		Loudness:       songLoudness,
+		Playlists:      playlists.New(pool),
+		Collections:    collections.New(pool),
+		HomeRows:       homeRows,
+		Taste:          tastes,
+		Thumbnails:     images,
+		Logger:         logger,
+		Activity:       activityLog,
+		Tasks:          registry,
+		Updates:        updateCheck,
+		Logs:           recent,
+		CacheDir:       work.Cache,
+		SegmentsDir:    work.Segments(),
+		FontsDir:       cfg.FontsDir,
+		Recordings:     recorder,
+		Commercials:    breaks,
+		Backups:        backups,
+		Trackers:       tracking,
+		Plays:          playbacks,
+		// Guests playing through share links, and plays that failed, are
+		// told through the notifications, made below.
+		SharePlayed: func(link accounts.ShareLink) { notifier.SharePlayed(link) },
+		PlayFailed:  func(f plays.Failure) { notifier.PlaybackFailed(f) },
+	})
+	// DLNA devices on the local network browse and play the libraries of
+	// the user chosen for each, while the settings share them; a port
+	// another server uses is told in System › Health, and never stops the
+	// start.
+	sharing := dlna.Start(ctx, dlna.Options{
+		Port:     cfg.DLNAPort,
+		HTTP:     listener.Addr().(*net.TCPAddr),
+		ServerID: serverID,
+		DB:       pool,
+		Settings: store.Settings,
+		Changed:  store.SettingsChanged,
+		User:     store.User,
+		Signer:   playback.NewSigner(secret),
+		Library:  lib,
+		Player:   jellyfinAPI,
+		Version:  version,
+		Logger:   logger,
+	})
+	// The copy of the files the web player's Custom texts load from
+	// elsewhere, kept in the data folder's themes.
+	themesDir := filepath.Join(cfg.DataDir, "themes")
+	themeCopier, err := themecopy.New(ctx, themecopy.Options{DB: pool, Accounts: store, Dir: themesDir, UserAgent: "Mira/" + version, Logger: logger})
+	if err != nil {
+		return fmt.Errorf("theme copy: %w", err)
+	}
+	restartRequested := make(chan struct{})
+	var restartOnce sync.Once
+	adminOptions := admin.Options{
+		Version:       version,
+		ServerID:      serverID,
+		Database:      pool,
+		Accounts:      store,
+		Addons:        addonStore,
+		QuickConnect:  quickConnect,
+		SignIns:       signIns,
+		SetupCode:     setupCode,
+		Logger:        logger,
+		Guides:        lib,
+		IPTV:          channels,
+		Folders:       folders,
+		Segments:      skipSegments,
+		Ratings:       titleRatings,
+		TMDB:          imageSearch,
+		Activity:      activityLog,
+		DataDir:       cfg.DataDir,
+		WebClient:     webClient != nil,
+		ThemeCopier:   themeCopier,
+		InContainer:   discovery.InContainer(),
+		Sessions:      jellyfinAPI,
+		Watching:      jellyfinAPI,
+		Tasks:         registry,
+		Logs:          recent,
+		Recordings:    recorder,
+		Library:       lib,
+		LibraryImages: lib,
+		Leftovers:     lib,
+		// Refreshing a library's descriptions, paced.
+		LibraryRefreshes: lib,
+		ShownTitles:      lib,
+		SmartLists:       smartlists.New(pool),
+		SmartPreviews:    lib,
+		ActivityTitles:   lib,
+		// The channels Mira airs, built from what the Jellyfin API lists.
+		VirtualChannels: ownChannels,
+		ChannelBuilder:  jellyfinAPI,
+		Playouts:        player,
+		// The rows of the web player's home page, the collections they may
+		// list, and each user's rows as the Jellyfin API tells them.
+		HomeRows:        homeRows,
+		HomeRowChoices:  jellyfinAPI,
+		HomeRowPreviews: jellyfinAPI,
+		// Each user's taste profile, which My account shows them.
+		Taste: tastes,
+		// Settings › Content › Posters previews the badges over real
+		// titles' posters.
+		PosterPreviews: jellyfinAPI,
+		// Reset my preferences forgets what Jellyfin apps saved, with what
+		// the Jellyfin API remembers of it.
+		Preferences: jellyfinAPI,
+		// My account's track choices are those the Jellyfin API remembers.
+		TrackChoices: jellyfinAPI,
+		// Apply this order to every user clears the orders of libraries
+		// users saved, with what the Jellyfin API remembers of them.
+		LibraryOrders: jellyfinAPI,
+		EpisodeOrders: lib,
+		Sharing:       lib,
+		// Users' and groups' Live TV channel rules name the channels of the
+		// server's line-ups.
+		ChannelChoices: lib,
+		// The Versions page explains titles' versions as the Jellyfin API
+		// offers them.
+		Versions: jellyfinAPI,
+		Titles:   lib,
+		// Replacing an addon's address forgets its version lists.
+		VersionLists: lib,
+		Health: admin.HealthSources{
+			Addons:           addonClient,
+			SearchesLeaveOut: lib.SearchesLeaveOut,
+			StreamsTimingOut: lib.StreamsTimingOut,
+			Cache:            sources,
+			Folders:          work,
+			Encoder:          segments,
+			NVIDIADriver:     segments.NVIDIADriver,
+			Thumbnails:       images,
+			DatabaseSize:     func(ctx context.Context) (int64, error) { return database.Size(ctx, pool) },
+			Started:          started,
+			SecretKey:        box.Enabled(),
+			Secrets:          func(ctx context.Context) (secrets.Report, error) { return box.Inspect(ctx, pool) },
+			Updates:          updateCheck,
+			Proxies:          proxies,
+			Discovery:        localDiscovery.Status,
+			DLNA:             sharing.Status,
+			HTTPS:            secure.Status,
+			MissingLanguages: player.MissingLanguages,
+			DownloadLanguage: player.DownloadLanguage,
+			Torrents:         torrents,
+			Images:           jellyfinAPI,
+			Artwork:          jellyfinAPI.ArtworkStatus,
+			People:           lib.PeopleStatus,
+
+			// The FFmpeg for NVIDIA drivers older than 610 (#542).
+			OlderDriverFFmpeg: segments.OlderDriverFFmpeg,
+		},
+		Variables:      config.Variables(os.Environ(), cfg),
+		Trackers:       tracking,
+		Backups:        backups,
+		JellyfinImport: fromJellyfin,
+		AppImport:      fromApps,
+		Letterboxd:     fromLetterboxd,
+		ImportTitles:   importTitles,
+		Nuvio:          fromNuvio,
+		Stremio:        fromStremio,
+		Plays:          history,
+		DLNA:           sharing,
+		// A restart asked in the admin app stops Mira as a signal does,
+		// below, for what runs it to start it again.
+		Restart:    func() { restartOnce.Do(func() { close(restartRequested) }) },
+		Desktop:    cfg.Desktop,
+		UpdateTool: updatetool.New("Mira/" + version),
+	}
+	// Notifications tell of new episodes, ended recordings, the problems
+	// System › Health finds, and once a week, a month and a year what
+	// happened in it.
+	notifier = notifications.New(notifications.Options{DB: pool, Accounts: store, Library: lib, UserData: userData, Secrets: box,
+		Version: version, ServerID: serverID, WebClient: webClient != nil, Problems: admin.HealthProblems(adminOptions), History: history,
+		LocalFiles: folders, Logger: logger})
+	defer notifier.Close()
+	adminOptions.Notifications = notifier
+	registerSummaryTasks(registry, notifier)
+	if crashed != nil {
+		logger.Warn("Mira crashed during its last run: System › Health shows the start of its trace", "crashed_at", crashed.At.Format(time.RFC3339))
+		if err := notifier.ServerCrashed(ctx, *crashed); err != nil {
+			logger.Warn("The last crash could not be kept: the next start tells it", "error", err)
+		} else if err := crashes.Forget(cfg.DataDir); err != nil {
+			logger.Warn("The last crash's file could not be deleted", "error", err)
+		}
+	}
+	// Programme reminders tell users, on their own targets and on their
+	// apps when they choose it, that a programme they chose starts soon.
+	// They are sent once the notifications read their targets.
+	programmeReminders := reminders.New(reminders.Config{DB: pool, Guide: lib, Users: store, Teller: notifier, Apps: jellyfinAPI,
+		Reaches: func(user accounts.ID) bool { return notifier.Receives(user, notifications.ProgrammeReminder) },
+		Ready:   notifier.Loaded(), Logger: logger})
+	jellyfinAPI.Reminders = programmeReminders
+	// Refresh metadata forgets the failed downloads of the artwork the
+	// image relay remembers.
+	lib.UseArtworkFailures(jellyfinAPI)
+	adminOptions.Reminders = programmeReminders
+	registerWatchlistTasks(registry, store, lists, jellyfinAPI, notifier, logger)
+	// Playbacks under way when Mira stops are kept in the history, as
+	// ended at their last report.
+	defer playbacks.Close()
+	registerMetrics(addonStore, jellyfinAPI, segments, pool, metricFolders(work, recorder.Dir, backups.Dir))
+	httpServer := &http.Server{
+		Handler: server.New(server.Options{
+			Database:      pool,
+			Admin:         adminApp,
+			AdminAPI:      admin.New(adminOptions),
+			Jellyfin:      jellyfinAPI,
+			Share:         jellyfinAPI.Share(),
+			ShareAssets:   jellyfin.ShareAssets,
+			DLNA:          sharing.Handler(),
+			Web:           webClient,
+			SetupRequired: store.SetupRequired,
+			WebThemes: func() server.WebThemes {
+				settings := store.Settings()
+				return server.WebThemes{Theme: settings.WebTheme, CustomCss: settings.CustomCss, CustomJs: settings.CustomJs}
+			},
+			ServerID:    serverID,
+			SavedThemes: themesDir,
+			// A file of the copy kept that is missing goes to where it
+			// came from.
+			SavedThemeOriginal: themeCopier.Original,
+			Proxies:            proxies,
+			HTTPS:              secure.Handler,
+			Metrics: metrics.Handler(func() (bool, string) {
+				settings := store.Settings()
+				return settings.Metrics, settings.MetricsToken
+			}),
+			Logger: logger,
+			// Silo's apps, while the settings allow them, through the
+			// Jellyfin API's answers.
+			Silo: silo.New(silo.Options{ServerID: serverID, Version: version, Accounts: store, Jellyfin: jellyfinAPI,
+				DB: pool, QuickConnect: quickConnect, BoxSets: movieCollections, Logger: logger, ContainerTracks: jellyfinAPI.ContainerTracks}),
+		}),
+		ReadHeaderTimeout: readHeaderTimeout,
+		ErrorLog:          slog.NewLogLogger(logger.Handler(), slog.LevelWarn),
+	}
+	// Jellyfin's handler, created above, closes the sockets of the devices
+	// the device sweep signs out. The guides due are fetched at start too.
+	registry.Start(ctx)
+	// Recordings in progress when ctx ends are finished, as partial, when
+	// Mira starts again.
+	go recorder.Run(ctx)
+	go recorder.RunConversions(ctx)
+	// What was left to send to tracking services is sent again.
+	go tracking.Run(ctx)
+	// The app connections due are imported, then as often as the settings
+	// say.
+	go fromApps.Run(ctx)
+	go notifier.Run(ctx)
+	go programmeReminders.Run(ctx)
+	go updateCheck.Run(ctx)
+	go playbacks.Run(ctx)
+	// Playbacks whose apps stopped reporting are stopped.
+	go jellyfinAPI.Run(ctx)
+	served := make(chan error, 1)
+	go func() { served <- httpServer.Serve(listener) }()
+	secure.Start(ctx, httpServer.Handler)
+	logger.Info("Mira started", "version", version, "address", listener.Addr().String(), "server_id", serverID)
+
+	restarting := false
+	select {
+	case err := <-served:
+		return err
+	case <-ctx.Done():
+		logger.Info("Mira is stopping")
+	case <-restartRequested:
+		// The same stop as on a signal, but Mira then exits with
+		// exitRestart, for what runs it to start it again.
+		logger.Info("Mira is stopping to restart")
+		restarting = true
+		stopAll()
+	case plan := <-backups.Requested():
+		// Playbacks, conversions, recordings and tasks stop with the rest:
+		// the backup is restored once nothing uses the database.
+		logger.Info("Mira is stopping to restore a backup")
+		*restore = pendingRestore{plan: &plan, backups: backups, listen: cfg.Listen, logger: logger}
+		stopAll()
+	}
+	shutdownCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), shutdownTimeout)
+	defer cancel()
+	// HTTPS stops with ctx, which ended either way.
+	if err := secure.Shutdown(shutdownCtx); err != nil {
+		logger.Warn("HTTPS did not stop before the shutdown timeout", "error", err)
+	}
+	if err := httpServer.Shutdown(shutdownCtx); err != nil {
+		logger.Warn("Closing connections still open after the shutdown timeout", "error", err)
+		if err := httpServer.Close(); err != nil {
+			return err
+		}
+	}
+	if restarting {
+		return errRestart
+	}
+	return nil
+}
+
+// registerTasks registers Mira's own periodic jobs, which Jellyfin apps
+// show as scheduled tasks.
+func registerTasks(registry *tasks.Registry, store *accounts.Store, activityLog *activity.Store, lib *library.Service, channels *iptv.Service,
+	logger *slog.Logger) {
+	registry.Register(tasks.Task{
+		Key:      "SignOutInactiveDevices",
+		Category: tasks.CategoryMaintenance,
+		Text: map[string]tasks.Text{
+			"en":    {Name: "Sign out unused devices", Description: "Signs out the Jellyfin apps left unused for the number of days the settings choose."},
+			"fr":    {Name: "Déconnecter les appareils inutilisés", Description: "Déconnecte les applis Jellyfin restées inutilisées pendant le nombre de jours choisi dans les paramètres."},
+			"de":    {Name: "Ungenutzte Geräte abmelden", Description: "Meldet die Jellyfin-Apps ab, die so viele Tage ungenutzt blieben, wie in den Einstellungen festgelegt."},
+			"es":    {Name: "Cerrar la sesión de los dispositivos sin uso", Description: "Cierra la sesión de las aplicaciones de Jellyfin que no se han usado durante el número de días elegido en los ajustes."},
+			"it":    {Name: "Disconnetti i dispositivi inutilizzati", Description: "Disconnette le applicazioni Jellyfin rimaste inutilizzate per il numero di giorni scelto nelle impostazioni."},
+			"pt-BR": {Name: "Desconectar dispositivos sem uso", Description: "Desconecta os aplicativos Jellyfin que ficaram sem uso pelo número de dias escolhido nas configurações."},
+		},
+		Interval: accounts.DeviceSweepInterval,
+		AtStart:  true,
+		Run:      func(ctx context.Context) error { return store.SweepInactiveDevices(ctx, logger) },
+	})
+	registry.Register(tasks.Task{
+		Key:      "CleanActivityLog",
+		Category: tasks.CategoryMaintenance,
+		Text: map[string]tasks.Text{
+			"en":    {Name: "Clean the activity log", Description: "Deletes the activity log entries older than 30 days."},
+			"fr":    {Name: "Nettoyer le journal d’activité", Description: "Supprime les entrées du journal d’activité de plus de 30 jours."},
+			"de":    {Name: "Aktivitätsprotokoll bereinigen", Description: "Löscht die Einträge des Aktivitätsprotokolls, die älter als 30 Tage sind."},
+			"es":    {Name: "Limpiar el registro de actividad", Description: "Borra las entradas del registro de actividad de más de 30 días."},
+			"it":    {Name: "Pulisci il registro attività", Description: "Elimina le voci del registro attività più vecchie di 30 giorni."},
+			"pt-BR": {Name: "Limpar o registro de atividades", Description: "Exclui as entradas do registro de atividades com mais de 30 dias."},
+		},
+		Interval: activity.SweepInterval,
+		AtStart:  true,
+		Run: func(ctx context.Context) error {
+			deleted, err := activityLog.Sweep(ctx)
+			if deleted > 0 {
+				logger.Info("Deleted old activity log entries", "entries", deleted)
+			}
+			return err
+		},
+	})
+	registry.Register(tasks.Task{
+		Key:      "RefreshLiveTvGuides",
+		Category: tasks.CategoryLiveTV,
+		Text: map[string]tasks.Text{
+			"en":    {Name: "Refresh Live TV guides", Description: "Fetches the IPTV channel lists, then the XMLTV guides of live TV catalogs, not fetched for the hours set under Settings › Live TV; run by hand, fetches every list and guide now."},
+			"fr":    {Name: "Actualiser les guides TV", Description: "Télécharge les listes de chaînes IPTV, puis les guides XMLTV des catalogues de TV en direct, qui ne l’ont pas été depuis le nombre d’heures choisi dans Paramètres › TV en direct\u202f; lancé à la main, télécharge toutes les listes et tous les guides tout de suite."},
+			"de":    {Name: "Live-TV-Programme aktualisieren", Description: "Lädt die IPTV-Kanallisten und dann die XMLTV-Programme der Live-TV-Kataloge herunter, die seit der unter Einstellungen › Live-TV festgelegten Anzahl Stunden nicht geladen wurden; von Hand gestartet, lädt sie sofort alle Listen und Programme herunter."},
+			"es":    {Name: "Actualizar las guías de televisión en vivo", Description: "Descarga las listas de canales IPTV y luego las guías XMLTV de los catálogos de televisión en vivo que no se han descargado en las horas elegidas en Ajustes › Televisión en vivo; iniciada a mano, descarga ahora todas las listas y guías."},
+			"it":    {Name: "Aggiorna le guide della Diretta TV", Description: "Scarica gli elenchi canali IPTV, poi le guide XMLTV dei cataloghi di Diretta TV non scaricate da quante ore scelte in Impostazioni › Diretta TV; avviata a mano, scarica subito tutti gli elenchi e tutte le guide."},
+			"pt-BR": {Name: "Atualizar os guias de TV ao Vivo", Description: "Baixa as listas de canais IPTV e depois os guias XMLTV dos catálogos de TV ao Vivo que não foram baixados nas horas definidas em Configurações › TV ao Vivo; iniciada manualmente, baixa agora todas as listas e guias."},
+		},
+		Interval: library.GuideCheck,
+		AtStart:  true,
+		Run: func(ctx context.Context) error {
+			// The guides are matched with the channels of the lists.
+			if err := channels.RefreshDue(ctx, tasks.ByHand(ctx)); err != nil {
+				return err
+			}
+			return lib.RefreshGuides(ctx, tasks.ByHand(ctx))
+		},
+	})
+	// Home screens then show the libraries' first pages at once, after a
+	// restart too.
+	registry.Register(tasks.Task{
+		Key:      "WarmLibraries",
+		Category: tasks.CategoryLibrary,
+		Text: map[string]tasks.Text{
+			"en":    {Name: "Read the libraries' first pages", Description: "Reads the first page of each library from the addons when it is older than Refresh catalogs after (minutes), so that home screens never wait for them, then downloads their posters and resizes them for the apps' cards, and forgets the catalog pages and descriptions no one read for long."},
+			"fr":    {Name: "Lire la première page des médiathèques", Description: "Relit auprès des addons la première page de chaque médiathèque plus ancienne que Rafraîchir les catalogues après (minutes), pour que les écrans d’accueil ne les attendent jamais, puis télécharge leurs affiches et les redimensionne pour les vignettes des applications, et oublie les pages de catalogue et les descriptions que personne n’a lues depuis longtemps."},
+			"de":    {Name: "Erste Seiten der Bibliotheken lesen", Description: "Liest bei den Add-ons die erste Seite jeder Bibliothek neu, die älter ist als „Kataloge aktualisieren nach (Minuten)“, damit Startbildschirme nie darauf warten, lädt dann ihre Poster herunter und skaliert sie für die Kacheln der Apps, und vergisst die Katalogseiten und Beschreibungen, die lange niemand gelesen hat."},
+			"es":    {Name: "Leer la primera página de las bibliotecas", Description: "Vuelve a pedir a las extensiones la primera página de cada biblioteca más antigua que «Actualizar los catálogos después de (minutos)», para que las pantallas de inicio nunca la esperen, luego descarga sus pósteres y los redimensiona para las tarjetas de las aplicaciones, y olvida las páginas de catálogo y las descripciones que nadie ha leído en mucho tiempo."},
+			"it":    {Name: "Leggi la prima pagina delle librerie", Description: "Rilegge dagli add-on la prima pagina di ogni libreria più vecchia di «Aggiorna i cataloghi dopo (minuti)», così le schermate iniziali non la aspettano mai, poi scarica le loro locandine e le ridimensiona per le schede delle app, e dimentica le pagine di catalogo e le descrizioni che nessuno legge da tempo."},
+			"pt-BR": {Name: "Ler a primeira página das bibliotecas", Description: "Lê de novo nos complementos a primeira página de cada biblioteca mais antiga que “Atualizar catálogos após (minutos)”, para que as telas iniciais nunca esperem por ela, depois baixa os pôsteres delas e os redimensiona para os cartões dos aplicativos, e esquece as páginas de catálogo e as descrições que ninguém lê há muito tempo."},
+		},
+		Interval: library.WarmInterval,
+		AtStart:  true,
+		Run:      lib.Warm,
+	})
+	// Reading every collection asks the addons for many pages: it runs at
+	// the hour an administrator sets, never by default.
+	registry.Register(tasks.Task{
+		Key:      "ReadCollections",
+		Category: tasks.CategoryLibrary,
+		Text: map[string]tasks.Text{
+			"en":    {Name: "Read every collection", Description: "Reads every collection of the server's collection libraries whole, two at a time, then the catalogs of the server's smart lists, so that each opens at once with all its titles: every day at the hour set under Settings › Catalogs, never by default."},
+			"fr":    {Name: "Lire toutes les collections", Description: "Lit en entier toutes les collections des médiathèques de collections du serveur, deux à la fois, puis les catalogues des listes intelligentes du serveur, pour que chacune s’ouvre tout de suite avec tous ses titres\u202f: chaque jour à l’heure choisie dans Paramètres › Catalogues, jamais par défaut."},
+			"de":    {Name: "Alle Sammlungen lesen", Description: "Liest alle Sammlungen der Sammlungsbibliotheken des Servers vollständig, jeweils zwei gleichzeitig, dann die Kataloge der intelligenten Listen des Servers, damit sich jede sofort mit allen Titeln öffnet: jeden Tag zu der unter Einstellungen › Kataloge festgelegten Stunde, standardmäßig nie."},
+			"es":    {Name: "Leer todas las colecciones", Description: "Lee enteras, de dos en dos, todas las colecciones de las bibliotecas de colecciones del servidor y luego los catálogos de las listas inteligentes del servidor, para que cada una se abra al instante con todos sus títulos: cada día a la hora elegida en Ajustes › Catálogos, nunca por defecto."},
+			"it":    {Name: "Leggi tutte le collezioni", Description: "Legge per intero, due alla volta, tutte le collezioni delle librerie di collezioni del server, poi i cataloghi delle liste intelligenti del server, così ognuna si apre subito con tutti i suoi titoli: ogni giorno all’ora scelta in Impostazioni › Cataloghi, mai in modo predefinito."},
+			"pt-BR": {Name: "Ler todas as coleções", Description: "Lê por inteiro, duas de cada vez, todas as coleções das bibliotecas de coleções do servidor e depois os catálogos das listas inteligentes do servidor, para que cada uma abra na hora com todos os seus títulos: todos os dias na hora definida em Configurações › Catálogos, nunca por padrão."},
+		},
+		Daily: func() int { return store.Settings().CollectionReadHour },
+		Run:   lib.ReadCollections,
+	})
+	// Asking for ratings costs requests to addons: this runs only when an
+	// administrator starts it.
+	registry.Register(tasks.Task{
+		Key:      "RefreshRatings",
+		Category: tasks.CategoryLibrary,
+		Text: map[string]tasks.Text{
+			"en":    {Name: "Refresh ratings", Description: "Asks the server's addons again for the ratings and genres of titles last asked long ago, which parental control and blocked genres use."},
+			"fr":    {Name: "Actualiser les classifications", Description: "Redemande aux addons du serveur les classifications et les genres des titres demandés il y a longtemps, qui servent au contrôle parental et aux genres bloqués."},
+			"de":    {Name: "Altersfreigaben aktualisieren", Description: "Fragt die Add-ons des Servers erneut nach den Altersfreigaben und Genres der Titel, die zuletzt vor langer Zeit abgefragt wurden und die Kindersicherung und gesperrte Genres verwenden."},
+			"es":    {Name: "Actualizar las clasificaciones", Description: "Vuelve a pedir a las extensiones del servidor las clasificaciones y los géneros de los títulos pedidos hace tiempo, que usan el control parental y los géneros bloqueados."},
+			"it":    {Name: "Aggiorna le classificazioni", Description: "Richiede agli add-on del server le classificazioni e i generi dei titoli richiesti molto tempo fa, che usano il controllo parentale e i generi bloccati."},
+			"pt-BR": {Name: "Atualizar as classificações", Description: "Pede de novo aos complementos do servidor as classificações etárias e os gêneros dos títulos pedidos há muito tempo, que o controle parental e os gêneros bloqueados usam."},
+		},
+		Run: func(ctx context.Context) error {
+			asked, err := lib.RefreshRatings(ctx)
+			logger.Info("Ratings refreshed", "titles", asked)
+			return err
+		},
+	})
+	registry.Register(forgetVersionListsTask(lib, logger))
+	// An account is refused from its end date on its own: this only writes
+	// the end to the activity log.
+	registry.Register(tasks.Task{
+		Key:      "RecordEndedAccounts",
+		Category: tasks.CategoryMaintenance,
+		Text: map[string]tasks.Text{
+			"en":    {Name: "Record ended accounts", Description: "Writes to the activity log, once each, the accounts whose end, date or exact time, has come."},
+			"fr":    {Name: "Noter les comptes arrivés à leur fin", Description: "Inscrit au journal d’activité, une fois chacun, les comptes dont la fin, date ou heure exacte, est arrivée."},
+			"de":    {Name: "Abgelaufene Konten protokollieren", Description: "Trägt die Konten, deren Ende (Datum oder genaue Uhrzeit) erreicht ist, einmal je Konto ins Aktivitätsprotokoll ein."},
+			"es":    {Name: "Anotar las cuentas finalizadas", Description: "Anota en el registro de actividad, una vez cada una, las cuentas cuyo fin, fecha u hora exacta, ha llegado."},
+			"it":    {Name: "Annota gli account scaduti", Description: "Scrive nel registro attività, una volta ciascuno, gli account la cui fine, data o ora esatta, è arrivata."},
+			"pt-BR": {Name: "Registrar as contas encerradas", Description: "Registra no registro de atividades, uma vez cada, as contas cujo encerramento, data ou hora exata, chegou."},
+		},
+		Interval: accounts.EndCheckInterval,
+		AtStart:  true,
+		Run: func(ctx context.Context) error {
+			ended, err := store.EndedAccounts(ctx)
+			for _, user := range ended {
+				activityLog.AccountEnded(ctx, user)
+			}
+			return err
+		},
+	})
+	// A share link stops at its expiry on its own: this only writes the
+	// expiry to the activity log, and forgets the links ended long ago.
+	registry.Register(tasks.Task{
+		Key:      "RecordExpiredShareLinks",
+		Category: tasks.CategoryMaintenance,
+		Text: map[string]tasks.Text{
+			"en":    {Name: "Record expired share links", Description: "Writes to the activity log, once each, the share links that expired, and deletes those that ended more than 30 days ago."},
+			"fr":    {Name: "Noter les liens de partage expirés", Description: "Inscrit au journal d’activité, une fois chacun, les liens de partage qui ont expiré, et supprime ceux qui ont pris fin il y a plus de 30 jours."},
+			"de":    {Name: "Abgelaufene Freigabelinks protokollieren", Description: "Trägt die abgelaufenen Freigabelinks einmal je Link ins Aktivitätsprotokoll ein und löscht die, die vor mehr als 30 Tagen endeten."},
+			"es":    {Name: "Anotar los enlaces para compartir caducados", Description: "Anota en el registro de actividad, una vez cada uno, los enlaces para compartir que han caducado, y borra los que terminaron hace más de 30 días."},
+			"it":    {Name: "Annota i link di condivisione scaduti", Description: "Scrive nel registro attività, una volta ciascuno, i link di condivisione scaduti ed elimina quelli terminati da più di 30 giorni."},
+			"pt-BR": {Name: "Registrar os links de compartilhamento expirados", Description: "Registra no registro de atividades, uma vez cada, os links de compartilhamento que expiraram, e exclui os que terminaram há mais de 30 dias."},
+		},
+		Interval: accounts.ShareLinkCheckInterval,
+		AtStart:  true,
+		Run: func(ctx context.Context) error {
+			expired, err := store.ExpiredShareLinks(ctx)
+			for _, link := range expired {
+				activityLog.ShareLinkExpiredAt(ctx, link)
+			}
+			return err
+		},
+	})
+}
+
+// registerLocalFoldersTask registers the scans of local folders: each
+// folder at startup, then every LocalScanHours, all of them when run by
+// hand.
+func registerLocalFoldersTask(registry *tasks.Registry, folders *localfiles.Service) {
+	registry.Register(tasks.Task{
+		Key:      "ScanLocalFolders",
+		Category: tasks.CategoryLibrary,
+		Text: map[string]tasks.Text{
+			"en":    {Name: "Scan local folders", Description: "Looks in the local folders for the files added, changed or removed since their last scan, and matches the new ones to titles: each folder at startup, then every number of hours set under Settings › Catalogs; run by hand, scans every folder now."},
+			"fr":    {Name: "Analyser les dossiers locaux", Description: "Cherche dans les dossiers locaux les fichiers ajoutés, modifiés ou supprimés depuis leur dernière analyse, et associe les nouveaux à des titres\u202f: chaque dossier au démarrage, puis toutes les heures choisies dans Paramètres › Catalogues\u202f; lancée à la main, analyse tous les dossiers tout de suite."},
+			"de":    {Name: "Lokale Ordner scannen", Description: "Sucht in den lokalen Ordnern die seit dem letzten Scan hinzugefügten, geänderten oder entfernten Dateien und ordnet die neuen Titeln zu: jeden Ordner beim Start, dann alle unter Einstellungen › Kataloge festgelegten Stunden; von Hand gestartet, scannt sie sofort alle Ordner."},
+			"es":    {Name: "Escanear las carpetas locales", Description: "Busca en las carpetas locales los archivos añadidos, modificados o eliminados desde su último escaneo, y asocia los nuevos a títulos: cada carpeta al iniciarse, luego cada número de horas elegido en Ajustes › Catálogos; iniciada a mano, escanea ahora todas las carpetas."},
+			"it":    {Name: "Scansiona le cartelle locali", Description: "Cerca nelle cartelle locali i file aggiunti, modificati o rimossi dall’ultima scansione e associa i nuovi ai titoli: ogni cartella all’avvio, poi ogni numero di ore scelto in Impostazioni › Cataloghi; avviata a mano, scansiona subito tutte le cartelle."},
+			"pt-BR": {Name: "Rastrear as pastas locais", Description: "Procura nas pastas locais os arquivos adicionados, alterados ou removidos desde o último rastreamento e associa os novos a títulos: cada pasta na inicialização, depois a cada número de horas definido em Configurações › Catálogos; iniciada manualmente, rastreia agora todas as pastas."},
+		},
+		Interval: localfiles.ScanCheck,
+		AtStart:  true,
+		Run:      func(ctx context.Context) error { return folders.ScanDue(ctx, tasks.ByHand(ctx)) },
+	})
+}
+
+// registerCleanupTask registers the hourly cleanup of what removed
+// sources and catalogs left, as a removal does in its transaction: for a
+// user deleted with their own sources, a catalog an addon dropped, or a
+// row deleted in the database. It forgets the home videos of removed
+// folders past their days too, as scans do.
+func registerCleanupTask(registry *tasks.Registry, lib *library.Service, folders *localfiles.Service, logger *slog.Logger) {
+	registry.Register(tasks.Task{
+		Key:      "CleanUpRemovedSources",
+		Category: tasks.CategoryMaintenance,
+		Text: map[string]tasks.Text{
+			"en":    {Name: "Clean up removed sources", Description: "Deletes what sources removed and catalogs their addons dropped left behind: their libraries, collections and channels, their scheduled recordings, and their place in smart lists, hidden libraries and Live TV limits; titles they listed go to the next catalog that lists them."},
+			"fr":    {Name: "Nettoyer les sources supprimées", Description: "Supprime ce que les sources supprimées et les catalogues retirés par leurs addons ont laissé\u202f: leurs médiathèques, collections et chaînes, leurs enregistrements programmés, et leur place dans les listes intelligentes, les médiathèques masquées et les limites de TV en direct\u202f; les titres qu’ils listaient passent au prochain catalogue qui les liste."},
+			"de":    {Name: "Entfernte Quellen aufräumen", Description: "Löscht, was entfernte Quellen und von ihren Add-ons entfernte Kataloge hinterlassen haben: ihre Bibliotheken, Sammlungen und Kanäle, ihre geplanten Aufnahmen und ihren Platz in intelligenten Listen, ausgeblendeten Bibliotheken und Live-TV-Grenzen; die Titel, die sie listeten, gehen an den nächsten Katalog, der sie listet."},
+			"es":    {Name: "Limpiar las fuentes eliminadas", Description: "Borra lo que dejaron las fuentes eliminadas y los catálogos que sus extensiones retiraron: sus bibliotecas, colecciones y canales, sus grabaciones programadas y su lugar en las listas inteligentes, las bibliotecas ocultas y los límites de televisión en vivo; los títulos que listaban pasan al siguiente catálogo que los liste."},
+			"it":    {Name: "Pulisci le fonti rimosse", Description: "Elimina ciò che hanno lasciato le fonti rimosse e i cataloghi tolti dai loro add-on: le loro librerie, collezioni e canali, le loro registrazioni programmate e il loro posto nelle liste intelligenti, nelle librerie nascoste e nei limiti della Diretta TV; i titoli che elencavano passano al prossimo catalogo che li elenca."},
+			"pt-BR": {Name: "Limpar as fontes removidas", Description: "Exclui o que as fontes removidas e os catálogos retirados pelos complementos deixaram: suas bibliotecas, coleções e canais, suas gravações agendadas e seu lugar nas listas inteligentes, nas bibliotecas ocultas e nos limites de TV ao Vivo; os títulos que listavam passam para o próximo catálogo que os liste."},
+		},
+		Interval: library.LeftoversInterval,
+		AtStart:  true,
+		Run: func(ctx context.Context) error {
+			cleaned, err := lib.CleanUpRemoved(ctx)
+			if err != nil {
+				return err
+			}
+			if cleaned.Any() {
+				logger.Info("Cleaned up what removed sources left", "items", cleaned.Items, "released", cleaned.Released, "rows", cleaned.Rows)
+			}
+			forgotten, err := folders.ForgetGoneVideos(ctx)
+			if forgotten > 0 {
+				logger.Info("Forgot the home videos gone long ago", "videos", forgotten)
+			}
+			return err
+		},
+	})
+}
+
+// registerRecordingTasks registers the periodic jobs of Live TV recording,
+// which do nothing while it is off, and the reading of the recordings not
+// read yet for their commercials, which does nothing while that is off:
+// the scheduler itself runs on its own (see recordings.Service.Run).
+func registerRecordingTasks(registry *tasks.Registry, recorder *recordings.Service, breaks *commercials.Service) {
+	registry.Register(tasks.Task{
+		Key:      "DeleteOldRecordings",
+		Category: tasks.CategoryLiveTV,
+		Text: map[string]tasks.Text{
+			"en":    {Name: "Delete old recordings", Description: "Deletes the Live TV recordings older than the number of days the settings keep them."},
+			"fr":    {Name: "Supprimer les anciens enregistrements", Description: "Supprime les enregistrements de TV en direct plus anciens que le nombre de jours choisi dans les paramètres."},
+			"de":    {Name: "Alte Aufnahmen löschen", Description: "Löscht die Live-TV-Aufnahmen, die älter sind als die in den Einstellungen festgelegte Anzahl Tage."},
+			"es":    {Name: "Borrar las grabaciones antiguas", Description: "Borra las grabaciones de televisión en vivo más antiguas que el número de días elegido en los ajustes."},
+			"it":    {Name: "Elimina le vecchie registrazioni", Description: "Elimina le registrazioni della Diretta TV più vecchie del numero di giorni scelto nelle impostazioni."},
+			"pt-BR": {Name: "Excluir gravações antigas", Description: "Exclui as gravações de TV ao Vivo mais antigas que o número de dias definido nas configurações."},
+		},
+		Interval: recordings.SweepInterval,
+		AtStart:  true,
+		Run:      recorder.SweepRecordings,
+	})
+	registry.Register(tasks.Task{
+		Key:      "ScheduleSeriesRecordings",
+		Category: tasks.CategoryLiveTV,
+		Text: map[string]tasks.Text{
+			"en":    {Name: "Schedule series recordings", Description: "Looks in the guide for the new programmes of each series recording and schedules them."},
+			"fr":    {Name: "Programmer les enregistrements de séries", Description: "Cherche dans le guide les nouvelles émissions de chaque série enregistrée et les programme."},
+			"de":    {Name: "Serienaufnahmen planen", Description: "Sucht im Fernsehprogramm die neuen Sendungen jeder Serienaufnahme und plant sie ein."},
+			"es":    {Name: "Programar las grabaciones de series", Description: "Busca en la guía los nuevos programas de cada grabación de serie y los programa."},
+			"it":    {Name: "Pianifica le registrazioni delle serie TV", Description: "Cerca nella guida i nuovi programmi di ogni registrazione di serie TV e li pianifica."},
+			"pt-BR": {Name: "Agendar gravações de séries", Description: "Procura no guia os novos programas de cada gravação de série e os agenda."},
+		},
+		Interval: recordings.SeriesRefreshInterval,
+		AtStart:  true,
+		Run:      recorder.RefreshSeriesTimers,
+	})
+	registry.Register(tasks.Task{
+		Key:      "FindCommercials",
+		Category: tasks.CategoryLiveTV,
+		Text: map[string]tasks.Text{
+			"en":    {Name: "Find commercials in recordings", Description: "Reads the finished recordings not read yet for their commercial breaks, one at a time, while Find commercials in recordings is on under Settings › Recordings. Each recording is otherwise read once it ends."},
+			"fr":    {Name: "Trouver les publicités des enregistrements", Description: "Lit les enregistrements terminés pas encore lus pour trouver leurs coupures publicitaires, un à la fois, quand Trouver les publicités des enregistrements est activé dans Paramètres › Enregistrements. Chaque enregistrement est sinon lu dès qu’il se termine."},
+			"de":    {Name: "Werbung in Aufnahmen erkennen", Description: "Liest die beendeten, noch nicht gelesenen Aufnahmen nacheinander auf Werbeunterbrechungen, solange „Werbung in Aufnahmen erkennen“ unter Einstellungen › Aufnahmen aktiviert ist. Sonst wird jede Aufnahme gelesen, sobald sie endet."},
+			"es":    {Name: "Detectar anuncios en las grabaciones", Description: "Lee, de una en una, las grabaciones terminadas aún no leídas para encontrar sus pausas publicitarias, mientras «Detectar anuncios en las grabaciones» está activado en Ajustes › Grabaciones. Si no, cada grabación se lee en cuanto termina."},
+			"it":    {Name: "Trova la pubblicità nelle registrazioni", Description: "Legge, una alla volta, le registrazioni terminate non ancora lette per trovarne le interruzioni pubblicitarie, finché «Trova la pubblicità nelle registrazioni» è attivo in Impostazioni › Registrazioni. Altrimenti ogni registrazione viene letta appena termina."},
+			"pt-BR": {Name: "Encontrar comerciais nas gravações", Description: "Lê, uma de cada vez, as gravações terminadas ainda não lidas para encontrar seus intervalos comerciais, enquanto “Encontrar comerciais nas gravações” estiver ativado em Configurações › Gravações. Caso contrário, cada gravação é lida assim que termina."},
+		},
+		Interval: commercials.RunInterval,
+		Run:      breaks.Run,
+	})
+}
+
+// registerBackupTask registers the daily database backup: it runs every
+// day while backups are on, and by hand only, failing, while they are off.
+func registerBackupTask(registry *tasks.Registry, backups *backup.Service) {
+	registry.Register(tasks.Task{
+		Key:      "BackUpDatabase",
+		Category: tasks.CategoryMaintenance,
+		Text: map[string]tasks.Text{
+			"en":    {Name: "Back up the database", Description: "Copies the database into the backup folder every day at the hour set under Settings › Backups, while backups are on, sends the copies to the backup destinations, and deletes the oldest copies past the number each place keeps."},
+			"fr":    {Name: "Sauvegarder la base de données", Description: "Copie la base de données dans le dossier des sauvegardes chaque jour à l’heure choisie dans Paramètres › Sauvegardes, quand elles sont activées, envoie les copies aux destinations des sauvegardes, et supprime les plus anciennes copies au-delà du nombre que chaque endroit conserve."},
+			"de":    {Name: "Datenbank sichern", Description: "Kopiert die Datenbank jeden Tag zu der unter Einstellungen › Backups festgelegten Stunde in den Backup-Ordner, solange Backups aktiviert sind, sendet die Kopien an die Backup-Ziele und löscht die ältesten Kopien über die Anzahl hinaus, die jeder Ort behält."},
+			"es":    {Name: "Hacer una copia de seguridad de la base de datos", Description: "Copia la base de datos en la carpeta de las copias de seguridad cada día a la hora elegida en Ajustes › Copias de seguridad, mientras estén activadas, envía las copias a los destinos de las copias de seguridad y borra las copias más antiguas que superen el número que conserva cada lugar."},
+			"it":    {Name: "Esegui il backup del database", Description: "Copia il database nella cartella dei backup ogni giorno all’ora scelta in Impostazioni › Backup, finché i backup sono attivi, invia le copie alle destinazioni dei backup ed elimina le copie più vecchie oltre il numero che ogni posizione conserva."},
+			"pt-BR": {Name: "Fazer backup do banco de dados", Description: "Copia o banco de dados para a pasta de backups todos os dias na hora definida em Configurações › Backups, enquanto os backups estiverem ativados, envia as cópias para os destinos de backup e exclui as cópias mais antigas além do número que cada local mantém."},
+		},
+		Daily: backups.Hour,
+		Run:   backups.Run,
+	})
+}
+
+// registerTasteTask registers the building of the users' taste profiles,
+// every hour and at start.
+func registerTasteTask(registry *tasks.Registry, tastes *taste.Service) {
+	registry.Register(tasks.Task{
+		Key:      "BuildTasteProfiles",
+		Category: tasks.CategoryLibrary,
+		Text: map[string]tasks.Text{
+			"en":    {Name: "Build taste profiles", Description: "Builds each user's taste profile again from the movies and series they finished, watched again, stopped early, liked, disliked, marked as favorites and hid, for Top picks for you and the order of similar titles, suggestions and movie recommendations: every hour."},
+			"fr":    {Name: "Construire les profils de goûts", Description: "Reconstruit le profil de goûts de chaque utilisateur à partir des films et des séries qu’il a terminés, revus, arrêtés tôt, aimés, pas aimés, mis en favoris et masqués, pour Sélection pour vous et l’ordre des titres similaires, des suggestions et des recommandations de films\u202f: toutes les heures."},
+			"de":    {Name: "Geschmacksprofile erstellen", Description: "Erstellt das Geschmacksprofil jedes Benutzers neu aus den Filmen und Serien, die er zu Ende gesehen, erneut gesehen, früh abgebrochen, gemocht, nicht gemocht, zu Favoriten gemacht und ausgeblendet hat, für Top-Tipps für dich und die Reihenfolge ähnlicher Titel, Vorschläge und Filmempfehlungen: jede Stunde."},
+			"es":    {Name: "Crear los perfiles de gustos", Description: "Vuelve a crear el perfil de gustos de cada usuario a partir de las películas y series que terminó, volvió a ver, dejó pronto, le gustaron, no le gustaron, marcó como favoritas y ocultó, para Recomendados para usted y el orden de los títulos similares, las sugerencias y las recomendaciones de películas: cada hora."},
+			"it":    {Name: "Crea i profili dei gusti", Description: "Ricrea il profilo dei gusti di ogni utente dai film e dalle serie che ha finito, rivisto, interrotto presto, apprezzato, non apprezzato, messo tra i preferiti e nascosto, per Scelti per te e l’ordine dei titoli simili, dei suggerimenti e dei film consigliati: ogni ora."},
+			"pt-BR": {Name: "Criar os perfis de gosto", Description: "Cria de novo o perfil de gosto de cada usuário a partir dos filmes e séries que ele terminou, reviu, largou cedo, curtiu, não curtiu, marcou como favoritos e ocultou, para Escolhas para você e a ordem dos títulos semelhantes, das sugestões e das recomendações de filmes: a cada hora."},
+		},
+		Interval: taste.BuildInterval,
+		AtStart:  true,
+		Run:      tastes.BuildAll,
+	})
+}
+
+// registerPlaybackHistoryTask registers the daily cleanup of the playback
+// history: it deletes the playbacks older than the days the settings keep.
+func registerPlaybackHistoryTask(registry *tasks.Registry, history *plays.History, logger *slog.Logger) {
+	registry.Register(tasks.Task{
+		Key:      "CleanPlaybackHistory",
+		Category: tasks.CategoryMaintenance,
+		Text: map[string]tasks.Text{
+			"en":    {Name: "Clean the playback history", Description: "Deletes the playbacks older than the days to keep set under Settings › Playback."},
+			"fr":    {Name: "Nettoyer l’historique de lecture", Description: "Supprime les lectures plus anciennes que le nombre de jours à conserver choisi dans Paramètres › Lecture."},
+			"de":    {Name: "Wiedergabeverlauf bereinigen", Description: "Löscht die Wiedergaben, die älter sind als die unter Einstellungen › Wiedergabe festgelegten Tage."},
+			"es":    {Name: "Limpiar el historial de reproducción", Description: "Borra las reproducciones más antiguas que los días que se conservan, elegidos en Ajustes › Reproducción."},
+			"it":    {Name: "Pulisci la cronologia di riproduzione", Description: "Elimina le riproduzioni più vecchie dei giorni da conservare scelti in Impostazioni › Riproduzione."},
+			"pt-BR": {Name: "Limpar o histórico de reprodução", Description: "Exclui as reproduções mais antigas que os dias a manter definidos em Configurações › Reprodução."},
+		},
+		Interval: plays.SweepInterval,
+		AtStart:  true,
+		Run: func(ctx context.Context) error {
+			deleted, err := history.Sweep(ctx)
+			if deleted > 0 {
+				logger.Info("Deleted old playbacks from the history", "playbacks", deleted)
+			}
+			return err
+		},
+	})
+}
+
+// registerSummaryTasks registers the weekly summary and the month and year
+// in review, by hand only: their schedule is the day and hour of Settings ›
+// Notifications, which the notifications follow themselves (see
+// notifications.Service.CheckSummary).
+func registerSummaryTasks(registry *tasks.Registry, notifier *notifications.Service) {
+	send := func(event string) func(context.Context) error {
+		return func(ctx context.Context) error { return notifier.SendSummary(ctx, event) }
+	}
+	registry.Register(tasks.Task{
+		Key:      "SendWeeklySummary",
+		Category: tasks.CategoryMaintenance,
+		Text: map[string]tasks.Text{
+			"en":    {Name: "Send the weekly summary", Description: "Sends the summary of the last 7 days now to every notification target that chose it. Every week, it is sent on its own at the day and hour set under Settings › Notifications."},
+			"fr":    {Name: "Envoyer le résumé de la semaine", Description: "Envoie tout de suite le résumé des 7 derniers jours à toutes les cibles de notification qui l’ont choisi. Chaque semaine, il est envoyé de lui-même au jour et à l’heure choisis dans Paramètres › Notifications."},
+			"de":    {Name: "Wochenzusammenfassung senden", Description: "Sendet die Zusammenfassung der letzten 7 Tage sofort an jedes Benachrichtigungsziel, das sie gewählt hat. Jede Woche wird sie von selbst an dem Tag und zu der Stunde gesendet, die unter Einstellungen › Benachrichtigungen festgelegt sind."},
+			"es":    {Name: "Enviar el resumen semanal", Description: "Envía ahora el resumen de los últimos 7 días a cada destino de notificaciones que lo eligió. Cada semana se envía solo el día y a la hora elegidos en Ajustes › Notificaciones."},
+			"it":    {Name: "Invia il riepilogo settimanale", Description: "Invia subito il riepilogo degli ultimi 7 giorni a ogni destinazione delle notifiche che l’ha scelto. Ogni settimana viene inviato da solo nel giorno e all’ora scelti in Impostazioni › Notifiche."},
+			"pt-BR": {Name: "Enviar o resumo semanal", Description: "Envia agora o resumo dos últimos 7 dias para cada destino de notificação que o escolheu. Toda semana, ele é enviado sozinho no dia e na hora definidos em Configurações › Notificações."},
+		},
+		Run: send(notifications.WeeklySummary),
+	})
+	registry.Register(tasks.Task{
+		Key:      "SendMonthlySummary",
+		Category: tasks.CategoryMaintenance,
+		Text: map[string]tasks.Text{
+			"en":    {Name: "Send the month in review", Description: "Sends the review of the last month now to every notification target that chose it. Every month, it is sent on its own on the 1st, at the hour of the weekly summary."},
+			"fr":    {Name: "Envoyer le bilan du mois", Description: "Envoie tout de suite le bilan du mois dernier à toutes les cibles de notification qui l’ont choisi. Chaque mois, il est envoyé de lui-même le 1er, à l’heure du résumé de la semaine."},
+			"de":    {Name: "Monatsrückblick senden", Description: "Sendet den Rückblick auf den letzten Monat sofort an jedes Benachrichtigungsziel, das ihn gewählt hat. Jeden Monat wird er von selbst am 1. gesendet, zur Stunde der Wochenzusammenfassung."},
+			"es":    {Name: "Enviar el resumen del mes", Description: "Envía ahora el resumen del último mes a cada destino de notificaciones que lo eligió. Cada mes se envía solo el día 1, a la hora del resumen semanal."},
+			"it":    {Name: "Invia il mese in sintesi", Description: "Invia subito la sintesi dell’ultimo mese a ogni destinazione delle notifiche che l’ha scelta. Ogni mese viene inviata da sola il giorno 1, all’ora del riepilogo settimanale."},
+			"pt-BR": {Name: "Enviar a retrospectiva do mês", Description: "Envia agora a retrospectiva do último mês para cada destino de notificação que a escolheu. Todo mês, ela é enviada sozinha no dia 1º, na hora do resumo semanal."},
+		},
+		Run: send(notifications.MonthlySummary),
+	})
+	registry.Register(tasks.Task{
+		Key:      "SendYearlySummary",
+		Category: tasks.CategoryMaintenance,
+		Text: map[string]tasks.Text{
+			"en":    {Name: "Send the year in review", Description: "Sends the review of the last year now to every notification target that chose it. Every year, it is sent on its own on January 1st, at the hour of the weekly summary."},
+			"fr":    {Name: "Envoyer le bilan de l’année", Description: "Envoie tout de suite le bilan de l’année dernière à toutes les cibles de notification qui l’ont choisi. Chaque année, il est envoyé de lui-même le 1er janvier, à l’heure du résumé de la semaine."},
+			"de":    {Name: "Jahresrückblick senden", Description: "Sendet den Rückblick auf das letzte Jahr sofort an jedes Benachrichtigungsziel, das ihn gewählt hat. Jedes Jahr wird er von selbst am 1. Januar gesendet, zur Stunde der Wochenzusammenfassung."},
+			"es":    {Name: "Enviar el resumen del año", Description: "Envía ahora el resumen del último año a cada destino de notificaciones que lo eligió. Cada año se envía solo el 1 de enero, a la hora del resumen semanal."},
+			"it":    {Name: "Invia l’anno in sintesi", Description: "Invia subito la sintesi dell’ultimo anno a ogni destinazione delle notifiche che l’ha scelta. Ogni anno viene inviata da sola il 1º gennaio, all’ora del riepilogo settimanale."},
+			"pt-BR": {Name: "Enviar a retrospectiva do ano", Description: "Envia agora a retrospectiva do último ano para cada destino de notificação que a escolheu. Todo ano, ela é enviada sozinha em 1º de janeiro, na hora do resumo semanal."},
+		},
+		Run: send(notifications.YearlySummary),
+	})
+}
+
+// forgetVersionListsTask forgets the version lists of every addon, and
+// logs how many it forgot. Every title then asks its addons again: it
+// runs only when an administrator starts it.
+func forgetVersionListsTask(lib *library.Service, logger *slog.Logger) tasks.Task {
+	return tasks.Task{
+		Key:      "ForgetVersionLists",
+		Category: tasks.CategoryLibrary,
+		Text: map[string]tasks.Text{
+			"en":    {Name: "Forget the version lists", Description: "Forgets the versions and subtitles the addons listed for every title, those kept across restarts included, so that each title asks its addons again. Pinned versions and blocked files stay. Afterwards, the first play of each title waits for the addons again, and the addons get more requests for a while."},
+			"fr":    {Name: "Oublier les listes de versions", Description: "Oublie les versions et les sous-titres que les addons ont donnés pour chaque titre, y compris ceux gardés d’un redémarrage à l’autre, pour que chaque titre redemande à ses addons. Les versions épinglées et les fichiers bloqués restent. Ensuite, la première lecture de chaque titre attend de nouveau les addons, et les addons reçoivent plus de demandes pendant un moment."},
+			"de":    {Name: "Versionslisten vergessen", Description: "Vergisst die Versionen und Untertitel, die die Add-ons für jeden Titel gelistet haben, auch die über Neustarts hinweg behaltenen, damit jeder Titel seine Add-ons erneut fragt. Angeheftete Versionen und gesperrte Dateien bleiben. Danach wartet die erste Wiedergabe jedes Titels wieder auf die Add-ons, und die Add-ons erhalten eine Zeit lang mehr Anfragen."},
+			"es":    {Name: "Olvidar las listas de versiones", Description: "Olvida las versiones y los subtítulos que las extensiones indicaron para cada título, incluidos los conservados entre reinicios, para que cada título vuelva a consultar a sus extensiones. Las versiones fijadas y los archivos bloqueados se mantienen. Después, la primera reproducción de cada título vuelve a esperar a las extensiones, y las extensiones reciben más solicitudes durante un tiempo."},
+			"it":    {Name: "Dimentica gli elenchi delle versioni", Description: "Dimentica le versioni e i sottotitoli che gli add-on hanno elencato per ogni titolo, compresi quelli conservati da un riavvio all’altro, così ogni titolo interpella di nuovo i suoi add-on. Le versioni fissate e i file bloccati restano. In seguito, la prima riproduzione di ogni titolo attende di nuovo gli add-on, e gli add-on ricevono più richieste per un po’."},
+			"pt-BR": {Name: "Esquecer as listas de versões", Description: "Esquece as versões e as legendas que os complementos listaram para cada título, inclusive as mantidas entre reinicializações, para que cada título consulte de novo seus complementos. As versões fixadas e os arquivos bloqueados permanecem. Depois, a primeira reprodução de cada título espera de novo pelos complementos, e os complementos recebem mais solicitações por um tempo."},
+		},
+		Run: func(ctx context.Context) error {
+			forgotten, err := lib.ForgetVersionLists(ctx)
+			logger.Info("Version lists forgotten", "lists", forgotten)
+			return err
+		},
+	}
+}
+
+// emptySourceCacheTask empties the cache of files being read, but for the
+// files being read, and logs the bytes it freed: the tasks tell no more
+// of a run than how it ended. It runs every day at the hour settings
+// give, never by default, and whenever an administrator starts it.
+func emptySourceCacheTask(sources *source.Cache, settings func() accounts.Settings, logger *slog.Logger) tasks.Task {
+	return tasks.Task{
+		Key:      "EmptySourceCache",
+		Category: tasks.CategoryMaintenance,
+		Text: map[string]tasks.Text{
+			"en":    {Name: "Empty the cache of files being read", Description: "Removes the parts of files kept in the cache of files being read, but those of the files being read now and those read in the last 30 seconds; the torrents playing keep their pieces. The disk space and the days set under Settings › Playback already bound the cache, so emptying it is rarely needed, and what is played again afterwards is downloaded again. Runs every day at the hour set there, never by default."},
+			"fr":    {Name: "Vider le cache des fichiers lus", Description: "Supprime les parties de fichiers gardées dans le cache des fichiers en cours de lecture, sauf celles des fichiers lus en ce moment et celles lues dans les 30 dernières secondes\u202f; les torrents en cours de lecture gardent leurs morceaux. L’espace disque et les jours choisis dans Paramètres › Lecture bornent déjà le cache\u202f: le vider est rarement utile, et ce qui est relu ensuite est téléchargé à nouveau. S’exécute chaque jour à l’heure choisie là, jamais par défaut."},
+			"de":    {Name: "Cache der gelesenen Dateien leeren", Description: "Entfernt die im Cache der gelesenen Dateien behaltenen Teile, außer denen der gerade gelesenen Dateien und denen, die in den letzten 30 Sekunden gelesen wurden; laufende Torrents behalten ihre Stücke. Speicherplatz und Tage unter Einstellungen › Wiedergabe begrenzen den Cache bereits, daher ist das Leeren selten nötig, und was danach erneut abgespielt wird, wird erneut heruntergeladen. Läuft jeden Tag zu der dort festgelegten Stunde, standardmäßig nie."},
+			"es":    {Name: "Vaciar la caché de archivos en lectura", Description: "Borra las partes de archivos conservadas en la caché de archivos en lectura, salvo las de los archivos que se están leyendo y las leídas en los últimos 30 segundos; los torrents en reproducción conservan sus piezas. El espacio en disco y los días elegidos en Ajustes › Reproducción ya limitan la caché, así que vaciarla rara vez hace falta, y lo que se reproduce de nuevo después se vuelve a descargar. Se ejecuta cada día a la hora elegida allí, nunca por defecto."},
+			"it":    {Name: "Svuota la cache dei file in lettura", Description: "Elimina le parti di file conservate nella cache dei file in lettura, tranne quelle dei file letti in questo momento e quelle lette negli ultimi 30 secondi; i torrent in riproduzione conservano i loro pezzi. Lo spazio su disco e i giorni scelti in Impostazioni › Riproduzione limitano già la cache, quindi svuotarla serve di rado, e ciò che viene riprodotto di nuovo in seguito viene scaricato di nuovo. Viene eseguita ogni giorno all’ora scelta lì, mai in modo predefinito."},
+			"pt-BR": {Name: "Esvaziar o cache de arquivos em leitura", Description: "Exclui as partes de arquivos mantidas no cache de arquivos em leitura, exceto as dos arquivos sendo lidos agora e as lidas nos últimos 30 segundos; os torrents em reprodução mantêm suas partes. O espaço em disco e os dias definidos em Configurações › Reprodução já limitam o cache, então esvaziá-lo raramente é necessário, e o que for reproduzido de novo depois é baixado de novo. É executada todos os dias na hora definida ali, nunca por padrão."},
+		},
+		Daily: func() int { return settings().SourceCacheEmptyHour },
+		Run: func(context.Context) error {
+			logger.Info("The cache of files being read was emptied", "freed_bytes", sources.Empty())
+			return nil
+		},
+	}
+}
+
+// registerWatchlistTasks registers the background work on the watchlists:
+// every hour and at start, the entries of the titles that wait for them,
+// series whose episodes were learnt or aired since; and every hour, the
+// checks for versions of the titles not checked for the hours set under
+// Settings › Catalogs, telling their users of those found available once
+// the notifications read their targets.
+func registerWatchlistTasks(registry *tasks.Registry, store *accounts.Store, lists *watchlist.Store, api *jellyfin.Handler,
+	notifier *notifications.Service, logger *slog.Logger) {
+	registry.Register(tasks.Task{
+		Key:      "ExpandWatchlists",
+		Category: tasks.CategoryLibrary,
+		Text: map[string]tasks.Text{
+			"en":    {Name: "Add the episodes of watchlist series", Description: "Adds to each user's Watchlist playlist the aired episodes of the series their lists brought, once their episodes are known and one has aired, as any playlist takes a series."},
+			"fr":    {Name: "Ajouter les épisodes des séries à regarder", Description: "Ajoute à la liste de lecture «\u202fÀ regarder\u202f» de chaque utilisateur les épisodes diffusés des séries que ses listes ont apportées, dès que leurs épisodes sont connus et que l’un d’eux est diffusé, comme toute liste de lecture prend une série."},
+			"de":    {Name: "Folgen der Serien auf Merklisten hinzufügen", Description: "Fügt der Wiedergabeliste „Merkliste“ jedes Benutzers die ausgestrahlten Folgen der Serien hinzu, die seine Listen gebracht haben, sobald ihre Folgen bekannt sind und eine ausgestrahlt wurde, wie jede Wiedergabeliste eine Serie aufnimmt."},
+			"es":    {Name: "Añadir los episodios de las series para ver", Description: "Añade a la lista de reproducción «Para ver» de cada usuario los episodios emitidos de las series que trajeron sus listas, en cuanto se conocen sus episodios y se ha emitido uno, como cualquier lista de reproducción toma una serie."},
+			"it":    {Name: "Aggiungi gli episodi delle serie da guardare", Description: "Aggiunge alla playlist «Da guardare» di ogni utente gli episodi trasmessi delle serie portate dalle sue liste, appena i loro episodi sono noti e uno è stato trasmesso, come ogni playlist prende una serie."},
+			"pt-BR": {Name: "Adicionar os episódios das séries para assistir", Description: "Adiciona à playlist “Para assistir” de cada usuário os episódios exibidos das séries trazidas por suas listas, assim que seus episódios são conhecidos e um deles foi exibido, como qualquer playlist recebe uma série."},
+		},
+		Interval: time.Hour,
+		AtStart:  true,
+		Run:      lists.ExpandAll,
+	})
+	checker := watchlist.NewChecker(watchlist.CheckerOptions{
+		Store: lists,
+		Users: store.Users,
+		Hours: func() int { return store.Settings().WatchlistCheckHours },
+		Find:  api.FindWatchlistVersions,
+		Tell: func(ctx context.Context, user accounts.User, title accounts.ID) {
+			select {
+			case <-notifier.Loaded():
+				notifier.WatchlistTitleAvailable(ctx, user, title)
+			case <-ctx.Done():
+			}
+		},
+		Logger: logger,
+	})
+	registry.Register(tasks.Task{
+		Key:      "CheckWatchlists",
+		Category: tasks.CategoryLibrary,
+		Text: map[string]tasks.Text{
+			"en":    {Name: "Look for versions of watchlist titles", Description: "Asks the stream addons for versions of the titles of each user's watchlist not started, 20 titles per user at a time, each again after the hours set under Settings › Catalogs, for the Now available and Still waiting home rows, and tells each user once of a title versions were found for."},
+			"fr":    {Name: "Chercher des versions des titres à regarder", Description: "Demande aux addons de flux des versions des titres non commencés de la liste «\u202fÀ regarder\u202f» de chaque utilisateur, 20 titres par utilisateur à la fois, chacun de nouveau après le nombre d’heures choisi dans Paramètres › Catalogues, pour les rangées d’accueil Disponibles et Toujours en attente, et prévient chaque utilisateur une fois d’un titre pour lequel des versions ont été trouvées."},
+			"de":    {Name: "Versionen der Titel auf Merklisten suchen", Description: "Fragt die Stream-Add-ons nach Versionen der nicht begonnenen Titel der Merkliste jedes Benutzers, 20 Titel je Benutzer auf einmal, jeden erneut nach den unter Einstellungen › Kataloge festgelegten Stunden, für die Startseitenzeilen Jetzt verfügbar und Noch ausstehend, und benachrichtigt jeden Benutzer einmal über einen Titel, für den Versionen gefunden wurden."},
+			"es":    {Name: "Buscar versiones de los títulos para ver", Description: "Pide a las extensiones de streams versiones de los títulos no empezados de la lista «Para ver» de cada usuario, 20 títulos por usuario a la vez, cada uno de nuevo tras las horas elegidas en Ajustes › Catálogos, para las filas de inicio Ya disponible y Aún en espera, y avisa a cada usuario una vez de un título para el que se encontraron versiones."},
+			"it":    {Name: "Cerca versioni dei titoli da guardare", Description: "Chiede agli add-on di flussi versioni dei titoli non iniziati della lista «Da guardare» di ogni utente, 20 titoli per utente alla volta, ciascuno di nuovo dopo le ore scelte in Impostazioni › Cataloghi, per le righe iniziali Ora disponibili e Ancora in attesa, e avvisa ogni utente una volta di un titolo per cui sono state trovate versioni."},
+			"pt-BR": {Name: "Procurar versões dos títulos para assistir", Description: "Pede aos complementos de streams versões dos títulos não iniciados da lista “Para assistir” de cada usuário, 20 títulos por usuário de cada vez, cada um de novo após as horas definidas em Configurações › Catálogos, para as linhas iniciais Já disponível e Ainda aguardando, e avisa cada usuário uma vez de um título para o qual foram encontradas versões."},
+		},
+		Interval: watchlist.CheckInterval,
+		Run:      checker.Check,
+	})
+}
+
+// prepareFolders makes the default recordings or backups folder when the
+// settings turn that feature on, and warns about a folder Mira cannot
+// write into: the feature fails until it is fixed under Settings.
+func prepareFolders(settings accounts.Settings, dataDir string, logger *slog.Logger) {
+	for _, f := range []struct{ feature, dir, defaultDir string }{
+		{"recording", settings.RecordingsDir(dataDir), accounts.DefaultRecordingsFolder(dataDir)},
+		{"backups", settings.BackupDir(dataDir), accounts.DefaultBackupFolder(dataDir)},
+	} {
+		if f.dir == "" {
+			continue
+		}
+		if err := config.PrepareFolder(f.dir, f.dir == f.defaultDir); err != nil {
+			logger.Warn("A folder the settings choose cannot be written into", "feature", f.feature, "folder", f.dir, "error", err)
+		}
+	}
+}

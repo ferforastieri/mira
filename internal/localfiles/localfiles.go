@@ -1,0 +1,989 @@
+// Package localfiles serves the files of folders as versions of the titles
+// they are: folders mounted in Mira's container, and network shares
+// Mira reads itself: SMB shares, WebDAV folders, S3 buckets, SFTP
+// folders and rclone remotes. An administrator
+// declares a folder of movies or of shows; it is an addon of its own kind
+// (see addons.KindLocal), as IPTV sources are, which answers as an addon:
+// one catalog, a library apps see, of the titles its files were matched
+// to, and the streams of those titles, its files, which play beside the
+// other addons' streams.
+//
+// Folders are scanned at startup, every Settings.LocalScanHours and when an
+// administrator asks. They are also watched for changes, unless
+// Settings.WatchLocalFolders is off: the folders in the container through
+// the system's notifications, each scanned again a few seconds after its
+// files stop changing, SMB shares through their servers' notifications
+// too, and network shares by listing their folders again every few
+// minutes (see sharewatch.go and sharenotify.go). A scan reads only what changed since
+// the last one, by path, size and modification time; each new file is
+// matched to a title by the identifiers its name gives, else by those its
+// NFO file gives (see readNFO), else by its name and year through the
+// metadata addons' searches, kept only when they find one title. A
+// Blu-ray disc copied as it is, a folder holding BDMV, is the movies of a
+// movies folder its playlists are, and is left out of a shows folder (see
+// collapseDiscs); so is a DVD, a folder holding VIDEO_TS, played from its
+// folder (see collapseDVDs), and a disc image (see collapseImages), on
+// the server's disk or on a share (see sharedisc.go). An
+// administrator links the files left unmatched to an IMDb identifier by
+// hand. The subtitle files beside a video are offered with its stream (see
+// sidecars). A music folder answers as an Eclipse addon instead (see
+// music.go), and a home videos folder lists its videos as titles of their
+// own, which no metadata addon is asked about (see homevideos.go).
+//
+// A share's files are read from the share at each request, with byte
+// ranges; its connections are kept between requests. Those of S3 buckets,
+// SFTP folders and rclone remotes are read through the source cache,
+// straight from the storage (see Source); the others through the
+// loopback, as the files of the folders in the container are.
+package localfiles
+
+import (
+	"context"
+	"errors"
+	"log/slog"
+	"os"
+	"path/filepath"
+	"runtime"
+	"strings"
+	"sync"
+	"sync/atomic"
+	"time"
+	"unicode"
+	"unicode/utf8"
+
+	"github.com/jackc/pgx/v5"
+	"github.com/jackc/pgx/v5/pgxpool"
+
+	"github.com/ferforastieri/mira/internal/accounts"
+	"github.com/ferforastieri/mira/internal/addons"
+	"github.com/ferforastieri/mira/internal/eclipse"
+	"github.com/ferforastieri/mira/internal/library"
+	"github.com/ferforastieri/mira/internal/loudness"
+	"github.com/ferforastieri/mira/internal/media"
+	"github.com/ferforastieri/mira/internal/secrets"
+	"github.com/ferforastieri/mira/internal/stremio"
+	"github.com/ferforastieri/mira/internal/tmdb"
+)
+
+// Kinds of folders: a folder holds movies, shows with their episodes,
+// music, or home videos.
+const (
+	KindMovies     = "movies"
+	KindShows      = "shows"
+	KindMusic      = "music"
+	KindHomeVideos = "homevideos"
+)
+
+// catalogID identifies a folder's one catalog.
+const catalogID = "local"
+
+var (
+	ErrInvalidName = errors.New("folder names are 1 to 64 printable characters")
+	ErrInvalidPath = errors.New("a folder is an absolute path, other than the system's root")
+	ErrInvalidKind = errors.New("a folder holds movies, shows, music or home videos")
+	ErrInvalidIMDb = errors.New("an IMDb identifier is tt followed by digits")
+	// ErrSearchFailed wraps the error of a search of the metadata addons
+	// (see Service.Search).
+	ErrSearchFailed = errors.New("the metadata addons could not be searched")
+)
+
+// Titles finds titles in the server's metadata addons: library.Service.
+type Titles interface {
+	RemoteSearch(ctx context.Context, kind library.Kind, name string, limit int) ([]library.RemoteResult, error)
+	TitleMeta(ctx context.Context, metaType, id string) (stremio.Meta, bool)
+	RemoteSearches(ctx context.Context, kind library.Kind) (bool, error)
+	// EpisodeGroupsOf lists a series' TMDB episode groups, and FileOrder
+	// maps one's episodes to the catalog's (see numbering.go).
+	EpisodeGroupsOf(ctx context.Context, meta stremio.Meta) ([]tmdb.GroupSummary, error)
+	FileOrder(ctx context.Context, meta stremio.Meta, group string) (map[[2]int]library.OrderPlace, error)
+	// ProviderIDs returns the provider identifiers of the movie or series
+	// of kind that meta describes, with what administrators set of them
+	// (see library.Service.ProviderIDs).
+	ProviderIDs(kind library.Kind, meta stremio.Meta) map[string]string
+}
+
+// Service stores the local folders, scans them and answers for them as
+// addons.
+type Service struct {
+	db       *pgxpool.Pool
+	addons   *addons.Store
+	titles   Titles
+	logger   *slog.Logger
+	settings func() accounts.Settings
+	// box seals the shares' passwords.
+	box *secrets.Box
+	now func() time.Time
+	// files is the address the loopback interface serves the folders'
+	// files at, a file's key appended, and inputs the one the versions
+	// that are not one file have, their key appended (see UseFiles);
+	// empty, folders list no stream.
+	files, inputs string
+	// probe tells whether FFmpeg reads an input (see UseProbe), nil until
+	// set.
+	probe func(ctx context.Context, in media.Input) bool
+	// found is told of the videos a scan of a movies or shows folder found
+	// new or changed (see UseScanned), nil until set.
+	found func(videos []stremio.Stream)
+	// retry is told of a folder whose address, credentials or host key
+	// changed (see UseRetry), nil until set.
+	retry func(folder accounts.ID)
+	// unlisted keeps, by series, a hash of the episodes last recorded as
+	// not listed by its description and of those it lists (see
+	// NoteUnlisted), so that describing it again writes nothing unless
+	// they changed; unlistedMu guards it. frames
+	// bounds the episodes' frames made at once, and failedFrames keeps the
+	// files whose frame could not be made, which framesMu guards (see
+	// episodeFrame).
+	unlistedMu   sync.Mutex
+	unlisted     map[string]uint64
+	frames       chan struct{}
+	framesMu     sync.Mutex
+	failedFrames map[accounts.ID]failedFrame
+	// ffprobe and ffmpeg read a music folder's tracks, their tags and
+	// their embedded covers, and a home videos folder's videos, their
+	// dates and frames; toneMapping tells whether ffmpeg brings HDR to SDR
+	// (see UseTools).
+	ffprobe, ffmpeg string
+	toneMapping     bool
+	// workers bounds the units matched at once in a scan.
+	workers int
+	// meter measures the loudness of music folders' tracks without a
+	// gain, nil until UseMeter: none is measured.
+	meter *loudness.Meter
+
+	// ctx ends the scans started in the background, which wg waits for.
+	ctx    context.Context
+	cancel context.CancelFunc
+	wg     sync.WaitGroup
+
+	mu sync.Mutex
+	// running are the scans under way, by folder (see scanning); scanned
+	// the folders scanned since the service started; prints the prints of
+	// the folders the last scan of a share listed, by folder (see
+	// listing), and kept how many scans of a share kept them.
+	running map[accounts.ID]scanning
+	scanned map[accounts.ID]bool
+	prints  map[accounts.ID]map[string]uint64
+	kept    map[accounts.ID]int
+	// layouts are how the titles of discs on shares are laid out, by
+	// version (see openTitle).
+	layouts map[accounts.ID]titleLayout
+	// measuring are the music folders whose tracks are being measured,
+	// which measures waits for (see measureMusic).
+	measuring map[accounts.ID]bool
+	measures  sync.WaitGroup
+
+	// shares are the readers of the folders that are network shares, by
+	// folder, kept between requests.
+	sharesMu sync.Mutex
+	shares   map[accounts.ID]*pooledRemote
+
+	// watch watches the folders for changes, nil until Watch.
+	watch *watcher
+
+	// artwork is the artwork of the folders' titles as Artwork answers
+	// it, read on first use; artworkChanges counts the changes made to
+	// local_artwork and to the folders' options since, which read it
+	// again, and artworkMu orders its reads.
+	artwork        atomic.Pointer[artworkSet]
+	artworkChanges atomic.Uint64
+	artworkMu      sync.Mutex
+
+	// tmdb searches TMDB for a title when every metadata addon's search
+	// failed, nil until set (see tmdbmatch.go).
+	tmdb *tmdb.Client
+}
+
+// scanning is a scan under way: done is closed when it ends, and stop
+// stops it.
+type scanning struct {
+	done chan struct{}
+	stop context.CancelFunc
+}
+
+// matchWorkers bounds the units a scan matches at once, each asking the
+// metadata addons.
+const matchWorkers = 4
+
+// New returns the service. settings gives LocalScanHours, read whenever
+// folders due are looked for, and WatchLocalFolders, read whenever the
+// folders to watch are; box seals the shares' passwords.
+func New(db *pgxpool.Pool, store *addons.Store, titles Titles, logger *slog.Logger, settings func() accounts.Settings,
+	box *secrets.Box) *Service {
+	ctx, cancel := context.WithCancel(context.Background())
+	return &Service{db: db, addons: store, titles: titles, logger: logger, settings: settings, box: box, now: time.Now,
+		ffprobe: "ffprobe", ffmpeg: "ffmpeg", workers: matchWorkers, ctx: ctx, cancel: cancel, running: map[accounts.ID]scanning{},
+		scanned: map[accounts.ID]bool{}, prints: map[accounts.ID]map[string]uint64{}, kept: map[accounts.ID]int{},
+		shares: map[accounts.ID]*pooledRemote{}, measuring: map[accounts.ID]bool{}, unlisted: map[string]uint64{},
+		frames: make(chan struct{}, episodeFrames), failedFrames: map[accounts.ID]failedFrame{}}
+}
+
+// UseFiles sets the address the folders' files are served at, a file's
+// key appended (see playback.Service.LocalFiles), and the one of the
+// versions FFmpeg reads from their input, a DVD's (see Input and
+// playback.Service.LocalInputs); it is called before the service is used.
+func (s *Service) UseFiles(files, inputs string) { s.files, s.inputs = files, inputs }
+
+// UseTools sets the ffprobe and FFmpeg executables music folders' tracks
+// and home videos are read with, ffprobe and ffmpeg from PATH until then;
+// it is called before the service is used.
+func (s *Service) UseTools(ffprobe, ffmpeg string) { s.ffprobe, s.ffmpeg = ffprobe, ffmpeg }
+
+// UseToneMapping tells that FFmpeg has the filters bringing HDR to SDR,
+// which the frames of HDR home videos are made with (see homeFrame); it is
+// called before the service is used.
+func (s *Service) UseToneMapping(on bool) { s.toneMapping = on }
+
+// UseMeter sets the meter the loudness of music folders' tracks without a
+// gain is measured with, as the settings ask (see measureMusic); it is
+// called before the service is used.
+func (s *Service) UseMeter(meter *loudness.Meter) { s.meter = meter }
+
+// UseScanned sets what is told, after each scan of a movies or shows
+// folder, of the videos it found new or changed, as Streams lists them,
+// with their subtitle files: picture subtitles are read into text from
+// them (see playback.Service.QueueScanned). It is called before the
+// service is used.
+func (s *Service) UseScanned(found func(videos []stremio.Stream)) { s.found = found }
+
+// UseRetry sets what is told of a folder whose address, credentials or
+// host key an administrator changed, so that its versions that could not
+// be read before are tried again at once (see playback.Service.Retry). It
+// is called before the service is used.
+func (s *Service) UseRetry(retry func(folder accounts.ID)) { s.retry = retry }
+
+// Watch watches the folders for changes until Close; it is called once,
+// before the service is used.
+func (s *Service) Watch() {
+	s.watch = newWatcher(s.ctx, s.logger, s.watchable, s.watchScan, openNotifyWatcher, s, s.wg.Go)
+	s.wg.Go(s.watch.run)
+}
+
+// watchable lists the folders to watch.
+func (s *Service) watchable(ctx context.Context) ([]watchFolder, error) {
+	settings := s.settings()
+	if !settings.WatchLocalFolders {
+		return nil, nil
+	}
+	installed, err := s.addons.Addons(ctx, addons.Shared())
+	if err != nil {
+		return nil, err
+	}
+	rows, err := s.db.Query(ctx, "SELECT addon_id, poll_minutes FROM local_folders WHERE poll_minutes IS NOT NULL")
+	if err != nil {
+		return nil, err
+	}
+	polls := map[accounts.ID]int{}
+	var id accounts.ID
+	var minutes int
+	if _, err := pgx.ForEachRow(rows, []any{&id, &minutes}, func() error {
+		polls[id] = minutes
+		return nil
+	}); err != nil {
+		return nil, err
+	}
+	return watchable(settings, installed, polls), nil
+}
+
+// watchScan scans a folder that changed, once a scan of it under way
+// ended.
+func (s *Service) watchScan(ctx context.Context, id accounts.ID) {
+	if err := s.Scan(ctx, id); err != nil && ctx.Err() == nil {
+		s.logger.Warn("A local folder could not be scanned", "folder", id, "error", err)
+	}
+}
+
+// shareReader returns the reader of a share's folder, kept between
+// requests, and what the folder holds.
+func (s *Service) shareReader(ctx context.Context, id accounts.ID, address string) (remote, string, error) {
+	var kind, user, sealed string
+	if err := s.db.QueryRow(ctx, "SELECT kind, share_user, share_password FROM local_folders WHERE addon_id = $1", id).Scan(&kind, &user,
+		&sealed); err != nil {
+		return nil, "", err
+	}
+	r, err := s.folderRemote(ctx, id, address, user, sealed)
+	return r, kind, err
+}
+
+// shareSeen returns what the scans of a share's folder saw since the
+// service started (see seenShare).
+func (s *Service) shareSeen(id accounts.ID) seenShare {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return seenShare{prints: s.prints[id], kept: s.kept[id], scanned: s.scanned[id]}
+}
+
+// Close stops the watch and the scans under way, waits for them, and
+// closes the shares' connections.
+func (s *Service) Close() {
+	s.cancel()
+	s.wg.Wait()
+	s.forgetRemotes(func(accounts.ID) bool { return false })
+}
+
+// NewFolder is a folder to add: its name, its path in the container or a
+// share's address, what it holds, KindMovies, KindShows, KindMusic or
+// KindHomeVideos, a share's user and password, whether its titles show
+// the artwork beside their files (see Artwork), and whether its scans read
+// the extras beside them (see extras.go), nil for yes. An S3 bucket also
+// has its endpoint and region, its user and password being its access
+// key and secret key; an SFTP folder a private key, with its passphrase
+// when it has one; an rclone remote the remote's name. PollMinutes is how
+// often such a folder is listed again for changes, 0 only at its scans,
+// nil for its kind's default (see defaultPollMinutes). UsedBy is who uses
+// it (see addons.UsedBy).
+type NewFolder struct {
+	Name        string
+	Path        string
+	Kind        string
+	User        string
+	Password    string
+	UseArtwork  *bool
+	ReadExtras  *bool
+	Endpoint    string
+	Region      string
+	Remote      string
+	PrivateKey  string
+	Passphrase  string
+	PollMinutes *int
+	UsedBy      addons.UsedBy
+}
+
+// Folder describes a local folder: its addon, what it holds, the kind of
+// share it is (ShareSMB, ShareWebDAV, ShareS3, ShareSFTP, ShareRclone,
+// empty for a path in the container) with its user and whether a password
+// is stored, how its last scan went
+// (CheckedAt is the last attempt, ScannedAt the last scan that could read
+// the folder, Error the code of the last failure: "missing",
+// "unreadable", "not_folder", or for a share "unreachable", "refused" or
+// "host_key_changed"),
+// whether a scan is under way, its files, those matched to a title, how,
+// and the others, the links made by hand, and the episodes given by hand
+// to the titles of shows' discs. Unwatched tells why a
+// folder Mira should watch is not: for a local folder on Linux
+// "watch_limit" when the system's limit of watches is reached,
+// "instance_limit" when its limit of watchers or of open files is, on
+// macOS "open_files_limit" when its limit of open files is; for a share
+// "unreachable" when its last listing could not reach it, "refused" when
+// it refused the user or password, "host_key_changed" when an SFTP server
+// offered another host key; "failed" otherwise; empty when it is watched
+// or need not be.
+type Folder struct {
+	Addon       addons.Addon
+	Kind        string
+	Share       string
+	User        string
+	PasswordSet bool
+	CheckedAt   *time.Time
+	ScannedAt   *time.Time
+	Error       string
+	Scanning    bool
+	Files       int
+	Matched     int
+	Unmatched   int
+	MatchedBy   Matches
+	Links       []Link
+	Episodes    []GivenEpisode
+	Unwatched   string
+	// UseArtwork tells whether the titles of a movies or shows folder
+	// show the artwork beside their files (see Artwork).
+	UseArtwork bool
+	// ReadExtras tells whether the scans of a movies or shows folder read
+	// the extras, local trailers and theme media beside its titles, and
+	// Extras counts those its last scan found (see extras.go).
+	ReadExtras bool
+	Extras     int
+	// ShareWatch tells how a share is watched: "notified" when its server
+	// tells of its changes, "polled" when its folders are listed again
+	// every few minutes; empty for a folder in the container, or a share
+	// not watched. Polled tells why a share is: "webdav" for a WebDAV
+	// folder, "s3", "sftp" or "rclone" for those kinds, which are listed
+	// every PollMinutes, "unsupported" when the SMB server does not tell of changes,
+	// "silent" when it did not tell of one a listing found, "failed" while
+	// its watch is set up again; empty while it is set up. A notified
+	// share's Polled is "partial" once its server missed a change in one of
+	// its folders: it is also polled.
+	ShareWatch, Polled string
+	// Albums and Artists count a music folder's albums and their artists;
+	// its Files are its tracks, Matched those with a title and an album.
+	// Gained counts those of its tracks with a gain, from their tags or
+	// measured, and Measured those whose loudness was measured.
+	Albums, Artists, Gained, Measured int
+	// Dated counts a home videos folder's videos by where their dates
+	// come from (see homeDate); its Files are its videos, all matched.
+	Dated Dates
+	// Endpoint and Region are an S3 bucket's, Remote an rclone remote's
+	// name. PrivateKeySet and PassphraseSet tell whether an SFTP folder
+	// has a private key and a passphrase stored, never them; HostKey is
+	// the fingerprint of the host key saved at its first connection, and
+	// OfferedHostKey that of another one its server offered since, which
+	// refuses it until an administrator accepts it. PollMinutes is how
+	// often the folder is listed again for changes, 0 only at its scans,
+	// nil for a folder whose kind has no such setting.
+	Endpoint, Region, Remote     string
+	PrivateKeySet, PassphraseSet bool
+	HostKey, OfferedHostKey      string
+	PollMinutes                  *int
+	// SearchFailed counts the files left unmatched as their titles'
+	// searches failed, SearchAddon and SearchFailure telling the addon
+	// that failed most of them and why (see library.SearchFailure).
+	// SearchRetryAt is when the folder is scanned again to search them
+	// again, after SearchRetries failures in a row (see searchRetry).
+	SearchFailed               int
+	SearchAddon, SearchFailure string
+	SearchRetryAt              *time.Time
+	SearchRetries              int
+	// NoSearch counts the files left unmatched as no addon of the server
+	// describes and searches titles of the folder's kind.
+	NoSearch int
+	// Unlisted counts the episodes its files hold that their series'
+	// metadata addon does not list, as the series were last described:
+	// they are listed all the same, named after their files (see
+	// NoteUnlisted), and Unlisted lists them by show and season.
+	Unlisted int
+	// Absolute counts its files named by an absolute number that are the
+	// catalog's episodes of their places (see absolute.go).
+	Absolute int
+	// Unmapped counts its shows' files their numbering could not place,
+	// each an episode of its own (see numbering.go), which Shows lists.
+	Unmapped int
+}
+
+// Matches counts a folder's matched files by how they were matched: by an
+// identifier in their name, by their NFO file, by a search, by a search
+// that kept a title of the year before or after (Year), named alike once
+// numerals are read (Numerals), or both (YearNumerals), by a link made by
+// hand (see chooseItem), or by TMDB's search when the metadata addons'
+// failed (see tmdbmatch.go).
+type Matches struct {
+	Name, NFO, Search, Year, Numerals, YearNumerals, Link, TMDB int
+}
+
+// Dates counts home videos by where their dates come from: their NFO
+// file, the creation time their container tells, or their file's
+// modification time.
+type Dates struct {
+	NFO, Created, File int
+}
+
+// Link is a unit of a folder linked by hand to an IMDb identifier: a
+// file, or a show's folder.
+type Link struct {
+	Unit string
+	IMDb string
+	// Described tells whether a metadata addon of the server described
+	// the title, as the folder's kind, when the unit's files were last
+	// matched to it (see noteLink).
+	Described bool
+}
+
+// Add adds a folder to the server's addons, its catalog enabled as a
+// library, and scans it in the background. A folder Mira cannot read
+// is added all the same, its failure reported: a share mounted later is
+// read at the next scan.
+func (s *Service) Add(ctx context.Context, folder NewFolder) (addons.Addon, error) {
+	name, err := validName(folder.Name)
+	if err != nil {
+		return addons.Addon{}, err
+	}
+	location, err := validLocation(folder.Path)
+	if err != nil {
+		return addons.Addon{}, err
+	}
+	if !validKind(folder.Kind) {
+		return addons.Addon{}, ErrInvalidKind
+	}
+	share := shareKind(location)
+	useArtwork := folder.UseArtwork == nil || *folder.UseArtwork
+	readExtras := folder.ReadExtras == nil || *folder.ReadExtras
+	user, password := "", ""
+	if share != "" {
+		if user, err = validCredentials(folder.User, folder.Password); err != nil {
+			return addons.Addon{}, err
+		}
+		password = folder.Password
+	}
+	extra, err := validExtra(share, shareExtra{endpoint: folder.Endpoint, region: folder.Region, remote: folder.Remote,
+		privateKey: folder.PrivateKey, passphrase: folder.Passphrase, pollMinutes: folder.PollMinutes})
+	if err != nil {
+		return addons.Addon{}, err
+	}
+	usedBy := addons.UsedBy{Groups: []accounts.ID{}, Users: []accounts.ID{}}
+	addon, err := s.addons.Create(ctx, addons.Shared(), addons.KindLocal, location,
+		func(id accounts.ID) stremio.Manifest { return manifest(id, name, folder.Kind, share) },
+		func(tx pgx.Tx, addon addons.Addon) error {
+			// A share is first read by the scan that starts now.
+			var checked *time.Time
+			failure := ""
+			if share == "" {
+				at := s.now()
+				checked, failure = &at, readable(location)
+			}
+			_, err := tx.Exec(ctx, `INSERT INTO local_folders (addon_id, kind, checked_at, error, share_user, share_password, use_artwork,
+					read_extras, share_endpoint, share_region, share_remote, share_private_key, share_passphrase, poll_minutes)
+				VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14)`, addon.ID, folder.Kind, checked, failure, user,
+				s.box.Seal(password), useArtwork, readExtras, extra.endpoint, extra.region, extra.remote, s.box.Seal(extra.privateKey),
+				s.box.Seal(extra.passphrase), extra.pollMinutes)
+			if err != nil || !folder.UsedBy.Listed {
+				return err
+			}
+			usedBy, err = addons.WriteUsedBy(ctx, tx, addon.ID, folder.UsedBy)
+			return err
+		})
+	if err != nil {
+		return addons.Addon{}, err
+	}
+	addon.UsedBy = usedBy
+	s.StartScan(addon.ID)
+	s.watch.kick()
+	return addon, nil
+}
+
+// Changes are what Update changes of a folder: its name, its path or
+// address, a share's user, its password, removed when empty, whether its
+// titles show the artwork beside their files, whether its scans read the
+// extras beside them, and what it holds.
+//
+// An S3 bucket's endpoint and region, an rclone remote's name, an SFTP
+// folder's private key and passphrase, removed when empty, and how often
+// the folder is listed again for changes change too; AcceptHostKey
+// accepts the host key an SFTP server offered in place of the one saved.
+type Changes struct {
+	Name          *string
+	Path          *string
+	User          *string
+	Password      *string
+	UseArtwork    *bool
+	ReadExtras    *bool
+	Kind          *string
+	Endpoint      *string
+	Region        *string
+	Remote        *string
+	PrivateKey    *string
+	Passphrase    *string
+	PollMinutes   *int
+	AcceptHostKey bool
+}
+
+// Update changes a folder's name, path or address, a share's user or
+// password, whether its titles show the artwork beside their files, which
+// applies at once, whether its scans read the extras beside them, which
+// applies at the next scan, or what it holds. A new path or address forgets the
+// files found in the former one, their links included, and is scanned at
+// once, as a share whose user or password changed is. A path in the
+// container keeps no user nor password. A share moved to another server,
+// port or kind of share, or an S3 bucket to another endpoint, keeps none
+// of its stored password, private key and passphrase but those the changes
+// give again: they go only to the server they were given for.
+//
+// What a folder holds changes as a new path does, its addon and library
+// kept with their identifiers (see addons.Store.Update): the links made by
+// hand and the episodes given to discs go, and what users did with its
+// titles follows its files between movies, shows and home videos (see
+// rememberTitles and follow); to or from music, nothing follows. A scan
+// under way stops first.
+func (s *Service) Update(ctx context.Context, id accounts.ID, changes Changes) (addons.Addon, error) {
+	current, err := s.Folder(ctx, id)
+	if err != nil {
+		return addons.Addon{}, err
+	}
+	name, location, kind := current.Addon.Manifest.Name, current.Addon.ManifestURL, current.Kind
+	if changes.Name != nil {
+		if name, err = validName(*changes.Name); err != nil {
+			return addons.Addon{}, err
+		}
+	}
+	if changes.Path != nil {
+		if location, err = validLocation(*changes.Path); err != nil {
+			return addons.Addon{}, err
+		}
+	}
+	if changes.Kind != nil {
+		if kind = *changes.Kind; !validKind(kind) {
+			return addons.Addon{}, ErrInvalidKind
+		}
+	}
+	share := shareKind(location)
+	user := current.User
+	if changes.User != nil {
+		user = *changes.User
+	}
+	password := ""
+	if changes.Password != nil {
+		password = *changes.Password
+	}
+	if user, err = validCredentials(user, password); err != nil {
+		return addons.Addon{}, err
+	}
+	if share == "" {
+		user, changes.Password = "", new("")
+	}
+	stored, err := s.storedExtra(ctx, s.db, id)
+	if err != nil {
+		return addons.Addon{}, err
+	}
+	extra := stored
+	for _, field := range []struct {
+		from *string
+		to   *string
+	}{{changes.Endpoint, &extra.endpoint}, {changes.Region, &extra.region}, {changes.Remote, &extra.remote},
+		{changes.PrivateKey, &extra.privateKey}, {changes.Passphrase, &extra.passphrase}} {
+		if field.from != nil {
+			*field.to = *field.from
+		}
+	}
+	if secretsServer(location, extra.endpoint) != secretsServer(current.Addon.ManifestURL, stored.endpoint) {
+		// Stored secrets go only to the server they were given for: on
+		// another server, port or kind of share, the folder keeps only
+		// those the changes give again.
+		if changes.Password == nil {
+			changes.Password = new("")
+		}
+		if changes.PrivateKey == nil {
+			extra.privateKey = ""
+		}
+		if changes.Passphrase == nil {
+			extra.passphrase = ""
+		}
+	}
+	if shareKind(current.Addon.ManifestURL) != share {
+		// Another kind of share starts from its own default.
+		extra.pollMinutes = nil
+	}
+	if changes.PollMinutes != nil {
+		extra.pollMinutes = changes.PollMinutes
+	}
+	if extra, err = validExtra(share, extra); err != nil {
+		return addons.Addon{}, err
+	}
+	moved := location != current.Addon.ManifestURL
+	retyped := kind != current.Kind
+	credentials := user != current.User || changes.Password != nil || !extra.same(stored) || changes.AcceptHostKey
+	// A folder on another server forgets the host key of the former.
+	rehosted := serverOf(location) != serverOf(current.Addon.ManifestURL)
+	release := func() {}
+	if moved || retyped {
+		// A scan under way stops: what it found is forgotten.
+		release = s.hold(id)
+	}
+	addon, err := s.addons.Update(ctx, addons.Shared(), id, addons.KindLocal, location, manifest(id, name, kind, share), func(tx pgx.Tx) error {
+		if changes.UseArtwork != nil {
+			if _, err := tx.Exec(ctx, "UPDATE local_folders SET use_artwork = $2 WHERE addon_id = $1", id, *changes.UseArtwork); err != nil {
+				return err
+			}
+		}
+		if changes.ReadExtras != nil {
+			if _, err := tx.Exec(ctx, "UPDATE local_folders SET read_extras = $2 WHERE addon_id = $1", id, *changes.ReadExtras); err != nil {
+				return err
+			}
+		}
+		if credentials {
+			if _, err := tx.Exec(ctx, "UPDATE local_folders SET share_user = $2 WHERE addon_id = $1", id, user); err != nil {
+				return err
+			}
+			if _, err := tx.Exec(ctx, `UPDATE local_folders SET share_endpoint = $2, share_region = $3, share_remote = $4, poll_minutes = $5
+				WHERE addon_id = $1`, id, extra.endpoint, extra.region, extra.remote, extra.pollMinutes); err != nil {
+				return err
+			}
+			if extra.privateKey != stored.privateKey || extra.passphrase != stored.passphrase {
+				if _, err := tx.Exec(ctx, "UPDATE local_folders SET share_private_key = $2, share_passphrase = $3 WHERE addon_id = $1", id,
+					s.box.Seal(extra.privateKey), s.box.Seal(extra.passphrase)); err != nil {
+					return err
+				}
+			}
+			if changes.AcceptHostKey {
+				if _, err := tx.Exec(ctx, `UPDATE local_folders SET share_host_key = share_offered_key, share_offered_key = ''
+					WHERE addon_id = $1 AND share_offered_key <> ''`, id); err != nil {
+					return err
+				}
+			}
+			if changes.Password != nil {
+				if _, err := tx.Exec(ctx, "UPDATE local_folders SET share_password = $2 WHERE addon_id = $1", id, s.box.Seal(*changes.Password)); err != nil {
+					return err
+				}
+			}
+		}
+		if rehosted {
+			if _, err := tx.Exec(ctx, "UPDATE local_folders SET share_host_key = '', share_offered_key = '' WHERE addon_id = $1", id); err != nil {
+				return err
+			}
+		}
+		if !moved && !retyped {
+			return nil
+		}
+		if retyped {
+			if _, err := tx.Exec(ctx, "UPDATE local_folders SET kind = $2 WHERE addon_id = $1", id, kind); err != nil {
+				return err
+			}
+			if err := rememberTitles(ctx, tx, id, current.Kind, kind); err != nil {
+				return err
+			}
+		}
+		if _, err := tx.Exec(ctx, "DELETE FROM local_files WHERE addon_id = $1", id); err != nil {
+			return err
+		}
+		if _, err := tx.Exec(ctx, "DELETE FROM local_links WHERE addon_id = $1", id); err != nil {
+			return err
+		}
+		if _, err := tx.Exec(ctx, "DELETE FROM local_exact_units WHERE addon_id = $1", id); err != nil {
+			return err
+		}
+		if _, err := tx.Exec(ctx, "DELETE FROM local_side_files WHERE addon_id = $1", id); err != nil {
+			return err
+		}
+		for _, table := range []string{"local_tracks", "local_covers", "local_lyrics", "local_playlists", "local_artwork", "local_disc_episodes",
+			"local_extras", "local_relinked_units"} {
+			if _, err := tx.Exec(ctx, "DELETE FROM "+table+" WHERE addon_id = $1", id); err != nil {
+				return err
+			}
+		}
+		var checked *time.Time
+		failure := ""
+		if share == "" {
+			at := s.now()
+			checked, failure = &at, readable(location)
+		}
+		_, err := tx.Exec(ctx, "UPDATE local_folders SET checked_at = $2, scanned_at = NULL, error = $3 WHERE addon_id = $1", id, checked, failure)
+		return err
+	})
+	release()
+	if err != nil {
+		return addons.Addon{}, err
+	}
+	if changes.AcceptHostKey || rehosted {
+		// The reader keeps the host key it was made with.
+		s.forgetRemote(id)
+	}
+	if (moved || credentials) && s.retry != nil {
+		// What failed to be read may have failed for what changed.
+		s.retry(id)
+	}
+	s.artworkChanged()
+	if moved || retyped || share != "" && credentials {
+		// The watch reads again how often a share is listed.
+		s.StartScan(id)
+		s.watch.kick()
+	}
+	return addon, nil
+}
+
+// validKind reports whether a folder may hold kind.
+func validKind(kind string) bool {
+	return kind == KindMovies || kind == KindShows || kind == KindMusic || kind == KindHomeVideos
+}
+
+// Folder describes one of the server's local folders.
+func (s *Service) Folder(ctx context.Context, id accounts.ID) (Folder, error) {
+	addon, err := s.addons.Find(ctx, id)
+	if err != nil {
+		return Folder{}, err
+	}
+	if !addon.Local() {
+		return Folder{}, addons.ErrNotFound
+	}
+	f := Folder{Addon: addon, Share: shareKind(addon.ManifestURL)}
+	var password, hostKey, offeredKey string
+	err = s.db.QueryRow(ctx, `SELECT kind, checked_at, scanned_at, error, share_user, share_password, use_artwork, read_extras,
+			share_endpoint, share_region, share_remote, share_private_key <> '', share_passphrase <> '', share_host_key, share_offered_key,
+			poll_minutes, search_retry_at, search_retries,
+			(SELECT count(*) FROM local_extras WHERE addon_id = $1),
+			(SELECT count(*) FROM local_files WHERE addon_id = $1) + (SELECT count(*) FROM local_tracks WHERE addon_id = $1),
+			(SELECT count(*) FROM local_files WHERE addon_id = $1 AND stremio_id IS NOT NULL) +
+				(SELECT count(*) FROM local_tracks WHERE addon_id = $1 AND reason = ''),
+			(SELECT count(DISTINCT album_id) FROM local_tracks WHERE addon_id = $1 AND reason = ''),
+			(SELECT count(DISTINCT a) FROM local_tracks, unnest(album_artist_ids) a WHERE addon_id = $1 AND reason = ''),
+			(SELECT count(*) FROM local_tracks WHERE addon_id = $1 AND reason = '' AND (track_gain IS NOT NULL OR loudness > $2)),
+			(SELECT count(*) FROM local_tracks WHERE addon_id = $1 AND reason = '' AND loudness IS NOT NULL),
+			`+unlistedCount+`
+		FROM local_folders WHERE addon_id = $1`, id, loudness.Silence).Scan(&f.Kind, &f.CheckedAt, &f.ScannedAt, &f.Error, &f.User, &password,
+		&f.UseArtwork, &f.ReadExtras, &f.Endpoint, &f.Region, &f.Remote, &f.PrivateKeySet, &f.PassphraseSet, &hostKey, &offeredKey,
+		&f.PollMinutes, &f.SearchRetryAt, &f.SearchRetries, &f.Extras, &f.Files, &f.Matched, &f.Albums, &f.Artists, &f.Gained, &f.Measured,
+		&f.Unlisted)
+	f.PasswordSet = password != ""
+	f.HostKey, f.OfferedHostKey = Fingerprint(hostKey), Fingerprint(offeredKey)
+	if errors.Is(err, pgx.ErrNoRows) {
+		return Folder{}, addons.ErrNotFound
+	}
+	if err != nil {
+		return Folder{}, err
+	}
+	f.Unmatched = f.Files - f.Matched
+	rows, err := s.db.Query(ctx, "SELECT matched_by, count(*) FROM local_files WHERE addon_id = $1 AND stremio_id IS NOT NULL GROUP BY matched_by", id)
+	if err != nil {
+		return Folder{}, err
+	}
+	var by string
+	var count int
+	_, err = pgx.ForEachRow(rows, []any{&by, &count}, func() error {
+		switch by {
+		case byName:
+			f.MatchedBy.Name = count
+		case byNFO:
+			f.MatchedBy.NFO = count
+		case bySearch:
+			f.MatchedBy.Search = count
+		case byYear:
+			f.MatchedBy.Year = count
+		case byNumerals:
+			f.MatchedBy.Numerals = count
+		case byYearNumerals:
+			f.MatchedBy.YearNumerals = count
+		case byLink:
+			f.MatchedBy.Link = count
+		case byTMDB:
+			f.MatchedBy.TMDB = count
+		}
+		return nil
+	})
+	if err != nil {
+		return Folder{}, err
+	}
+	if err := s.db.QueryRow(ctx, "SELECT count(*) FROM local_files WHERE addon_id = $1 AND reason = $2", id, reasonNoSearch).Scan(&f.NoSearch); err != nil {
+		return Folder{}, err
+	}
+	if err := s.db.QueryRow(ctx, "SELECT count(*) FROM local_files WHERE addon_id = $1 AND stremio_id IS NOT NULL AND numbering = $2", id,
+		numberingAbsolute).Scan(&f.Absolute); err != nil {
+		return Folder{}, err
+	}
+	if err := s.db.QueryRow(ctx, "SELECT count(*) FROM local_files WHERE addon_id = $1 AND stremio_id IS NOT NULL AND numbering = $2", id,
+		numberingUnmapped).Scan(&f.Unmapped); err != nil {
+		return Folder{}, err
+	}
+	// The addon that failed the most searches tells why.
+	rows, err = s.db.Query(ctx, `SELECT search_addon, search_failure, count(*) FROM local_files
+		WHERE addon_id = $1 AND reason = $2 GROUP BY 1, 2 ORDER BY 3 DESC, 1, 2`, id, reasonSearchFailed)
+	if err != nil {
+		return Folder{}, err
+	}
+	var failedAddon, failure string
+	_, err = pgx.ForEachRow(rows, []any{&failedAddon, &failure, &count}, func() error {
+		if f.SearchFailed == 0 {
+			f.SearchAddon, f.SearchFailure = failedAddon, failure
+		}
+		f.SearchFailed += count
+		return nil
+	})
+	if err != nil {
+		return Folder{}, err
+	}
+	rows, err = s.db.Query(ctx, "SELECT unit, imdb_id, described FROM local_links WHERE addon_id = $1 ORDER BY unit", id)
+	if err != nil {
+		return Folder{}, err
+	}
+	f.Links, err = pgx.CollectRows(rows, func(row pgx.CollectableRow) (Link, error) {
+		var l Link
+		err := row.Scan(&l.Unit, &l.IMDb, &l.Described)
+		return l, err
+	})
+	if err != nil {
+		return Folder{}, err
+	}
+	if f.Kind == KindHomeVideos {
+		if err := s.db.QueryRow(ctx, `SELECT count(*) FILTER (WHERE dated_by = 'nfo'), count(*) FILTER (WHERE dated_by = 'created'),
+			count(*) FILTER (WHERE dated_by = 'file') FROM local_videos WHERE addon_id = $1`, id).Scan(&f.Dated.NFO, &f.Dated.Created,
+			&f.Dated.File); err != nil {
+			return Folder{}, err
+		}
+	}
+	if f.Episodes, err = s.folderEpisodes(ctx, id); err != nil {
+		return Folder{}, err
+	}
+	s.mu.Lock()
+	_, f.Scanning = s.running[id]
+	s.mu.Unlock()
+	f.Unwatched = s.watch.reason(id)
+	f.ShareWatch, f.Polled = s.watch.shareWatch(id)
+	return f, nil
+}
+
+// metaType is the Stremio type of a folder's titles.
+func metaType(kind string) string {
+	switch kind {
+	case KindShows:
+		return "series"
+	case KindHomeVideos:
+		return library.VideoType
+	}
+	return "movie"
+}
+
+// idPrefixes are the identifiers a folder's titles have: IMDb's, or TMDB's
+// for a title the metadata addons gave no IMDb identifier, and its plain
+// videos' (see plainID); a home video's are its own (see videoID).
+var idPrefixes = []string{"tt", "tmdb:", library.PlainIDPrefix}
+
+// manifest describes a folder as an addon: one catalog of its titles,
+// searchable, and the descriptions and streams of their identifiers. A
+// music folder's one catalog is a row of its albums, an Eclipse row, which
+// makes it answer as an Eclipse addon (see addons.Addon.HasMusic and
+// music.go).
+func manifest(id accounts.ID, name, kind, share string) stremio.Manifest {
+	description := "Local folder"
+	switch share {
+	case ShareSMB:
+		description = "SMB share"
+	case ShareWebDAV:
+		description = "WebDAV folder"
+	case ShareS3:
+		description = "S3 bucket"
+	case ShareSFTP:
+		description = "SFTP folder"
+	case ShareRclone:
+		description = "rclone remote"
+	}
+	if kind == KindMusic {
+		return stremio.Manifest{ID: "mira.local." + id.String(), Version: "1", Name: name, Description: description,
+			Types:    []string{eclipse.TypeAlbum, eclipse.TypeArtist, eclipse.TypeTrack},
+			Catalogs: []stremio.Catalog{{Type: eclipse.TypeAlbum, ID: catalogID, Name: name}}}
+	}
+	typ := metaType(kind)
+	types, prefixes := []string{typ}, idPrefixes
+	if kind == KindHomeVideos {
+		prefixes = []string{library.VideoIDPrefix}
+	}
+	return stremio.Manifest{
+		ID: "mira.local." + id.String(), Version: "1", Name: name, Description: description, Types: types,
+		Resources: []stremio.Resource{{Name: "catalog"}, {Name: "meta", Types: types, IDPrefixes: prefixes},
+			{Name: "stream", Types: types, IDPrefixes: prefixes}},
+		Catalogs: []stremio.Catalog{{Type: typ, ID: catalogID, Name: name, Extra: []stremio.Extra{{Name: "search"}, {Name: "skip"}}}},
+	}
+}
+
+func validName(name string) (string, error) {
+	name = strings.TrimSpace(name)
+	if name == "" || utf8.RuneCountInString(name) > 64 {
+		return "", ErrInvalidName
+	}
+	for _, r := range name {
+		if !unicode.IsPrint(r) {
+			return "", ErrInvalidName
+		}
+	}
+	return name, nil
+}
+
+// validPath cleans a folder's path, which must be absolute, other than the
+// system's root, and printable. On Windows, it is a drive's folder, such as
+// D:\Movies, or a share's, \\server\share\Movies; a drive's root, such as
+// E:\ for a disk of movies, is one, but the system's drive, C:\, is not.
+func validPath(path string) (string, error) {
+	path = strings.TrimSpace(path)
+	if !filepath.IsAbs(path) || len(path) > 4096 || strings.ContainsFunc(path, func(r rune) bool { return !unicode.IsPrint(r) }) {
+		return "", ErrInvalidPath
+	}
+	path = filepath.Clean(path)
+	if systemRoot(path) {
+		return "", ErrInvalidPath
+	}
+	return path, nil
+}
+
+// systemRoot reports whether path, clean, is the system's root: / or, on
+// Windows, the root of its drive, %SystemDrive%\.
+func systemRoot(path string) bool {
+	if path == string(filepath.Separator) {
+		return true
+	}
+	drive := os.Getenv("SystemDrive")
+	return runtime.GOOS == "windows" && drive != "" && strings.EqualFold(path, drive+`\`)
+}

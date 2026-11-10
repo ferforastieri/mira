@@ -1,0 +1,323 @@
+import type { Icon } from '@phosphor-icons/react'
+import {
+  createContext,
+  use,
+  useEffect,
+  useId,
+  useRef,
+  useState,
+  type KeyboardEvent,
+  type ReactNode,
+} from 'react'
+import { Link } from 'react-router'
+import { cx, rem } from './cx'
+
+type MenuContextValue = { close: (returnFocus?: boolean) => void }
+
+const MenuContext = createContext<MenuContextValue>({ close: () => {} })
+
+/** The props a Menu gives its trigger button: spread them on a `<button>`. */
+export type MenuTriggerProps = {
+  ref: (element: HTMLButtonElement | null) => void
+  id: string
+  type: 'button'
+  'aria-haspopup': 'menu'
+  'aria-expanded': boolean
+  'aria-controls': string
+  onClick: () => void
+  onKeyDown: (event: KeyboardEvent<HTMLButtonElement>) => void
+}
+
+const itemSelector = '[role^="menuitem"]:not([aria-disabled="true"])'
+
+/**
+ * A menu opened from a button: the account menu, a row's "more actions". The trigger is yours:
+ *
+ *   <Menu label={t.nav.accountMenu} align="end"
+ *     trigger={(props) => <button {...props} className="…"><Avatar name={user.name} /></button>}>
+ *     <MenuItem icon={UserCircleIcon} to="/me/account">{t.nav.myAccount}</MenuItem>
+ *     <MenuSeparator />
+ *     <MenuItem icon={SignOutIcon} onSelect={signOut}>{t.nav.signOut}</MenuItem>
+ *   </Menu>
+ *
+ * Keyboard: Enter, Space or ↓ opens it on the first item; ↑ ↓ Home End move; Escape and Tab close
+ * it, Escape returning to the button. A click outside closes it. It scrolls with its button,
+ * over the page's save bar and beneath the app's top bar.
+ */
+export function Menu({
+  label,
+  trigger,
+  align = 'start',
+  width = 256,
+  children,
+  className,
+}: {
+  /** The accessible name of the menu. */
+  label: string
+  /** Draws the button that opens the menu, from the props to spread on it. */
+  trigger: (props: MenuTriggerProps) => ReactNode
+  /** Which edge of the button the menu lines up with. */
+  align?: 'start' | 'end'
+  /** Width in px. */
+  width?: number
+  /** MenuItem, MenuSeparator, MenuHeader and MenuGroup. */
+  children: ReactNode
+  className?: string
+}) {
+  const id = useId()
+  const [open, setOpen] = useState(false)
+  const button = useRef<HTMLButtonElement | null>(null)
+  const list = useRef<HTMLDivElement>(null)
+  const root = useRef<HTMLDivElement>(null)
+
+  function items(): HTMLElement[] {
+    return Array.from(list.current?.querySelectorAll<HTMLElement>(itemSelector) ?? [])
+  }
+
+  function focusItem(which: 'first' | 'last') {
+    requestAnimationFrame(() => {
+      const all = items()
+      all[which === 'first' ? 0 : all.length - 1]?.focus()
+    })
+  }
+
+  function close(returnFocus = true) {
+    setOpen(false)
+    if (returnFocus) button.current?.focus()
+  }
+
+  // A press outside the menu closes it, without stealing the focus from where it lands.
+  useEffect(() => {
+    if (!open) return
+    function onPointerDown(event: PointerEvent) {
+      if (!root.current?.contains(event.target as Node)) setOpen(false)
+    }
+    document.addEventListener('pointerdown', onPointerDown)
+    return () => document.removeEventListener('pointerdown', onPointerDown)
+  }, [open])
+
+  function onListKeyDown(event: KeyboardEvent<HTMLDivElement>) {
+    const all = items()
+    const index = all.indexOf(document.activeElement as HTMLElement)
+    let next = -1
+    if (event.key === 'ArrowDown') next = (index + 1) % all.length
+    else if (event.key === 'ArrowUp') next = (index - 1 + all.length) % all.length
+    else if (event.key === 'Home') next = 0
+    else if (event.key === 'End') next = all.length - 1
+    else if (event.key === 'Escape') {
+      event.preventDefault()
+      event.stopPropagation()
+      close()
+      return
+    } else if (event.key === 'Tab') {
+      setOpen(false)
+      return
+    }
+    if (next >= 0) {
+      event.preventDefault()
+      all[next]?.focus()
+    }
+  }
+
+  return (
+    <MenuContext value={{ close }}>
+      <div ref={root} className={cx('relative', className)}>
+        {trigger({
+          ref: (element) => {
+            button.current = element
+          },
+          id: `${id}-button`,
+          type: 'button',
+          'aria-haspopup': 'menu',
+          'aria-expanded': open,
+          'aria-controls': `${id}-menu`,
+          onClick: () => {
+            setOpen(!open)
+            if (!open) focusItem('first')
+          },
+          onKeyDown: (event) => {
+            if (event.key === 'ArrowDown' || event.key === 'ArrowUp') {
+              event.preventDefault()
+              setOpen(true)
+              focusItem(event.key === 'ArrowDown' ? 'first' : 'last')
+            }
+          },
+        })}
+        <div
+          ref={list}
+          id={`${id}-menu`}
+          role="menu"
+          aria-label={label}
+          hidden={!open}
+          onKeyDown={onListKeyDown}
+          style={{ width: rem(width) }}
+          className={cx(
+            // Above the SaveBar (z-20), under the TopBar (z-30).
+            'absolute top-[calc(100%+0.375rem)] z-25 max-w-[calc(100vw-1.5rem)] rounded-panel p-1.5 raised animate-pop',
+            align === 'end' ? 'right-0' : 'left-0',
+          )}
+        >
+          {children}
+        </div>
+      </div>
+    </MenuContext>
+  )
+}
+
+// A row of the raised panel, 38 px (32 in Compact); the arrows light it like any other control.
+const itemClass =
+  'flex min-h-9.5 w-full cursor-pointer items-center gap-2.5 rounded-choice px-3 text-left text-control leading-snug outline-none transition-[background-color,color] duration-300 ease-nuit hover:bg-s2 focus-visible:lit focus-visible:outline-none aria-disabled:cursor-not-allowed aria-disabled:opacity-45 max-sm:min-h-11'
+
+/**
+ * One entry of a Menu: a link with `to` (or `href` for outside the app), or an action with
+ * `onSelect`. The menu closes once it is chosen.
+ */
+export function MenuItem({
+  icon: Glyph,
+  to,
+  href,
+  external = false,
+  onSelect,
+  danger = false,
+  disabled = false,
+  end,
+  children,
+}: {
+  icon?: Icon
+  /** A page of the app. */
+  to?: string
+  /** An address outside the app. */
+  href?: string
+  /** Opens `href` in a new tab. */
+  external?: boolean
+  onSelect?: () => void
+  /** Red, for removing. */
+  danger?: boolean
+  disabled?: boolean
+  /** A quiet value at the right end of the row, such as the current language. */
+  end?: ReactNode
+  children: ReactNode
+}) {
+  const { close } = use(MenuContext)
+  const content = (
+    <>
+      {Glyph && (
+        <Glyph
+          size="1.125rem"
+          aria-hidden="true"
+          className={cx('shrink-0', danger ? 'text-danger' : 'text-ink-2')}
+        />
+      )}
+      <span className="min-w-0 flex-1 truncate">{children}</span>
+      {end !== undefined && <span className="shrink-0 text-small text-ink-3">{end}</span>}
+    </>
+  )
+  const className = cx(itemClass, danger ? 'text-danger' : 'text-ink')
+  if (to !== undefined) {
+    return (
+      <Link
+        to={to}
+        role="menuitem"
+        tabIndex={-1}
+        className={className}
+        onClick={() => close(false)}
+      >
+        {content}
+      </Link>
+    )
+  }
+  if (href !== undefined) {
+    return (
+      <a
+        href={href}
+        role="menuitem"
+        tabIndex={-1}
+        className={className}
+        target={external ? '_blank' : undefined}
+        rel={external ? 'noopener' : undefined}
+        onClick={() => close(false)}
+      >
+        {content}
+      </a>
+    )
+  }
+  return (
+    <button
+      type="button"
+      role="menuitem"
+      tabIndex={-1}
+      aria-disabled={disabled || undefined}
+      className={className}
+      onClick={() => {
+        if (disabled) return
+        close()
+        onSelect?.()
+      }}
+    >
+      {content}
+    </button>
+  )
+}
+
+/**
+ * Exclusive choices inside a Menu (the language): the label and the chosen option's title on one
+ * line, then the options side by side across the menu's width, as a segmented control. Each option
+ * is a `menuitemradio` reached with the arrows like the other items.
+ */
+export function MenuChoice<T extends string>({
+  label,
+  options,
+  value,
+  onChange,
+}: {
+  /** Shown above the options, and the group's accessible name. */
+  label: string
+  options: readonly { value: T; label: string; lang?: string; title?: string }[]
+  value: T
+  onChange: (value: T) => void
+}) {
+  const id = useId()
+  const chosen = options.find((option) => option.value === value)
+  return (
+    <div role="group" aria-labelledby={id} className="flex flex-col gap-1.5 px-3 pt-1.5 pb-2">
+      <span className="flex items-baseline justify-between gap-3">
+        <span id={id} className="text-control text-ink">
+          {label}
+        </span>
+        {chosen?.title && (
+          <span lang={chosen.lang} className="truncate text-small text-ink-3" aria-hidden="true">
+            {chosen.title}
+          </span>
+        )}
+      </span>
+      <span className="flex gap-1">
+        {options.map((option) => (
+          <button
+            key={option.value}
+            type="button"
+            role="menuitemradio"
+            tabIndex={-1}
+            lang={option.lang}
+            title={option.title}
+            aria-label={option.title}
+            aria-checked={option.value === value}
+            onClick={() => onChange(option.value)}
+            className="h-8.5 min-w-0 flex-1 cursor-pointer rounded-[0.5625rem] bg-s1 px-1 text-small font-semibold text-ink-2 transition-[background-color,color] duration-300 ease-nuit hover:bg-s2 hover:text-ink focus-visible:lit focus-visible:outline-none aria-checked:bg-s4 aria-checked:text-ink max-sm:h-11"
+          >
+            {option.label}
+          </button>
+        ))}
+      </span>
+    </div>
+  )
+}
+
+/** A soft line between groups of a Menu. */
+export function MenuSeparator() {
+  return <hr role="separator" className="mx-3 my-1.5 h-px border-0 bg-line-2" />
+}
+
+/** The top of a Menu: who is signed in. Not focusable. */
+export function MenuHeader({ children }: { children: ReactNode }) {
+  return <div className="flex items-center gap-2.5 px-3 pt-2 pb-2.5 text-group">{children}</div>
+}

@@ -1,0 +1,29 @@
+package config
+
+import (
+	"testing"
+)
+
+// MIRA_RECORDINGS_DIR and MIRA_BACKUP_DIR give their folder, cleaned,
+// to the settings; the folder is not looked at on disk, and a path that is
+// not absolute is left out with a warning.
+func TestRecordingsAndBackupFoldersAreCopied(t *testing.T) {
+	t.Parallel()
+	for variable, folder := range map[string]func(Config) string{
+		"MIRA_RECORDINGS_DIR": func(cfg Config) string { return cfg.Environment.RecordingsFolder },
+		"MIRA_BACKUP_DIR":     func(cfg Config) string { return cfg.Environment.BackupFolder },
+	} {
+		t.Run(variable, func(t *testing.T) {
+			t.Parallel()
+			if cfg, err := Load(with(nil)); err != nil || folder(cfg) != "" {
+				t.Fatalf("without a folder: %q %v", folder(cfg), err)
+			}
+			if cfg, err := Load(with(map[string]string{variable: " " + systemPath("/missing/folder/") + " "})); err != nil || folder(cfg) != systemPath("/missing/folder") || len(cfg.Warnings) != 0 {
+				t.Errorf("with a folder: %q %v %v", folder(cfg), err, cfg.Warnings)
+			}
+			if cfg, err := Load(with(map[string]string{variable: "relative"})); err != nil || folder(cfg) != "" || len(cfg.Warnings) != 1 {
+				t.Errorf("relative: %q %v %v", folder(cfg), err, cfg.Warnings)
+			}
+		})
+	}
+}

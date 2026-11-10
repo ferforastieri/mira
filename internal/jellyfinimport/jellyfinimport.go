@@ -1,0 +1,760 @@
+// Package jellyfinimport moves users and what they watched from a Jellyfin
+// server, a server that speaks Jellyfin's API, an Emby server or a Plex
+// Media Server, to Mira. An administrator connects to the server with its
+// address and a key, or a user's name and password, and lists its users,
+// then chooses the Mira account each one's watch data goes to, creating
+// those that do not exist yet. The import then reads, user by user, the
+// movies and episodes played with their dates and play counts, the resume
+// points, and the favorite movies, series and episodes, and adds them to the
+// accounts; and, as asked (see Extras), the ratings, the collections and the
+// playlists. A user may also import their own watch data into their own
+// account, signing in to a Jellyfin or Emby server as themselves (see
+// Service.ImportOwn).
+//
+// Titles are found by their IMDb, TMDB or TVDB identifiers, episodes by
+// their series' and their numbers, as the watch histories of tracking
+// services are (see trackers), and merge the same way: Mira's data is
+// only added to, never taken back, and a newer resume point of Mira's
+// stays. Running an import again adds nothing twice. The server is only
+// read, but for the sessions signing in opens and the import ends.
+//
+// The server numbers episodes as its own metadata and episode order do,
+// which may differ from the addon's. Each episode is placed among those
+// the addon lists by its own TMDB or TVDB identifier, else by the day it
+// aired and its name, against the episodes the server holds of its
+// series, read once per series; one placed on none is kept not found,
+// for a link by hand (see library.SourceEpisodes).
+//
+// The titles not found are kept in each user's list of the server's kind,
+// jellyfin, emby or plex, with what the import would have brought of them,
+// and a title linked there by hand is found as its link names it, now and
+// at every later import (see package importlinks).
+//
+// An API key of the server's dashboard reads every user's watch data. A
+// user's own key or access token, or a user signed in, reads that user's
+// only: Jellyfin refuses it the others', and some servers that speak
+// Jellyfin's API answer it with its owner's data whatever user is asked,
+// which would land in the wrong accounts. Another user's watch data is
+// then read signed in as them, with their password, as Jellyfin's apps
+// sign in: every such server lets its apps do so. Emby does not tell whose
+// a user's key is: only its API keys and users signed in are taken.
+//
+// Plex is read with its owner's token, which reads the owner's watch data
+// from the library sections, and every other account's played history,
+// but not their resume points, ratings or playlists. Plex has no favorites.
+//
+// One import runs at a time, in the background. It and the last one's
+// result are kept in memory: an import cut by a restart is lost and is
+// started again.
+package jellyfinimport
+
+import (
+	"context"
+	"errors"
+	"log/slog"
+	"net/http"
+	"slices"
+	"sync"
+	"time"
+
+	"github.com/ferforastieri/mira/internal/accounts"
+	"github.com/ferforastieri/mira/internal/collections"
+	"github.com/ferforastieri/mira/internal/importlinks"
+	"github.com/ferforastieri/mira/internal/library"
+	"github.com/ferforastieri/mira/internal/playlists"
+	"github.com/ferforastieri/mira/internal/userdata"
+	"github.com/ferforastieri/mira/internal/watchlist"
+)
+
+// The ways asking for an import fails before it starts.
+var (
+	// ErrRunning reports an import asked while one runs.
+	ErrRunning = errors.New("an import is running")
+	// ErrNotKeyOwner reports watch data asked, with a user's key, of
+	// another user than the key's owner, without signing in as them (see
+	// Server.KeyOwner).
+	ErrNotKeyOwner = errors.New("a user's key reads only that user's watch data")
+	// ErrNotSignedIn reports a user's own import asked of a Plex server
+	// without signing in to Plex (see Service.ImportOwnPlex), or of a
+	// Jellyfin or Emby server without a name to sign in with: it reads only
+	// the user who signs in.
+	ErrNotSignedIn = errors.New("a user's own import signs in to the server")
+)
+
+// Kind is the kind of server an import reads.
+type Kind string
+
+const (
+	// Jellyfin is a Jellyfin server, or a server that speaks its API.
+	Jellyfin Kind = "jellyfin"
+	// Emby is an Emby server, which takes its own token header, and serves
+	// its API under /emby.
+	Emby Kind = "emby"
+	// Plex is a Plex Media Server, read with its owner's token, or with a
+	// user's own token for it, got by signing in to Plex.
+	Plex Kind = "plex"
+)
+
+// Connection is a server an import reads, and what it connects with.
+// PlexOwner has an administrator's import of a Plex server read the
+// other accounts with the tokens Plex gives the server's owner, whom the
+// administrator starting it signed in to Plex as (see PlexSignIn).
+// Extras are what an import brings besides watch data; Users ignores
+// them.
+type Connection struct {
+	Kind    Kind
+	Address string
+	Credentials
+	PlexOwner bool
+	Extras    Extras
+}
+
+// Extras are what an import brings besides the titles played, the resume
+// points and the favorites, which it always brings.
+//
+// Ratings are each user's ratings, from 0 to 10, as they are: a rating
+// Mira has stays. A title Emby gives a thumb up without a rating
+// becomes a favorite, as Letterboxd's liked movies can.
+//
+// Collections are the server's collections, Jellyfin's and Emby's BoxSets
+// and the collections of Plex's library sections, which become Mira
+// collections, which every user sees, holding the titles matched; one
+// that has none is not created. An administrator's import brings them; a
+// user's own import, only for a user who may manage collections.
+//
+// Playlists are each user's video playlists, which become playlists of
+// theirs, with the entries matched, in order. Plex gives them only for the
+// accounts read with their own token, the owner's included.
+//
+// Watchlist is a user's own Plex import's, the titles of their Plex
+// Watchlist.
+type Extras struct {
+	Ratings, Collections, Playlists, Watchlist bool
+}
+
+// Titles finds the items of titles named by other services' identifiers,
+// placing the episodes a server holds among the addon's (see
+// library.Service.ResolveFromSource).
+type Titles interface {
+	ResolveFromSource(ctx context.Context, refs []library.TitleRef) ([][]library.TitleTarget, []bool, error)
+}
+
+// Options are the dependencies of the service.
+type Options struct {
+	// Settings give the thresholds resume points are kept and titles
+	// played at.
+	Settings func() accounts.Settings
+	Titles   Titles
+	UserData *userdata.Store
+	// Links keeps the titles the imports did not find, and applies the
+	// links users made of them (see package importlinks); nil keeps none.
+	Links *importlinks.Store
+	// Version is Mira's, which the server is told.
+	Version string
+	Logger  *slog.Logger
+	// Watchlist keeps the titles of the Plex Watchlist a user's own Plex
+	// import brings; nil brings none.
+	Watchlist *watchlist.Store
+	// Collections and Playlists keep the collections and playlists imports
+	// bring; nil brings none.
+	Collections *collections.Store
+	Playlists   *playlists.Store
+	// PlexClient is the client identifier Mira names itself by to
+	// plex.tv and to Plex Media Servers (see database.PlexClient); empty,
+	// one for as long as Mira runs.
+	PlexClient string
+	// PlexTV replaces the addresses of Plex's online services, for tests:
+	// its empty fields are Plex's own.
+	PlexTV PlexTV
+}
+
+// timing is how the service paces its requests. Tests shorten it.
+type timing struct {
+	// gap is the least time between two requests: the server is the
+	// administrator's own, and keeps serving its users meanwhile.
+	gap time.Duration
+	// request bounds each request; a page of a large library takes the
+	// server a while.
+	request time.Duration
+	// retryFirst is the first wait after a failed request of an import,
+	// doubling for each of retries more tries; maxWait bounds how long a
+	// server asking to wait is waited for.
+	retryFirst, maxWait time.Duration
+	retries             int
+	// pageSize is how many items a request reads.
+	pageSize int
+}
+
+var defaultTiming = timing{
+	gap:        100 * time.Millisecond,
+	request:    time.Minute,
+	retryFirst: 5 * time.Second,
+	maxWait:    time.Minute,
+	retries:    3,
+	pageSize:   200,
+}
+
+// Service lists the users of Jellyfin, Emby and Plex servers and imports
+// their watch data, one import at a time.
+type Service struct {
+	settings  func() accounts.Settings
+	titles    Titles
+	userData  *userdata.Store
+	watchlist *watchlist.Store
+	// links keeps the titles not found and gives the links made of them;
+	// nil keeps none and applies none.
+	links *importlinks.Store
+	// collections and playlists keep the lists imports bring.
+	collections *collections.Store
+	playlists   *playlists.Store
+	version     string
+	logger      *slog.Logger
+	client      *http.Client
+	timing      timing
+	now         func() time.Time
+	// device names Mira to plex.tv and to Plex Media Servers, which
+	// list the devices reading them; plexTV are Plex's online services.
+	device string
+	plexTV PlexTV
+	ctx    context.Context
+	cancel context.CancelFunc
+	wg     sync.WaitGroup
+
+	mu sync.Mutex
+	// busy is set from the moment an import is asked until it ends.
+	busy bool
+	// current is the import running, else the last one; stop ends the
+	// one running. own are the last imports users made of their own watch
+	// data, by the user.
+	current *Status
+	own     map[accounts.ID]*Status
+	stop    context.CancelFunc
+	// plexSignIns are the users' sign-ins to Plex held while they choose
+	// what to import (see plextv.go); plexServer is the machine identifier
+	// of the Plex server administrators last imported from.
+	plexSignIns map[accounts.ID]*plexSignIn
+	plexServer  string
+}
+
+// New returns a service importing with options.
+func New(options Options) *Service {
+	ctx, cancel := context.WithCancel(context.Background())
+	device := options.PlexClient
+	if device == "" {
+		device = newID()
+	}
+	return &Service{
+		settings:    options.Settings,
+		titles:      options.Titles,
+		userData:    options.UserData,
+		watchlist:   options.Watchlist,
+		links:       options.Links,
+		collections: options.Collections,
+		playlists:   options.Playlists,
+		version:     options.Version,
+		logger:      options.Logger,
+		client:      &http.Client{},
+		timing:      defaultTiming,
+		now:         time.Now,
+		device:      device,
+		plexTV:      options.PlexTV.or(plexTVServices),
+		ctx:         ctx,
+		cancel:      cancel,
+		own:         map[accounts.ID]*Status{},
+		plexSignIns: map[accounts.ID]*plexSignIn{},
+	}
+}
+
+// Close stops the import running and waits for it to end, and signs out
+// of Plex the sign-ins still held.
+func (s *Service) Close() {
+	s.cancel()
+	s.mu.Lock()
+	held := s.plexSignIns
+	s.plexSignIns = map[accounts.ID]*plexSignIn{}
+	s.mu.Unlock()
+	for _, held := range held {
+		s.endPlexSignIn(held)
+	}
+	s.wg.Wait()
+}
+
+// The states of an import.
+const (
+	StateRunning = "running"
+	StateDone    = "done"
+	// StateStopped is an import an administrator stopped, StateFailed one
+	// the server stopped answering, or refused the key of, midway.
+	StateStopped = "stopped"
+	StateFailed  = "failed"
+)
+
+// The states of a user's import. A user still waiting once the import
+// ended was not reached.
+const (
+	UserWaiting = "waiting"
+	UserReading = "reading"
+	UserSaving  = "saving"
+	UserDone    = "done"
+	UserFailed  = "failed"
+)
+
+// The problems that end an import: ProblemUnreachable, ProblemKeyRefused
+// and ProblemNotJellyfin come from the server, ProblemInternal from
+// Mira's database. ProblemForbidden, a user whose data the server does
+// not let the key read, fails that user only: the import goes on.
+const (
+	ProblemUnreachable = "jellyfin_unreachable"
+	ProblemKeyRefused  = "jellyfin_key_refused"
+	ProblemNotJellyfin = "not_jellyfin"
+	ProblemInternal    = "internal"
+	ProblemForbidden   = "jellyfin_user_forbidden"
+)
+
+// The reasons a title is not matched: it has no identifier at all, as a
+// home video, or an episode not numbered, or no Mira title has its
+// identifiers, or a Plex history names it while no library section lists
+// it any longer, or Plex numbers the episode in another order than
+// TheTVDB's usual one, which its numbers cannot be trusted in, or the
+// episode's series is found but none of its episodes is surely the one
+// the server numbers so (see library.SourceEpisodes).
+const (
+	ReasonNoIdentifier      = "no_identifier"
+	ReasonNotFound          = "not_found"
+	ReasonNotInLibrary      = "not_in_library"
+	ReasonOtherEpisodeOrder = "other_episode_order"
+	ReasonEpisodeNotPlaced  = "episode_not_placed"
+)
+
+// The reasons the import of a user that ended without a problem added
+// nothing (see UserStatus.NothingAdded): everything it read was already in
+// Mira; or it read nothing: the Jellyfin or Emby server lists nothing
+// played, in progress or favorite for the user, the Plex server has no
+// library section of movies or shows, the Plex owner, or the account a
+// user signed in to Plex with, has nothing played, in progress or rated
+// there, or Plex's history lists no play of the account on that server.
+const (
+	NothingUpToDate      = "up_to_date"
+	NothingPlayed        = "nothing_played"
+	NothingNoSections    = "no_sections"
+	NothingPlexOwner     = "plex_owner_nothing_watched"
+	NothingPlexOwn       = "plex_nothing_watched"
+	NothingPlexNoHistory = "plex_no_history"
+)
+
+// Status is how an import goes, or went.
+type Status struct {
+	ID         string
+	Kind       Kind
+	ServerName string
+	Address    string
+	State      string
+	// Problem is what ended an import that failed.
+	Problem   string
+	StartedAt time.Time
+	EndedAt   *time.Time
+	// StartedBy is the Mira user who started the import, StartedByName
+	// their name then. Own tells an import of their own watch data.
+	StartedBy     accounts.ID
+	StartedByName string
+	Own           bool
+	// Extras are what the import brings besides watch data.
+	Extras Extras
+	Users  []UserStatus
+	// source names the server the lists brought remember (see
+	// Server.source).
+	source string
+}
+
+// UserStatus is how the import of one Jellyfin user's watch data goes.
+type UserStatus struct {
+	JellyfinID, JellyfinName string
+	User                     accounts.ID
+	UserName                 string
+	State                    string
+	// Read counts the items read from Jellyfin. Played counts the titles
+	// marked played that were not, Resumed the resume points set,
+	// Favorites the titles made favorites, Ratings the titles rated,
+	// Watchlist the titles a Plex Watchlist added to the user's,
+	// Collections and Playlists the collections and playlists created, and
+	// ListTitles the titles added to those an earlier import brought.
+	Read, Played, Resumed, Favorites, Ratings, Watchlist int
+	Collections, Playlists, ListTitles                   int
+	// Sections counts the library sections of movies and shows a Plex
+	// server has, Listed the items they list that were read, and History
+	// the rows of the account's playback history read; Read counts the
+	// items with watch data among them.
+	Sections, Listed, History int
+	// Matched counts the items read that a Mira title matched, UpToDate
+	// the marks, resume points and favorites they hold that Mira already
+	// had, and the lists an earlier import brought that already held every
+	// title found, and Undated the resume points without a date, which are
+	// not added: whether Mira's own is newer cannot be told.
+	Matched, UpToDate, Undated int
+	// UnmatchedCount counts the titles not found, which the user's list
+	// of the server's kind keeps (see package importlinks).
+	UnmatchedCount int
+	Problem        string
+	// Skipped lists the collections and playlists read that no title of
+	// matched, which were not created.
+	Skipped []SkippedList
+	// NothingAdded tells why the import of a user that ended without a
+	// problem added nothing, empty when it added something, or when the
+	// titles it could not match tell why.
+	NothingAdded string
+}
+
+// The kinds of SkippedList.
+const (
+	ListCollection = "collection"
+	ListPlaylist   = "playlist"
+)
+
+// SkippedList is a collection or a playlist of the server, of Kind
+// ListCollection or ListPlaylist, named Name there, that an import did
+// not create: no title of it matched.
+type SkippedList struct {
+	Kind, Name string
+}
+
+// clone copies s, so that what the import changes later does not show.
+func (s *Status) clone() *Status {
+	c := *s
+	c.Users = slices.Clone(s.Users)
+	for i := range c.Users {
+		c.Users[i].Skipped = slices.Clone(c.Users[i].Skipped)
+	}
+	return &c
+}
+
+// Current returns the import running, else the last one, nil when none
+// ran since Mira started.
+func (s *Service) Current() *Status {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.current == nil {
+		return nil
+	}
+	return s.current.clone()
+}
+
+// Own returns user's import of their own watch data running, else their
+// last one, nil when they made none since Mira started.
+func (s *Service) Own(user accounts.ID) *Status {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.own[user] == nil {
+		return nil
+	}
+	return s.own[user].clone()
+}
+
+// Credentials are what Mira connects to a server with: a key, which is
+// an API key of the server's dashboard, a user's own key or access token,
+// or Plex's owner's token, or a user's name and password, which it signs in
+// with as Jellyfin's apps do, then signs out once done. A password may be
+// empty: an account may have none. A name, when given, is used over a key.
+// Plex takes its owner's token only.
+type Credentials struct {
+	Key            string
+	Name, Password string
+}
+
+// Users reads the server connection leads to: which server it is, and its
+// users. Signed in, it signs out before returning. It fails with
+// ErrInvalidAddress, ErrUnreachable, ErrNotJellyfin, ErrKeyRefused,
+// ErrForbidden, ErrUserKey, ErrSignInRefused or ErrSignInForbidden.
+func (s *Service) Users(ctx context.Context, connection Connection) (Server, []User, error) {
+	address, err := ParseAddress(connection.Address)
+	if err != nil {
+		return Server{}, nil, err
+	}
+	// An administrator waits on the answer: a server that fails is told
+	// at once.
+	c := &client{s: s, kind: connection.Kind, address: address}
+	defer c.signOut()
+	return c.connect(ctx, connection.Credentials)
+}
+
+// Target is a Jellyfin user whose watch data an import adds to a Mira
+// account.
+type Target struct {
+	JellyfinID string
+	User       accounts.ID
+	UserName   string
+}
+
+// SignIn signs in, while an import starts, as the user jellyfinID names,
+// with their password on the server: the import reads their watch data as
+// them. It fails as Users does, or with ErrOtherUser. Plex has no sign-in:
+// with the owner signed in to Plex (see Connection.PlexOwner), it takes
+// the account's own token for the server, password being a Plex Home
+// profile's PIN, and fails with ErrPlexProfilePIN or as plex.tv does;
+// an account Plex gives no token for, or a profile with a PIN without
+// it, is read from the server's playback history. Without the owner
+// signed in, it fails with ErrNotSignedIn.
+type SignIn func(jellyfinID, password string) error
+
+// Start reads the server connection leads to again, hands it and its users
+// to choose, which maps them to Mira accounts, creating them as needed,
+// and imports in the background the watch data of the users it returns.
+// With a user's key (see Server.KeyOwner), choose must sign in as each
+// other user it returns, with signIn, before creating any account: Start
+// fails with ErrNotKeyOwner, reading no one, when it did not. The import
+// reads the users signed in as themselves, ends each session once that
+// user is read, and its own at its end. by is the Mira user who starts
+// it. Start returns the import, nil when choose returned no one. While an
+// import runs, it fails with ErrRunning before reading anything; it fails
+// as Users does, or with choose's error. With Connection.PlexOwner, it
+// fails with ErrPlexSignInEnded, ErrNotSignedIn before Plex signed by in,
+// or ErrPlexNotOwner, before choose is called; the import takes the
+// sign-in over and signs it out of Plex once it ends, and the tokens of
+// the accounts it reads are dropped.
+func (s *Service) Start(ctx context.Context, connection Connection, by accounts.User,
+	choose func(Server, []User, SignIn) ([]Target, error)) (*Status, error) {
+	if !s.claim() {
+		return nil, ErrRunning
+	}
+	// own reads with the credentials; sessions read as the users signed in
+	// as themselves, by their identifier on the server, or, on Plex, with
+	// their own token. Until the import takes them over, failing ends
+	// them, and signs out of Plex the Home profiles switched to.
+	address, err := ParseAddress(connection.Address)
+	own := &client{s: s, kind: connection.Kind, address: address}
+	sessions := map[string]*client{}
+	var switched []string
+	started := false
+	defer func() {
+		if !started {
+			own.signOut()
+			for _, session := range sessions {
+				session.signOut()
+			}
+			for _, token := range switched {
+				s.plexSignOut(token)
+			}
+			s.release()
+		}
+	}()
+	if err != nil {
+		return nil, err
+	}
+
+	server, users, err := own.connect(ctx, connection.Credentials)
+	if err != nil {
+		return nil, err
+	}
+	var held *plexSignIn
+	var shares *plexShares
+	if connection.PlexOwner {
+		if server.Kind != Plex {
+			return nil, ErrPlexNotOwner
+		}
+		if held = s.heldPlex(by.ID); held == nil {
+			return nil, ErrPlexSignInEnded
+		}
+		held.mu.Lock()
+		defer held.mu.Unlock()
+		if shares, err = s.plexOwnerShares(ctx, held, server.MachineID); err != nil {
+			return nil, err
+		}
+	}
+	names := make(map[string]string, len(users))
+	for _, u := range users {
+		names[u.ID] = u.Name
+	}
+	signIn := func(jellyfinID, password string) error {
+		name, ok := names[jellyfinID]
+		switch {
+		case server.Kind == Plex && shares == nil:
+			return ErrNotSignedIn
+		case !ok:
+			return errors.New("not a user of the server")
+		case sessions[jellyfinID] != nil || server.Kind == Plex && jellyfinID == plexOwner:
+			// The owner's token reads the owner.
+			return nil
+		case server.Kind == Plex:
+			token, signOut, err := s.plexToken(ctx, shares, jellyfinID, password)
+			if signOut != "" {
+				switched = append(switched, signOut)
+			}
+			if token != "" {
+				sessions[jellyfinID] = &client{s: s, kind: Plex, address: server.Address, key: token}
+			}
+			return err
+		}
+		session := &client{s: s, kind: server.Kind, address: server.Address}
+		signed, err := session.signIn(ctx, name, password)
+		if err != nil {
+			return err
+		}
+		if signed != jellyfinID {
+			session.signOut()
+			return ErrOtherUser
+		}
+		sessions[jellyfinID] = session
+		return nil
+	}
+	targets, err := choose(server, users, signIn)
+	if err != nil || len(targets) == 0 {
+		return nil, err
+	}
+	for _, t := range targets {
+		if server.KeyOwner != "" && t.JellyfinID != server.KeyOwner && sessions[t.JellyfinID] == nil {
+			return nil, ErrNotKeyOwner
+		}
+	}
+	// The sessions of users not imported end now.
+	used := make(map[string]*client, len(sessions))
+	for _, t := range targets {
+		if session := sessions[t.JellyfinID]; session != nil {
+			used[t.JellyfinID] = session
+		}
+	}
+	for id, session := range sessions {
+		if used[id] == nil {
+			session.signOut()
+		}
+	}
+	sessions = used
+	status := s.newStatus(server, by, false, connection.Extras)
+	for _, t := range targets {
+		status.Users = append(status.Users, UserStatus{JellyfinID: t.JellyfinID, JellyfinName: names[t.JellyfinID], User: t.User,
+			UserName: t.UserName, State: UserWaiting})
+	}
+	var taken []string
+	if server.Kind == Plex {
+		// Users signing in to Plex find this server chosen for them.
+		s.mu.Lock()
+		s.plexServer = server.MachineID
+		s.mu.Unlock()
+		if held != nil {
+			// The import holds the owner's sign-in from now on.
+			taken = s.takePlex(by.ID, held)
+		}
+	}
+	snapshot, err := s.launch(status, own, sessions, nil, slices.Concat(taken, switched))
+	if started = err == nil; !started {
+		// The owner's sign-in was taken: it ends here.
+		for _, token := range taken {
+			s.plexSignOut(token)
+		}
+	}
+	return snapshot, err
+}
+
+// ImportOwn imports, in the background, the watch data of the user who
+// signs in to the Jellyfin or Emby server connection leads to with its name
+// and password, into the account of user, who starts it. It never lists
+// the server's users, which a user's session may not, and reads the user
+// signed in as themselves only: even a server that answers every user with
+// the session's data gives them their own. The session ends with the
+// import, and the password is not kept. It fails as Start does, or with
+// ErrNotSignedIn for a Plex server or without a name.
+func (s *Service) ImportOwn(ctx context.Context, connection Connection, user accounts.User) (*Status, error) {
+	if connection.Kind == Plex || connection.Name == "" {
+		return nil, ErrNotSignedIn
+	}
+	if !s.claim() {
+		return nil, ErrRunning
+	}
+	address, err := ParseAddress(connection.Address)
+	c := &client{s: s, kind: connection.Kind, address: address}
+	started := false
+	defer func() {
+		if !started {
+			c.signOut()
+			s.release()
+		}
+	}()
+	if err != nil {
+		return nil, err
+	}
+	server, err := c.open(ctx, connection.Credentials)
+	if err != nil {
+		return nil, err
+	}
+	status := s.newStatus(server, user, true, connection.Extras)
+	status.Users = []UserStatus{{JellyfinID: server.KeyOwner, JellyfinName: connection.Name, User: user.ID, UserName: user.Name,
+		State: UserWaiting}}
+	snapshot, err := s.launch(status, c, nil, nil, nil)
+	started = err == nil
+	return snapshot, err
+}
+
+// claim marks the service busy for an import about to start, and reports
+// false when one runs or starts already.
+func (s *Service) claim() bool {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.busy {
+		return false
+	}
+	s.busy = true
+	return true
+}
+
+// release frees the service after an import that could not start.
+func (s *Service) release() {
+	s.mu.Lock()
+	s.busy = false
+	s.mu.Unlock()
+}
+
+// newStatus is a running import of server that by starts, without users
+// yet; own tells an import of by's own watch data, and extras what it
+// brings besides. A user's own import creates collections, which every
+// user sees, only for a user who may manage them, as Jellyfin lets only
+// them create collections.
+func (s *Service) newStatus(server Server, by accounts.User, own bool, extras Extras) *Status {
+	extras.Collections = extras.Collections && s.collections != nil && (!own || by.CollectionManagement)
+	extras.Playlists = extras.Playlists && s.playlists != nil
+	return &Status{ID: newID(), Kind: server.Kind, ServerName: server.Name, Address: server.Address, State: StateRunning,
+		StartedAt: s.now().UTC(), StartedBy: by.ID, StartedByName: by.Name, Own: own, Extras: extras, source: server.source()}
+}
+
+// launch runs the import of status in the background, reading with own and
+// the sessions of the users signed in, or, for a user's own import from
+// Plex, as plex tells, and returns a copy of status. The import signs
+// plexSignOut out of Plex once it ends. It fails only once the service is
+// closed.
+func (s *Service) launch(status *Status, own *client, sessions map[string]*client, plex *ownPlex,
+	plexSignOut []string) (*Status, error) {
+	runCtx, stop := context.WithCancel(s.ctx)
+	s.mu.Lock()
+	if s.ctx.Err() != nil {
+		s.mu.Unlock()
+		stop()
+		return nil, s.ctx.Err()
+	}
+	s.current, s.stop = status, stop
+	if status.Own {
+		s.own[status.StartedBy] = status
+	}
+	s.wg.Add(1)
+	snapshot := status.clone()
+	s.mu.Unlock()
+
+	own.retries = s.timing.retries
+	for _, session := range sessions {
+		session.retries = s.timing.retries
+	}
+	r := &run{s: s, status: status, client: own, sessions: sessions, series: map[string]map[string]string{},
+		sources: map[string]*library.SourceEpisodes{}, plex: plex, plexSignOut: plexSignOut}
+	go func() {
+		defer s.wg.Done()
+		defer stop()
+		r.run(runCtx)
+	}()
+	s.logger.Info("An import started", "kind", status.Kind, "server", status.ServerName, "users", len(status.Users), "own", status.Own)
+	return snapshot, nil
+}
+
+// Stop stops the import running, if any: what it imported stays.
+func (s *Service) Stop() {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.stop != nil {
+		s.stop()
+	}
+}

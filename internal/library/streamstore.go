@@ -1,0 +1,247 @@
+package library
+
+import (
+	"context"
+	"encoding/json"
+	"errors"
+	"sync"
+	"time"
+
+	"github.com/jackc/pgx/v5"
+
+	"github.com/ferforastieri/mira/internal/accounts"
+	"github.com/ferforastieri/mira/internal/stremio"
+)
+
+// Each addon's last stream list for a title is saved in the database, so
+// that a restart does not forget the versions known before: a list read
+// back is stale (see list), listed at once while the addon is asked again,
+// as a list that expired is, and kept as long (see staleLists). A refresh
+// of the title deletes it (see forgetLists), and so does forgetting the
+// version lists of every addon, or of one (see forgetVersionLists). A
+// list's saving, reading back and dropping take its lock (see listLocks),
+// so that the copy saved ends as the list in memory: a list dropped while
+// it was being saved is not saved back, nor read back from a copy read
+// before it was dropped.
+
+const (
+	// savedTimeout bounds the reading and saving of a list.
+	savedTimeout = 5 * time.Second
+	// forgetTimeout bounds the deleting of many lists at once (see
+	// deleteSavedLists).
+	forgetTimeout = 30 * time.Second
+	// sweepEvery is how often saved lists past keeping are deleted.
+	sweepEvery = time.Hour
+)
+
+// savedList is how a stream list is saved. Identities are the identities
+// the streams carry from earlier answers (see carryIdentities), in order,
+// "" for a stream without; none when no stream carries one.
+type savedList struct {
+	Streams    []stremio.Stream `json:"streams"`
+	Identities []string         `json:"identities,omitempty"`
+}
+
+// newSavedList is how streams are saved.
+func newSavedList(streams []stremio.Stream) savedList {
+	saved := savedList{Streams: streams}
+	for i, stream := range streams {
+		if stream.Identity == "" {
+			continue
+		}
+		if saved.Identities == nil {
+			saved.Identities = make([]string, len(streams))
+		}
+		saved.Identities[i] = stream.Identity
+	}
+	return saved
+}
+
+// streams returns the streams saved, with their identities.
+func (saved savedList) streams() []stremio.Stream {
+	if len(saved.Identities) == len(saved.Streams) {
+		for i, identity := range saved.Identities {
+			saved.Streams[i].Identity = identity
+		}
+	}
+	return saved.Streams
+}
+
+// savedStreams reads back the stream list saved for key, still kept. A key
+// found missing is not looked for again: every list saved since went
+// through saveStreams, which forgets that.
+func (s *Service) savedStreams(ctx context.Context, key streamKey) (list[stremio.Stream], bool) {
+	if s.db == nil {
+		return list[stremio.Stream]{}, false
+	}
+	unsaved := s.tracked().unsaved
+	if _, missing := unsaved.Get(key); missing {
+		return list[stremio.Stream]{}, false
+	}
+	ctx, cancel := context.WithTimeout(context.WithoutCancel(ctx), savedTimeout)
+	defer cancel()
+	var data []byte
+	var answer int
+	var at time.Time
+	err := s.db.QueryRow(ctx, "SELECT streams, answer, fetched_at FROM stream_lists WHERE addon_id = $1 AND content_type = $2 AND stremio_id = $3",
+		key.addon, key.contentType, key.id).Scan(&data, &answer, &at)
+	if errors.Is(err, pgx.ErrNoRows) {
+		unsaved.Put(key, true)
+		return list[stremio.Stream]{}, false
+	}
+	if err != nil {
+		s.logger.Warn("Reading a saved stream list failed", "error", err)
+		return list[stremio.Stream]{}, false
+	}
+	var saved savedList
+	if err := json.Unmarshal(data, &saved); err != nil {
+		return list[stremio.Stream]{}, false
+	}
+	streams := saved.streams()
+	l := list[stremio.Stream]{items: streams, answer: min(max(answer, 0), len(streams)), at: at, restored: true}
+	if _, kept := l.state(s.now(), s.listLife()); !kept {
+		return list[stremio.Stream]{}, false
+	}
+	return l, true
+}
+
+// saveStreams saves the stream list kept in memory for key, and now and
+// then deletes the lists saved past keeping.
+func (s *Service) saveStreams(key streamKey) {
+	if s.db == nil || !s.writeStreams(key) {
+		return
+	}
+	tracked := s.tracked()
+	now := s.now()
+	if last := tracked.swept.Load(); now.UnixNano()-last >= int64(sweepEvery) && tracked.swept.CompareAndSwap(last, now.UnixNano()) {
+		ctx, cancel := context.WithTimeout(context.Background(), savedTimeout)
+		defer cancel()
+		if _, err := s.db.Exec(ctx, "DELETE FROM stream_lists WHERE fetched_at < $1", now.Add(-s.keptListLife())); err != nil {
+			s.logger.Warn("Deleting old stream lists failed", "error", err)
+		}
+	}
+}
+
+// writeStreams writes the stream list kept in memory for key to the
+// database, reading it under the key's lock, and reports whether it did.
+func (s *Service) writeStreams(key streamKey) bool {
+	tracked := s.tracked()
+	defer tracked.saving.lock(key)()
+	l, ok := s.streamLists.Get(key)
+	if !ok || l.restored {
+		return false
+	}
+	data, err := json.Marshal(newSavedList(l.items))
+	if err != nil {
+		return false
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), savedTimeout)
+	defer cancel()
+	if _, err := s.db.Exec(ctx, `INSERT INTO stream_lists (addon_id, content_type, stremio_id, streams, answer, fetched_at)
+		VALUES ($1, $2, $3, $4, $5, $6)
+		ON CONFLICT (addon_id, content_type, stremio_id) DO UPDATE
+		SET streams = excluded.streams, answer = excluded.answer, fetched_at = excluded.fetched_at`,
+		key.addon, key.contentType, key.id, data, l.answer, l.at); err != nil {
+		s.logger.Warn("Saving a stream list failed", "error", err)
+		return false
+	}
+	tracked.unsaved.Delete(key)
+	return true
+}
+
+// dropStreams drops the stream list kept for key, in memory and saved,
+// under the key's lock: a save under way does not save it back (see
+// writeStreams), nor does a read under way restore it (see streamListOf).
+func (s *Service) dropStreams(ctx context.Context, key streamKey) {
+	tracked := s.tracked()
+	defer tracked.saving.lock(key)()
+	s.streamLists.Delete(key)
+	if s.db == nil {
+		return
+	}
+	ctx, cancel := context.WithTimeout(context.WithoutCancel(ctx), savedTimeout)
+	defer cancel()
+	if _, err := s.db.Exec(ctx, "DELETE FROM stream_lists WHERE addon_id = $1 AND content_type = $2 AND stremio_id = $3",
+		key.addon, key.contentType, key.id); err != nil {
+		s.logger.Warn("Deleting a saved stream list failed", "error", err)
+	}
+	tracked.unsaved.Put(key, true)
+}
+
+// deleteSavedLists deletes the stream lists saved, every addon's, or
+// addon's alone unless it is nil, and passes the key of each one deleted
+// to deleted. The deletion goes on when ctx ends, bounded by
+// forgetTimeout: the lists dropped from memory are not left saved.
+func (s *Service) deleteSavedLists(ctx context.Context, addon *accounts.ID, deleted func(streamKey)) error {
+	if s.db == nil {
+		return nil
+	}
+	ctx, cancel := context.WithTimeout(context.WithoutCancel(ctx), forgetTimeout)
+	defer cancel()
+	query, args := "DELETE FROM stream_lists RETURNING addon_id, content_type, stremio_id", []any(nil)
+	if addon != nil {
+		query, args = "DELETE FROM stream_lists WHERE addon_id = $1 RETURNING addon_id, content_type, stremio_id", []any{*addon}
+	}
+	rows, err := s.db.Query(ctx, query, args...)
+	if err != nil {
+		return err
+	}
+	var key streamKey
+	_, err = pgx.ForEachRow(rows, []any{&key.addon, &key.contentType, &key.id}, func() error {
+		deleted(key)
+		return nil
+	})
+	return err
+}
+
+// listLocks holds a lock for each stream list being saved, read back or
+// dropped (see writeStreams, streamListOf and dropStreams), and a lock of
+// every list, which forgetting many lists at once holds (see lockAll). A
+// list's lock is dropped once nothing holds or awaits it. Its zero value
+// is ready.
+type listLocks struct {
+	// all is held shared with each list's lock, and alone by lockAll.
+	all   sync.RWMutex
+	mu    sync.Mutex
+	locks map[streamKey]*listLock
+}
+
+type listLock struct {
+	sync.Mutex
+	// users counts those holding or awaiting it.
+	users int
+}
+
+// lock locks key's list, and returns what unlocks it.
+func (l *listLocks) lock(key streamKey) func() {
+	l.all.RLock()
+	l.mu.Lock()
+	if l.locks == nil {
+		l.locks = map[streamKey]*listLock{}
+	}
+	k := l.locks[key]
+	if k == nil {
+		k = &listLock{}
+		l.locks[key] = k
+	}
+	k.users++
+	l.mu.Unlock()
+	k.Lock()
+	return func() {
+		k.Unlock()
+		l.mu.Lock()
+		if k.users--; k.users == 0 {
+			delete(l.locks, key)
+		}
+		l.mu.Unlock()
+		l.all.RUnlock()
+	}
+}
+
+// lockAll locks every list, once the lists locked now are unlocked, and
+// returns what unlocks them: a save or a read back under way ends first,
+// and the next ones wait.
+func (l *listLocks) lockAll() func() {
+	l.all.Lock()
+	return l.all.Unlock
+}

@@ -1,0 +1,171 @@
+package admin
+
+import (
+	"context"
+	"errors"
+	"net/http"
+	"slices"
+
+	"github.com/ferforastieri/mira/internal/accounts"
+	"github.com/ferforastieri/mira/internal/secrets"
+	"github.com/ferforastieri/mira/internal/trackers"
+)
+
+// serverSecrets are the server's secrets an administrator can read again,
+// by the names the settings JSON gives them.
+var serverSecrets = map[string]func(accounts.Settings) string{
+	"publicMetaDbKey":         func(s accounts.Settings) string { return s.PublicMetaDBKey },
+	"theIntroDbKey":           func(s accounts.Settings) string { return s.TheIntroDBKey },
+	"mdblistRatingsKey":       func(s accounts.Settings) string { return s.MDBListRatingsKey },
+	"tmdbKey":                 func(s accounts.Settings) string { return s.TMDBKey },
+	"traktClientSecret":       func(s accounts.Settings) string { return s.TraktClientSecret },
+	"lastFmSecret":            func(s accounts.Settings) string { return s.LastFMSecret },
+	"aniListClientSecret":     func(s accounts.Settings) string { return s.AniListClientSecret },
+	"myAnimeListClientSecret": func(s accounts.Settings) string { return s.MyAnimeListClientSecret },
+	"metricsToken":            func(s accounts.Settings) string { return s.MetricsToken },
+	"updateToolToken":         func(s accounts.Settings) string { return s.UpdateToolToken },
+}
+
+// secretJSON is a secret revealed on demand. Answers never cache it.
+type secretJSON struct {
+	Value string `json:"value"`
+}
+
+// revealServerSecret answers one of the server's saved secrets, for an
+// administrator to read it again, and records who did in the activity log.
+// 404 not_found names no such secret, 404 not_set one not saved, or one
+// the key cannot decrypt.
+func (h *handler) revealServerSecret(w http.ResponseWriter, r *http.Request) {
+	name := r.PathValue("name")
+	read, ok := serverSecrets[name]
+	if !ok {
+		writeError(w, http.StatusNotFound, "not_found")
+		return
+	}
+	value := read(h.Accounts.Settings())
+	if value == "" {
+		writeError(w, http.StatusNotFound, "not_set")
+		return
+	}
+	h.Activity.SecretRevealed(r.Context(), sessionFrom(r.Context()).User, name, false)
+	writeJSON(w, http.StatusOK, secretJSON{Value: value})
+}
+
+// newMetricsToken makes a new metrics token, which ends the former one,
+// records who did in the activity log, and answers the settings, which
+// never hold the token.
+func (h *handler) newMetricsToken(w http.ResponseWriter, r *http.Request) {
+	settings, err := h.Accounts.NewMetricsToken(r.Context())
+	if err != nil {
+		h.internalError(w, r, err)
+		return
+	}
+	h.Activity.MetricsTokenMade(r.Context(), sessionFrom(r.Context()).User.Name)
+	answer, err := h.settingsJSON(r.Context(), settings)
+	if err != nil {
+		h.internalError(w, r, err)
+		return
+	}
+	writeJSON(w, http.StatusOK, answer)
+}
+
+// revealTrackingKey answers the API key or user token the signed-in user
+// connected a key service with, MDBList, PublicMetaDB or ListenBrainz, and
+// records it in the activity log. The tokens and session keys of the
+// services connected on their own sites are never revealed: 400
+// not_revealable. 404 not_set: no connection, or one the key cannot
+// decrypt.
+func (h *handler) revealTrackingKey(w http.ResponseWriter, r *http.Request) {
+	service := r.PathValue("service")
+	if h.Trackers == nil || !slices.Contains(trackers.Services, service) {
+		writeError(w, http.StatusNotFound, "not_found")
+		return
+	}
+	if !trackers.ByKey(service) {
+		writeError(w, http.StatusBadRequest, "not_revealable")
+		return
+	}
+	user := sessionFrom(r.Context()).User
+	key, err := h.Trackers.Key(r.Context(), user.ID, service)
+	switch {
+	case errors.Is(err, trackers.ErrNotConnected):
+		writeError(w, http.StatusNotFound, "not_set")
+		return
+	case err != nil:
+		h.internalError(w, r, err)
+		return
+	}
+	h.Activity.SecretRevealed(r.Context(), user, service, true)
+	writeJSON(w, http.StatusOK, secretJSON{Value: key})
+}
+
+// secretsHealthJSON is how the stored secrets stand: whether
+// MIRA_SECRET_KEY is set, how many are stored unencrypted, and which
+// the key cannot decrypt, by name.
+type secretsHealthJSON struct {
+	Encrypted  bool             `json:"encrypted"`
+	Plaintext  int              `json:"plaintext"`
+	Unreadable []unreadableJSON `json:"unreadable"`
+}
+
+// unreadableJSON is a secret the key cannot decrypt: one of the server's,
+// by its settings name, a user's tracking connection, a user's connection
+// to an app, a notification target, by its name, of a user, or of the
+// server (user null), a network share's password, by its folder's name,
+// a backup destination's, by what it shows, the keys of the certificate
+// of Let's Encrypt (certificate true), or a user's two-step sign-in
+// (twoStep true).
+type unreadableJSON struct {
+	Setting     *string `json:"setting"`
+	Service     *string `json:"service"`
+	App         *string `json:"app"`
+	Target      *string `json:"target"`
+	User        *string `json:"user"`
+	Folder      *string `json:"folder"`
+	Destination *string `json:"destination"`
+	Certificate bool    `json:"certificate"`
+	TwoStep     bool    `json:"twoStep"`
+}
+
+// secretsHealth reads how the stored secrets stand; nil when it cannot.
+func (h *handler) secretsHealth(ctx context.Context) *secretsHealthJSON {
+	if h.Health.Secrets == nil {
+		return nil
+	}
+	report, err := h.secretsReport(ctx)
+	if err != nil {
+		// A request that ended, such as a tab closed during a refresh, is
+		// not a failure: nobody reads the answer.
+		if ctx.Err() == nil {
+			h.Logger.Warn("The stored secrets could not be inspected", "error", err)
+		}
+		return nil
+	}
+	result := &secretsHealthJSON{Encrypted: h.Health.SecretKey, Plaintext: report.Plaintext, Unreadable: []unreadableJSON{}}
+	for _, unreadable := range report.Unreadable {
+		result.Unreadable = append(result.Unreadable, newUnreadableJSON(unreadable))
+	}
+	return result
+}
+
+func newUnreadableJSON(u secrets.Unreadable) unreadableJSON {
+	switch {
+	case u.Setting != "":
+		return unreadableJSON{Setting: &u.Setting}
+	case u.Certificate:
+		return unreadableJSON{Certificate: true}
+	case u.TwoStep:
+		return unreadableJSON{TwoStep: true, User: &u.User}
+	case u.Destination != "":
+		return unreadableJSON{Destination: &u.Destination}
+	case u.Folder != "":
+		return unreadableJSON{Folder: &u.Folder}
+	case u.Target != "" && u.User == "":
+		return unreadableJSON{Target: &u.Target}
+	case u.Target != "":
+		return unreadableJSON{Target: &u.Target, User: &u.User}
+	case u.App != "":
+		return unreadableJSON{App: &u.App, User: &u.User}
+	}
+	return unreadableJSON{Service: &u.Service, User: &u.User}
+}

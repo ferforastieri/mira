@@ -1,0 +1,342 @@
+package accounts
+
+import (
+	"errors"
+	"net/netip"
+	"reflect"
+	"runtime"
+	"slices"
+	"strconv"
+	"strings"
+	"testing"
+)
+
+// The Go defaults are those of the columns: a server set up anew, and a
+// row the database fills with its defaults, both hold DefaultSettings.
+func TestDefaultSettingsAreTheColumnDefaults(t *testing.T) {
+	t.Parallel()
+	store := newStore(t)
+	ctx := t.Context()
+	if got := store.Settings(); !reflect.DeepEqual(got, DefaultSettings()) {
+		t.Errorf("a new server's settings:\n%+v\nwant\n%+v", got, DefaultSettings())
+	}
+	if _, err := store.db.Exec(ctx, "DELETE FROM settings"); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := store.db.Exec(ctx, "INSERT INTO settings DEFAULT VALUES"); err != nil {
+		t.Fatal(err)
+	}
+	var columns Settings
+	if err := store.db.QueryRow(ctx, "SELECT "+settingsColumns+" FROM settings").Scan(columns.fields()...); err != nil {
+		t.Fatal(err)
+	}
+	if !reflect.DeepEqual(columns, DefaultSettings()) {
+		t.Errorf("the column defaults:\n%+v\nwant\n%+v", columns, DefaultSettings())
+	}
+}
+
+// boundField is the field of Settings named name in the admin API.
+func boundField(settings *Settings, name string) (reflect.Value, bool) {
+	value := reflect.ValueOf(settings).Elem()
+	for i := range value.NumField() {
+		if strings.EqualFold(value.Type().Field(i).Name, name) {
+			return value.Field(i), true
+		}
+	}
+	return reflect.Value{}, false
+}
+
+// The bounds served are those the settings check: each setting has an
+// entry, its default is DefaultSettings', its bounds and choices are
+// accepted, and what lies past them is refused.
+func TestSettingsBoundsAreThoseChecked(t *testing.T) {
+	t.Parallel()
+	store := newStore(t)
+	ctx := t.Context()
+	base := store.Settings()
+	bounds := SettingsBounds()
+	named := map[string]bool{}
+	for key := range bounds {
+		named[strings.ToLower(key)] = true
+	}
+	fields := reflect.TypeFor[Settings]()
+	// The host names of Known proxies share the bounds of knownProxies,
+	// the admin API's list of both.
+	named["knownproxynames"] = true
+	for i := range fields.NumField() {
+		// Unexported fields are state read with the settings, not
+		// settings.
+		if field := fields.Field(i); field.IsExported() && !named[strings.ToLower(field.Name)] {
+			t.Errorf("no bounds for %s", field.Name)
+		}
+	}
+	try := func(name string, value any) error {
+		t.Helper()
+		changed := base
+		// Each way of serving HTTPS needs what it serves with.
+		changed.HTTPSCertificate, changed.HTTPSPrivateKey = systemPath("/certs/fullchain.pem"), systemPath("/certs/privkey.pem")
+		changed.ACMEHosts, changed.ACMETerms = []string{"media.example.org"}, true
+		// The source cache's limits are checked as set, which only the
+		// custom preset keeps.
+		changed.SourceCachePreset = SourceCacheCustom
+		field, _ := boundField(&changed, name)
+		field.Set(reflect.ValueOf(value).Convert(field.Type()))
+		_, err := store.UpdateSettings(ctx, changed)
+		return err
+	}
+	defaults := DefaultSettings()
+	for name, b := range bounds {
+		field, ok := boundField(&defaults, name)
+		if !ok {
+			t.Errorf("%s: no such setting", name)
+			continue
+		}
+		if !reflect.DeepEqual(field.Interface(), b.Default) {
+			t.Errorf("%s: default %v, want %v", name, b.Default, field.Interface())
+		}
+		switch kind := field.Kind(); {
+		case b.Bounded && (kind == reflect.Int || kind == reflect.Float64):
+			step := 1.0
+			if kind == reflect.Float64 {
+				step = 0.01
+			}
+			for _, edge := range []float64{b.Min, b.Max} {
+				if err := try(name, edge); err != nil {
+					t.Errorf("%s: %v refused: %v", name, edge, err)
+				}
+			}
+			if b.Zero {
+				if err := try(name, 0); err != nil {
+					t.Errorf("%s: 0 refused: %v", name, err)
+				}
+			}
+			for _, past := range []float64{b.Min - step, b.Max + step} {
+				if past == 0 && b.Zero {
+					continue
+				}
+				if err := try(name, past); err == nil {
+					t.Errorf("%s: %v accepted", name, past)
+				}
+			}
+		case b.Bounded && kind == reflect.String:
+			// An address is a URL: its scheme starts it, letters fill the
+			// rest. A folder is an absolute path, and a sender an email
+			// address.
+			letter, start, end := "a", "", ""
+			switch name {
+			case "remuxDbUrl", "publicAddress", "localAddress", "updateToolUrl", "providerIssuer":
+				start = "https://"
+			case "recordingsFolder", "backupFolder", "httpsCertificate", "httpsPrivateKey", "conversionFolder", "readingFolder", "cacheFolder":
+				start = systemPath("/")
+			case "smtpFrom", "acmeEmail":
+				start = "mira@"
+			case "torrentProxy":
+				// A proxy is a host and a port.
+				end = ":1080"
+			case "posterTemplate":
+				// The template names an identifier to fill in.
+				start, end = "https://", "/{imdb_id}"
+			case "torrentWireGuard":
+				// A WireGuard configuration, a comment ending it.
+				key := "yAnz5TF+lXXJte14tji3zlMNq+hd2rYUIgJBgB3fBmk="
+				start = "[Interface]\nPrivateKey = " + key + "\nAddress = 10.2.0.2/32\n[Peer]\nPublicKey = " + key +
+					"\nEndpoint = 203.0.113.5:51820\nAllowedIPs = 0.0.0.0/0\n# "
+			case "torrentInterface":
+				// Only Linux binds sockets to an interface.
+				if !InterfaceRoutes {
+					if err := try(name, "wg0"); err == nil {
+						t.Errorf("%s: accepted on %s", name, runtime.GOOS)
+					}
+					continue
+				}
+			}
+			long := func(n int) string {
+				text := []byte(start + strings.Repeat(letter, n-len(start)-len(end)) + end)
+				if name == "torrentProxy" {
+					// A host name's labels hold 63 bytes at most.
+					for i := 50; i < len(text)-len(end); i += 51 {
+						text[i] = '.'
+					}
+				}
+				return string(text)
+			}
+			if err := try(name, long(int(b.Max))); err != nil {
+				t.Errorf("%s: %v long refused: %v", name, b.Max, err)
+			}
+			if err := try(name, long(int(b.Max)+1)); err == nil {
+				t.Errorf("%s: %v long accepted", name, b.Max+1)
+			}
+			if b.Min > 0 {
+				if err := try(name, strings.Repeat(letter, int(b.Min)-1)); err == nil {
+					t.Errorf("%s: %v long accepted", name, b.Min-1)
+				}
+			}
+		case b.Bounded && kind == reflect.Slice:
+			// A list of addresses, of app names, of host names or of
+			// sources holds up to Max of them.
+			var entries []any
+			for i := range int(b.Max) + 1 {
+				switch {
+				case name == "acmeHosts":
+					entries = append(entries, "host-"+strconv.Itoa(i)+".example.org")
+				case name == "torrentTrackers":
+					entries = append(entries, "udp://tracker.example:"+strconv.Itoa(1000+i)+"/announce")
+				case field.Type().Elem().Kind() == reflect.String:
+					entries = append(entries, "App "+strconv.Itoa(i))
+				case field.Type().Elem() == reflect.TypeFor[ID]():
+					entries = append(entries, ID{byte(i >> 8), byte(i), 1})
+				case field.Type().Elem() == reflect.TypeFor[VersionLabelRule]():
+					entries = append(entries, VersionLabelRule{Text: "rule " + strconv.Itoa(i), Hide: true})
+				default:
+					entries = append(entries, netip.PrefixFrom(netip.AddrFrom4([4]byte{10, 0, byte(i >> 8), byte(i)}), 32))
+				}
+			}
+			list := func(n int) any {
+				value := reflect.MakeSlice(field.Type(), n, n)
+				for i := range n {
+					value.Index(i).Set(reflect.ValueOf(entries[i]))
+				}
+				return value.Interface()
+			}
+			if err := try(name, list(int(b.Max))); err != nil {
+				t.Errorf("%s: %v entries refused: %v", name, b.Max, err)
+			}
+			if err := try(name, list(int(b.Max)+1)); err == nil {
+				t.Errorf("%s: %v entries accepted", name, b.Max+1)
+			}
+		case b.Choices != nil && kind != reflect.Slice:
+			for _, choice := range b.Choices {
+				if err := try(name, choice); err != nil {
+					t.Errorf("%s: %v refused: %v", name, choice, err)
+				}
+			}
+			outside := any("other")
+			if kind == reflect.Int {
+				outside = 7
+			}
+			if err := try(name, outside); err == nil {
+				t.Errorf("%s: %v accepted", name, outside)
+			}
+		case b.Choices != nil:
+			var choices []string
+			for _, choice := range b.Choices {
+				choices = append(choices, choice.(string))
+			}
+			if err := try(name, []string{"other"}); err == nil {
+				t.Errorf("%s: a value not among %v accepted", name, choices)
+			}
+		case b.Bounded || b.Zero:
+			t.Errorf("%s: bounds on a %s", name, kind)
+		}
+	}
+}
+
+func TestEnvironmentIsAdoptedOnce(t *testing.T) {
+	t.Parallel()
+	store := newStore(t)
+	ctx := t.Context()
+	method := HardwareAccelerations[1]
+	if err := store.AdoptEnvironment(ctx, Environment{Hardware: method, Segments: []string{"introdb", "theintrodb"}}); err != nil {
+		t.Fatal(err)
+	}
+	check := func(when string, s *Store, hardware string, order, off []string) {
+		t.Helper()
+		got := s.Settings()
+		if got.HardwareAcceleration != hardware || !slices.Equal(got.SegmentOrder, order) || !slices.Equal(got.SegmentSourcesOff, off) {
+			t.Errorf("%s: GPU %q, order %v, off %v; want %q, %v, %v", when, got.HardwareAcceleration, got.SegmentOrder, got.SegmentSourcesOff,
+				hardware, order, off)
+		}
+		reopened, err := Open(ctx, s.db)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if reopened.Settings().HardwareAcceleration != got.HardwareAcceleration || !slices.Equal(reopened.Settings().SegmentOrder, got.SegmentOrder) ||
+			!slices.Equal(reopened.Settings().SegmentSourcesOff, got.SegmentSourcesOff) {
+			t.Errorf("%s: not saved: %+v", when, reopened.Settings())
+		}
+	}
+	// The databases MIRA_SEGMENTS names come first, in its order, the
+	// others after them, turned off.
+	adopted := []string{"introdb", "theintrodb", "publicmetadb", "skipdb"}
+	check("the first start", store, method, adopted, []string{"publicmetadb", "skipdb"})
+	// A start with other values changes nothing.
+	if err := store.AdoptEnvironment(ctx, Environment{Hardware: "none", Segments: []string{"publicmetadb"}}); err != nil {
+		t.Fatal(err)
+	}
+	check("a start with other values", store, method, adopted, []string{"publicmetadb", "skipdb"})
+	// An administrator's choice stays chosen.
+	chosen := store.Settings()
+	chosen.HardwareAcceleration, chosen.SegmentOrder, chosen.SegmentSourcesOff = "none", []string{"publicmetadb", "skipdb", "theintrodb", "introdb"}, []string{}
+	if _, err := store.UpdateSettings(ctx, chosen); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.AdoptEnvironment(ctx, Environment{Hardware: "auto"}); err != nil {
+		t.Fatal(err)
+	}
+	check("after the administrator's choice", store, "none", chosen.SegmentOrder, []string{})
+	// Wrong values are refused, and change nothing.
+	for _, unknown := range []string{"opencl", otherSystemsMethod()} {
+		if err := store.AdoptEnvironment(ctx, Environment{Hardware: unknown}); !errors.Is(err, ErrInvalidHardwareAcceleration) {
+			t.Errorf("an unknown GPU, %s: %v", unknown, err)
+		}
+	}
+	if err := store.AdoptEnvironment(ctx, Environment{Segments: []string{"introdb", "introdb"}}); !errors.Is(err, ErrInvalidSegmentSourcesOff) {
+		t.Errorf("a database twice: %v", err)
+	}
+}
+
+// A server that chose its GPU and order before only takes the databases
+// turned off from the environment; MIRA_SEGMENTS=none turns them all
+// off.
+func TestEnvironmentFillsOnlyWhatFollowedIt(t *testing.T) {
+	t.Parallel()
+	store := newStore(t)
+	ctx := t.Context()
+	if _, err := store.db.Exec(ctx, "UPDATE settings SET hardware_acceleration = 'none', "+
+		"segment_order = '{publicmetadb,introdb,theintrodb,skipdb}', environment_pending = '{segment_sources_off}'"); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.AdoptEnvironment(ctx, Environment{Hardware: HardwareAccelerations[1], Segments: []string{}}); err != nil {
+		t.Fatal(err)
+	}
+	got := store.Settings()
+	if got.HardwareAcceleration != "none" || !slices.Equal(got.SegmentOrder, []string{"publicmetadb", "introdb", "theintrodb", "skipdb"}) ||
+		!slices.Equal(got.SegmentSourcesOff, SegmentSources) {
+		t.Errorf("adopted: %+v", got)
+	}
+}
+
+func TestSegmentSourcesStayValid(t *testing.T) {
+	t.Parallel()
+	store := newStore(t)
+	ctx := t.Context()
+	for _, tc := range []struct {
+		name       string
+		order, off []string
+		err        error
+	}{
+		{"no order", []string{}, []string{}, ErrInvalidSegmentOrder},
+		{"a database missing", []string{"theintrodb", "introdb", "publicmetadb"}, []string{}, ErrInvalidSegmentOrder},
+		{"a database twice", []string{"theintrodb", "introdb", "publicmetadb", "introdb"}, []string{}, ErrInvalidSegmentOrder},
+		{"an unknown database turned off", SegmentSources, []string{"other"}, ErrInvalidSegmentSourcesOff},
+		{"a database turned off twice", SegmentSources, []string{"introdb", "introdb"}, ErrInvalidSegmentSourcesOff},
+	} {
+		changed := store.Settings()
+		changed.SegmentOrder, changed.SegmentSourcesOff = tc.order, tc.off
+		if _, err := store.UpdateSettings(ctx, changed); !errors.Is(err, tc.err) {
+			t.Errorf("%s: got %v, want %v", tc.name, err, tc.err)
+		}
+	}
+	// The databases turned off are kept in their usual order, and none is
+	// an empty list.
+	changed := store.Settings()
+	changed.SegmentOrder, changed.SegmentSourcesOff = []string{"publicmetadb", "skipdb", "introdb", "theintrodb"}, []string{"skipdb", "publicmetadb", "theintrodb"}
+	saved, err := store.UpdateSettings(ctx, changed)
+	if err != nil || !slices.Equal(saved.SegmentSourcesOff, []string{"theintrodb", "publicmetadb", "skipdb"}) {
+		t.Errorf("saved: %v %v", saved.SegmentSourcesOff, err)
+	}
+	changed.SegmentSourcesOff = nil
+	if saved, err := store.UpdateSettings(ctx, changed); err != nil || saved.SegmentSourcesOff == nil {
+		t.Errorf("none turned off: %#v %v", saved.SegmentSourcesOff, err)
+	}
+}

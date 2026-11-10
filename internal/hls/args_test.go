@@ -1,0 +1,182 @@
+package hls
+
+import (
+	"encoding/json"
+	"os"
+	"path/filepath"
+	"reflect"
+	"slices"
+	"strconv"
+	"strings"
+	"testing"
+	"time"
+)
+
+// defaultCases are conversions of every kind, by name, with the
+// settings left as they are by default.
+func defaultCases() []struct {
+	name string
+	args func() []string
+} {
+	plan := NewPlan([]time.Duration{0, 6 * time.Second, 12 * time.Second}, 18*time.Second)
+	nvidia := &Hardware{Method: "cuda", Encoders: []string{"h264_nvenc", "hevc_nvenc"}}
+	nvidiaToneMapping := &Hardware{Method: "cuda", Encoders: []string{"h264_nvenc", "hevc_nvenc"}, ToneMapping: true}
+	vaapi := &Hardware{Method: "vaapi", Device: "/dev/dri/renderD128", Encoders: []string{"h264_vaapi", "hevc_vaapi"}}
+	burn := 3
+	return []struct {
+		name string
+		args func() []string
+	}{
+		{"copy", func() []string {
+			return Remux{Input: "http://127.0.0.1:1/a.mkv", Video: 0, Audio: 1, Format: FMP4, Plan: plan, VideoTag: "hvc1"}.args(1, 0)
+		}},
+		{"cpu h264", func() []string {
+			return Remux{Input: "http://127.0.0.1:1/a.mkv", Video: 0, Audio: 1, Format: FMP4, Plan: plan, VideoTag: "avc1",
+				AudioCodec: "aac", AudioChannels: 2, AudioBitrate: 192_000,
+				Encode: &VideoEncoding{Encoder: "libx264", Level: "4.1", Width: 1280, Height: 720, Bitrate: 5_000_000, FrameRate: 23.976, Deinterlace: true}}.args(1, 0)
+		}},
+		{"cpu hevc tone mapped", func() []string {
+			return Remux{Input: "http://127.0.0.1:1/a.mkv", Video: 0, Audio: 1, Format: TS, Plan: plan, Subtitles: []int{2},
+				AudioCodec: "ac3", AudioChannels: 6, AudioBitrate: 384_000,
+				Encode: &VideoEncoding{Encoder: "libx265", Level: "4.1", Width: 1280, Height: 720, Bitrate: 5_000_000, FrameRate: 24, ToneMap: true}}.args(0, 0)
+		}},
+		{"cpu burn", func() []string {
+			return Remux{Input: "http://127.0.0.1:1/a.mkv", Video: 0, Audio: -1, Format: TS, Plan: plan,
+				Encode: &VideoEncoding{Encoder: "libx264", Level: "4.2", Width: 1920, Height: 1080, Bitrate: 10_000_000, FrameRate: 50, Burn: &burn}}.args(2, 0)
+		}},
+		{"nvenc", func() []string {
+			return Remux{Input: "http://127.0.0.1:1/a.mkv", Video: 0, Audio: 1, Format: FMP4, Plan: plan, VideoTag: "avc1",
+				AudioCodec: "aac", AudioChannels: 2, AudioBitrate: 192_000,
+				Encode: &VideoEncoding{Encoder: "h264_nvenc", Level: "4.1", Width: 1920, Height: 1080, Bitrate: 8_000_000, FrameRate: 25, Deinterlace: true, Hardware: nvidia}}.args(0, 0)
+		}},
+		{"nvenc tone mapped", func() []string {
+			return Remux{Input: "http://127.0.0.1:1/a.mkv", Video: 0, Audio: 1, Format: FMP4, Plan: plan, VideoTag: "hvc1",
+				Encode: &VideoEncoding{Encoder: "hevc_nvenc", Level: "4.1", Width: 3840, Height: 2160, Bitrate: 20_000_000, FrameRate: 23.976, ToneMap: true, Hardware: nvidiaToneMapping}}.args(1, 0)
+		}},
+		{"nvenc burn", func() []string {
+			return Remux{Input: "http://127.0.0.1:1/a.mkv", Video: 0, Audio: 1, Format: TS, Plan: plan,
+				Encode: &VideoEncoding{Encoder: "h264_nvenc", Level: "4.1", Width: 1920, Height: 1080, Bitrate: 8_000_000, FrameRate: 24, ToneMap: true, Burn: &burn, Hardware: nvidiaToneMapping}}.args(0, 0)
+		}},
+		{"vaapi", func() []string {
+			return Remux{Input: "http://127.0.0.1:1/a.mkv", Video: 0, Audio: 1, Format: FMP4, Plan: plan, VideoTag: "avc1",
+				AudioCodec: "aac", AudioChannels: 6, AudioBitrate: 384_000,
+				Encode: &VideoEncoding{Encoder: "h264_vaapi", Level: "4.1", Width: 1920, Height: 1080, Bitrate: 8_000_000, FrameRate: 29.97, Deinterlace: true, Hardware: vaapi}}.args(1, 0)
+		}},
+		{"vaapi tone mapped", func() []string {
+			return Remux{Input: "http://127.0.0.1:1/a.mkv", Video: 0, Audio: -1, Format: TS, Plan: plan,
+				Encode: &VideoEncoding{Encoder: "hevc_vaapi", Level: "4.1", Width: 1280, Height: 720, Bitrate: 5_000_000, FrameRate: 24, ToneMap: true, Burn: &burn, Hardware: vaapi}}.args(0, 0)
+		}},
+		{"live cpu", func() []string {
+			return Remux{Input: "http://127.0.0.1:1/live.m3u8", InputOptions: []string{"-re"}, Video: 0, Audio: 1, Format: TS,
+				AudioCodec: "aac", AudioChannels: 2, AudioBitrate: 192_000,
+				Encode: &VideoEncoding{Encoder: "libx264", Level: "4.1", Width: 1280, Height: 720, Bitrate: 5_000_000, FrameRate: 25, Deinterlace: true}}.liveArgs("/tmp/live", 4)
+		}},
+		{"live nvenc", func() []string {
+			return Remux{Input: "http://127.0.0.1:1/live.m3u8", Video: 0, Audio: 1, Format: FMP4, ADTS: true, VideoTag: "avc1",
+				Encode: &VideoEncoding{Encoder: "h264_nvenc", Level: "4.2", Width: 1920, Height: 1080, Bitrate: 8_000_000, FrameRate: 50, Hardware: nvidia}}.liveArgs("/tmp/live", 0)
+		}},
+		{"live vaapi", func() []string {
+			return Remux{Input: "http://127.0.0.1:1/live.m3u8", Video: 0, Audio: 1, Format: TS,
+				AudioCodec: "aac", AudioChannels: 2, AudioBitrate: 192_000,
+				Encode: &VideoEncoding{Encoder: "h264_vaapi", Level: "4.1", Width: 1280, Height: 720, Bitrate: 4_000_000, FrameRate: 25, Deinterlace: true, Hardware: vaapi}}.liveArgs("/tmp/live", 0)
+		}},
+	}
+}
+
+// The conversion settings' defaults keep the FFmpeg command lines
+// Mira ran before they were settings: testdata/default-args.json was
+// recorded from version 0.11.0, then given FFmpeg's progress pipe, the
+// smaller probing of jobs past the first segment, and x264's High
+// profile. The GPUs there keep no frame in their memory (see
+// TestGPUPipelines).
+func TestDefaultSettingsKeepTheArguments(t *testing.T) {
+	t.Parallel()
+	data, err := os.ReadFile("testdata/default-args.json")
+	if err != nil {
+		t.Fatal(err)
+	}
+	var want map[string][]string
+	if err := json.Unmarshal(data, &want); err != nil {
+		t.Fatal(err)
+	}
+	cases := defaultCases()
+	if len(cases) != len(want) {
+		t.Errorf("%d cases, %d recorded", len(cases), len(want))
+	}
+	// The live cases write to /tmp/live, joined by the system's separator:
+	// the recording has slashes.
+	live := filepath.FromSlash("/tmp/live/")
+	for _, c := range cases {
+		got := c.args()
+		for i, arg := range got {
+			if strings.HasPrefix(arg, live) {
+				got[i] = filepath.ToSlash(arg)
+			}
+		}
+		if !reflect.DeepEqual(got, want[c.name]) {
+			t.Errorf("%s:\n got %q\nwant %q", c.name, got, want[c.name])
+		}
+	}
+}
+
+// A subtitle file burned in is a second input, read from its start: past
+// the first segment, only the main input seeks, and the pictures shown
+// before burnLead ahead of the seek are left out before scaling.
+func TestSubtitleFileIsASecondInput(t *testing.T) {
+	t.Parallel()
+	plan := NewPlan([]time.Duration{0, 6 * time.Second, 12 * time.Second}, 18*time.Second)
+	encoding := &VideoEncoding{Encoder: "libx264", Level: "4.1", Width: 1280, Height: 720, Bitrate: 5_000_000, FrameRate: 24,
+		BurnFile: "http://127.0.0.1:1/local/key/1.sup"}
+	from := strconv.FormatFloat((plan.seekTime(2, 0) - burnLead).Seconds(), 'f', 3, 64)
+	for n, want := range map[int]string{0: "[1:0]scale=1280:-2[subtitle]", 2: `[1:0]select=gte(t\,` + from + `),scale=1280:-2[subtitle]`} {
+		args := Remux{Input: "http://127.0.0.1:1/a.mkv", Video: 0, Audio: 1, Format: TS, Plan: plan, Encode: encoding}.args(n, 0)
+		main := slices.Index(args, "http://127.0.0.1:1/a.mkv")
+		if main < 0 || !slices.Equal(args[main+1:main+3], []string{"-i", encoding.BurnFile}) || slices.Contains(args[main+1:], "-ss") {
+			t.Errorf("segment %d: inputs %q", n, args)
+		}
+		if graph := args[slices.Index(args, "-filter_complex")+1]; !strings.Contains(graph, ";"+want+";") || strings.Contains(graph, "fps=") {
+			t.Errorf("segment %d: graph %q", n, graph)
+		}
+	}
+}
+
+// A track converted on its own goes through its downmix after -ac, as
+// converted video's audio does.
+func TestAudioConversionsTakeTheirDownmix(t *testing.T) {
+	t.Parallel()
+	filter := "pan=stereo|c0=c0+0.707*c2+0.707*c4|c1=c1+0.707*c2+0.707*c5"
+	args := Audio{Encoder: "libmp3lame", Bitrate: 192_000, Channels: 2, Filter: filter}.args()
+	if !slices.Equal(args[len(args)-4:], []string{"-ac", "2", "-af", filter}) {
+		t.Errorf("arguments: %q", args)
+	}
+	if args := (Audio{Encoder: "libmp3lame", Channels: 2}).args(); slices.Contains(args, "-af") {
+		t.Errorf("a filter without a downmix: %q", args)
+	}
+}
+
+// The options of converted audio's decoder go before the input, for its
+// stream alone, in every command line that converts it; copied audio gets
+// none, its decoder being the app's.
+func TestConvertedAudioTakesItsDecoderOptions(t *testing.T) {
+	t.Parallel()
+	plan := NewPlan([]time.Duration{0, 6 * time.Second}, 12*time.Second)
+	converted := Remux{Input: "http://127.0.0.1:1/a.mkv", Video: 0, Audio: 2, Format: TS, Plan: plan,
+		AudioCodec: "aac", AudioChannels: 2, AudioBitrate: 384_000, AudioDecoder: []string{"drc_scale", "0"}}
+	copied := converted
+	copied.AudioCodec, copied.AudioChannels, copied.AudioBitrate = "", 0, 0
+	lines := func(r Remux) map[string][]string {
+		return map[string][]string{"segments": r.args(0, 0), "live": r.liveArgs("/tmp/live", 0),
+			"progressive": r.progressiveArgs(0), "track": r.trackArgs(0)}
+	}
+	for name, args := range lines(converted) {
+		at, input := slices.Index(args, "-drc_scale:2"), slices.Index(args, "-i")
+		if at < 0 || args[at+1] != "0" || input < at {
+			t.Errorf("%s, converted: %q", name, args)
+		}
+	}
+	for name, args := range lines(copied) {
+		if slices.ContainsFunc(args, func(arg string) bool { return strings.HasPrefix(arg, "-drc_scale") }) {
+			t.Errorf("%s, copied: %q", name, args)
+		}
+	}
+}

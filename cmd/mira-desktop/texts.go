@@ -1,0 +1,225 @@
+package main
+
+import (
+	"fmt"
+
+	"github.com/ferforastieri/mira/internal/desktop/app"
+)
+
+// texts is the tray's text in one language.
+type texts struct {
+	starting, running, stopping, stopped, failed string
+	downloading, updating, rebuilding            string
+	keyStore, tools, updateFailed                string
+	setupCode                                    string
+	openAdmin, openWeb, openLogs                 string
+	start, stop, startWithComputer               string
+	install, quit                                string
+	copyKey, keyCopied, keyHint                  string
+}
+
+// trayTexts are the tray's texts in each language Mira speaks.
+var trayTexts = map[string]texts{
+	"en": {
+		starting:          "Mira is starting",
+		running:           "Mira is running",
+		stopping:          "Mira is stopping",
+		stopped:           "Mira is stopped",
+		failed:            "Mira could not start: see the log folder",
+		downloading:       "Downloading FFmpeg: %d%%",
+		updating:          "Downloading the update: %d%%",
+		rebuilding:        "Rebuilding the database's indexes",
+		keyStore:          "The system's key store could not be read",
+		tools:             "FFmpeg could not be downloaded",
+		updateFailed:      "The update could not be installed",
+		setupCode:         "Setup code: %s (click to copy)",
+		openAdmin:         "Open the admin app",
+		openWeb:           "Open the web player",
+		openLogs:          "Open the log folder",
+		start:             "Start Mira",
+		stop:              "Stop Mira",
+		startWithComputer: "Start with the computer",
+		install:           "Install Mira %s",
+		quit:              "Quit Mira",
+		copyKey:           "Copy the secret key",
+		keyCopied:         "Secret key copied: keep it with your backups",
+		keyHint:           "Copies the key the stored keys and tokens are encrypted with, to keep with your backups",
+	},
+	"fr": {
+		starting:          "Mira démarre",
+		running:           "Mira fonctionne",
+		stopping:          "Mira s’arrête",
+		stopped:           "Mira est arrêté",
+		failed:            "Mira n’a pas pu démarrer\u202f: voir le dossier des journaux",
+		downloading:       "Téléchargement de FFmpeg\u202f: %d %%",
+		updating:          "Téléchargement de la mise à jour\u202f: %d %%",
+		rebuilding:        "Reconstruction des index de la base de données",
+		keyStore:          "Le trousseau du système n’a pas pu être lu",
+		tools:             "FFmpeg n’a pas pu être téléchargé",
+		updateFailed:      "La mise à jour n’a pas pu être installée",
+		setupCode:         "Code d’installation\u202f: %s (cliquer pour copier)",
+		openAdmin:         "Ouvrir l’appli d’administration",
+		openWeb:           "Ouvrir le lecteur web",
+		openLogs:          "Ouvrir le dossier des journaux",
+		start:             "Démarrer Mira",
+		stop:              "Arrêter Mira",
+		startWithComputer: "Démarrer avec l’ordinateur",
+		install:           "Installer Mira %s",
+		quit:              "Quitter Mira",
+		copyKey:           "Copier la clé secrète",
+		keyCopied:         "Clé secrète copiée\u202f: gardez-la avec vos sauvegardes",
+		keyHint:           "Copie la clé qui chiffre les clés et jetons enregistrés, à garder avec vos sauvegardes",
+	},
+	"de": {
+		starting:          "Mira wird gestartet",
+		running:           "Mira läuft",
+		stopping:          "Mira wird angehalten",
+		stopped:           "Mira ist angehalten",
+		failed:            "Mira konnte nicht starten: siehe Protokollordner",
+		downloading:       "FFmpeg wird heruntergeladen: %d %%",
+		updating:          "Update wird heruntergeladen: %d %%",
+		rebuilding:        "Die Indizes der Datenbank werden neu aufgebaut",
+		keyStore:          "Der Schlüsselbund des Systems konnte nicht gelesen werden",
+		tools:             "FFmpeg konnte nicht heruntergeladen werden",
+		updateFailed:      "Das Update konnte nicht installiert werden",
+		setupCode:         "Einrichtungscode: %s (zum Kopieren klicken)",
+		openAdmin:         "Admin-App öffnen",
+		openWeb:           "Web-Player öffnen",
+		openLogs:          "Protokollordner öffnen",
+		start:             "Mira starten",
+		stop:              "Mira anhalten",
+		startWithComputer: "Mit dem Computer starten",
+		install:           "Mira %s installieren",
+		quit:              "Mira beenden",
+		copyKey:           "Geheimen Schlüssel kopieren",
+		keyCopied:         "Geheimer Schlüssel kopiert: Bewahre ihn bei deinen Backups auf",
+		keyHint:           "Kopiert den Schlüssel, mit dem die gespeicherten Schlüssel und Tokens verschlüsselt sind, zum Aufbewahren bei deinen Backups",
+	},
+	"es": {
+		starting:          "Mira se está iniciando",
+		running:           "Mira está en marcha",
+		stopping:          "Mira se está deteniendo",
+		stopped:           "Mira está detenido",
+		failed:            "Mira no ha podido iniciarse: consulte la carpeta de registros",
+		downloading:       "Descargando FFmpeg: %d %%",
+		updating:          "Descargando la actualización: %d %%",
+		rebuilding:        "Reconstruyendo los índices de la base de datos",
+		keyStore:          "No se ha podido leer el almacén de claves del sistema",
+		tools:             "No se ha podido descargar FFmpeg",
+		updateFailed:      "No se ha podido instalar la actualización",
+		setupCode:         "Código de configuración: %s (haga clic para copiarlo)",
+		openAdmin:         "Abrir la aplicación de administración",
+		openWeb:           "Abrir el reproductor web",
+		openLogs:          "Abrir la carpeta de registros",
+		start:             "Iniciar Mira",
+		stop:              "Detener Mira",
+		startWithComputer: "Iniciar con el ordenador",
+		install:           "Instalar Mira %s",
+		quit:              "Salir de Mira",
+		copyKey:           "Copiar la clave secreta",
+		keyCopied:         "Clave secreta copiada: guárdela con sus copias de seguridad",
+		keyHint:           "Copia la clave con la que se cifran las claves y los tokens guardados, para guardarla con sus copias de seguridad",
+	},
+	"it": {
+		starting:          "Mira si sta avviando",
+		running:           "Mira è in esecuzione",
+		stopping:          "Mira si sta arrestando",
+		stopped:           "Mira è arrestato",
+		failed:            "Impossibile avviare Mira: vedi la cartella dei log",
+		downloading:       "Download di FFmpeg: %d%%",
+		updating:          "Download dell’aggiornamento: %d%%",
+		rebuilding:        "Ricostruzione degli indici del database",
+		keyStore:          "Impossibile leggere il portachiavi del sistema",
+		tools:             "Impossibile scaricare FFmpeg",
+		updateFailed:      "Impossibile installare l’aggiornamento",
+		setupCode:         "Codice di configurazione: %s (fai clic per copiarlo)",
+		openAdmin:         "Apri l’applicazione di amministrazione",
+		openWeb:           "Apri il lettore web",
+		openLogs:          "Apri la cartella dei log",
+		start:             "Avvia Mira",
+		stop:              "Arresta Mira",
+		startWithComputer: "Avvia con il computer",
+		install:           "Installa Mira %s",
+		quit:              "Esci da Mira",
+		copyKey:           "Copia la chiave segreta",
+		keyCopied:         "Chiave segreta copiata: conservala con i tuoi backup",
+		keyHint:           "Copia la chiave con cui sono cifrati le chiavi e i token salvati, da conservare con i tuoi backup",
+	},
+	"pt-BR": {
+		starting:          "O Mira está iniciando",
+		running:           "O Mira está em execução",
+		stopping:          "O Mira está parando",
+		stopped:           "O Mira está parado",
+		failed:            "O Mira não pôde iniciar: veja a pasta de registros",
+		downloading:       "Baixando o FFmpeg: %d%%",
+		updating:          "Baixando a atualização: %d%%",
+		rebuilding:        "Reconstruindo os índices do banco de dados",
+		keyStore:          "Não foi possível ler o chaveiro do sistema",
+		tools:             "Não foi possível baixar o FFmpeg",
+		updateFailed:      "Não foi possível instalar a atualização",
+		setupCode:         "Código de configuração: %s (clique para copiar)",
+		openAdmin:         "Abrir o aplicativo de administração",
+		openWeb:           "Abrir o player web",
+		openLogs:          "Abrir a pasta de registros",
+		start:             "Iniciar o Mira",
+		stop:              "Parar o Mira",
+		startWithComputer: "Iniciar com o computador",
+		install:           "Instalar o Mira %s",
+		quit:              "Sair do Mira",
+		copyKey:           "Copiar a chave secreta",
+		keyCopied:         "Chave secreta copiada: guarde-a com seus backups",
+		keyHint:           "Copia a chave que criptografa as chaves e os tokens armazenados, para guardar com seus backups",
+	},
+}
+
+// formatted fills a text's %s.
+func formatted(text, value string) string {
+	return fmt.Sprintf(text, value)
+}
+
+// textsFor returns the tray's texts in language, one of i18n.Languages,
+// in English for any other.
+func textsFor(language string) texts {
+	if text, ok := trayTexts[language]; ok {
+		return text
+	}
+	return trayTexts["en"]
+}
+
+// phase is the line that tells what Mira is doing.
+func (c texts) phase(s app.Status) string {
+	switch s.Phase {
+	case app.Downloading:
+		return fmt.Sprintf(c.downloading, s.Percent)
+	case app.Updating:
+		return fmt.Sprintf(c.updating, s.Percent)
+	case app.Rebuilding:
+		return c.rebuilding
+	case app.Running:
+		return c.running
+	case app.Stopping:
+		return c.stopping
+	case app.Stopped:
+		return c.stopped
+	case app.Failed:
+		return c.failed
+	default:
+		return c.starting
+	}
+}
+
+// problems are the lines of what went wrong.
+func (c texts) problems(s app.Status) []string {
+	var lines []string
+	for _, p := range s.Problems {
+		switch p {
+		case app.NoKeyStore:
+			lines = append(lines, c.keyStore)
+		case app.NoTools:
+			lines = append(lines, c.tools)
+		case app.UpdateFailed:
+			lines = append(lines, c.updateFailed)
+		}
+	}
+	return lines
+}
